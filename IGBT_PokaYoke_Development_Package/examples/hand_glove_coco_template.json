@@ -1,0 +1,41 @@
+{
+  "images": [
+    {
+      "id": 1,
+      "file_name": "relative/path/to/raw_frame.jpg",
+      "width": 1920,
+      "height": 1080,
+      "physical_tube_id": "TUBE_ANON_001",
+      "batch_id": "BATCH_001",
+      "video_group_id": "CAPTURE_GROUP_001",
+      "station_id": "STATION_01",
+      "operator_anon_id": "OP_ANON_01",
+      "worksite_white_glove": true,
+      "glove_type": "white knit ESD glove",
+      "white_glove_reviewed_by": "REVIEWER_ANON_01",
+      "white_glove_reviewed_at": "2026-11-20"
+    }
+  ],
+  "annotations": [
+    {
+      "id": 1,
+      "image_id": 1,
+      "category_id": 1,
+      "bbox": [100, 150, 180, 240],
+      "area": 43200,
+      "iscrowd": 0
+    },
+    {
+      "id": 2,
+      "image_id": 1,
+      "category_id": 2,
+      "bbox": [400, 200, 80, 25],
+      "area": 2000,
+      "iscrowd": 0
+    }
+  ],
+  "categories": [
+    {"id": 1, "name": "hand_glove", "supercategory": "hand"},
+    {"id": 2, "name": "marker", "supercategory": "tool"}
+  ]
+}

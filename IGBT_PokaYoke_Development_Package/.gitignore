@@ -1,0 +1,62 @@
+# ==============================================================================
+# IGBT_PokaYoke_Development_Package .gitignore
+# ==============================================================================
+
+# --- Secrets & Local Env ---
+.env
+.env.*
+!.env.example
+
+# --- Runtime SQLite Database & Evidence Images ---
+data/station.sqlite3*
+data/evidence/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+
+# --- AI Training Dataset & Model Runs ---
+data/dataset/
+data/runs/
+data/
+runs/
+backup/
+*.pth
+*.pt
+*.onnx
+*.onnx.data
+*.ckpt
+*.safetensors
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# --- Frontend Dependencies & Built Bundle ---
+node_modules/
+frontend/igbt-station-ui/node_modules/
+web/dist/
+*.tsbuildinfo
+npm-debug.log*
+
+# --- Logs & OS/IDE ---
+logs/
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/

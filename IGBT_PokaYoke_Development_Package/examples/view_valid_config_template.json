@@ -1,0 +1,28 @@
+{
+  "camera_device_id": "SET_FROM_CAMERA_PROBE",
+  "calibrated_width": 1920,
+  "calibrated_height": 1080,
+  "roi_config_version": "ROI_V001",
+  "rois": {
+    "tube_roi": [0.05, 0.2, 0.95, 0.8],
+    "label_roi": [0.43, 0.42, 0.57, 0.58],
+    "label_contact_roi": [0.38, 0.3, 0.62, 0.7],
+    "left_grip_zone": [0.0, 0.15, 0.25, 0.9],
+    "right_grip_zone": [0.75, 0.15, 1.0, 0.9]
+  },
+  "quality_thresholds_approved": false,
+  "orientation_detector_ready": false,
+  "quality_thresholds": {
+    "min_brightness": null,
+    "max_brightness": null,
+    "max_overexposed_fraction": null,
+    "max_underexposed_fraction": null,
+    "min_laplacian_variance": null,
+    "max_frame_gap_ms": 200,
+    "stable_window_ms": 400,
+    "min_stable_frames": 5,
+    "max_center_drift_norm": 0.008,
+    "max_label_roi_offset_norm": 0.04
+  },
+  "note": "Example ROI coordinates only. Calibrate on actual station; thresholds are intentionally unapproved by default."
+}

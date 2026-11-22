@@ -1,0 +1,7 @@
+# Select a compatible torch/torchvision build using the official PyTorch
+# installer for the target OS/accelerator; freeze resolved versions later.
+torch
+torchvision
+numpy
+opencv-python
+Pillow

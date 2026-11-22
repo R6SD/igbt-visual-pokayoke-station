@@ -1,0 +1,9 @@
+# Install a PyTorch/torchvision pair compatible with the target Python and OS
+# using the official PyTorch selector first. Freeze exact resolved versions
+# into a release lock file after the target environment is validated.
+torch
+torchvision
+Pillow
+numpy
+onnx
+onnxruntime

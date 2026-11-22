@@ -1,0 +1,1 @@
+sample_id,path,label,physical_tube_id,batch_id,video_group_id,cycle_id,source_video_id,raw_path,frame_id,captured_at,camera_device,camera_width,camera_height,camera_fps,exposure,focus,white_balance,pipe_color,operation_event,operator_anon_id,roi_config_version
