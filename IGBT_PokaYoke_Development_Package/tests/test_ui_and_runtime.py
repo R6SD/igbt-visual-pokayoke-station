@@ -1,10 +1,12 @@
 """End-to-end tests for StationRuntime, ViewValidEvaluator, ContactCandidateTracker, and FastAPI UI endpoints."""
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -335,26 +337,50 @@ class FastAPIStationEndpointsTests(unittest.TestCase):
         self.assertEqual(status_res.status_code, 200)
         self.assertEqual(
             status_res.json(),
-            {"role_gate_enabled": True, "default_pin_active": True},
+            {
+                "role_gate_enabled": True,
+                "pin_configured": False,
+                "admin_token_configured": True,
+                "auth_configured": True,
+                "default_pin_active": False,
+            },
         )
 
-        # 1. Default demo PIN "888888" returns 200 with authenticated=True and configured admin_token
+        # 1. No built-in default PIN when IGBT_ENGINEER_PIN is unset: "888888" MUST fail with 401
         pin_res = self.client.post("/api/auth/verify", json={"passcode": "888888"})
-        self.assertEqual(pin_res.status_code, 200)
-        pin_body = pin_res.json()
-        self.assertTrue(pin_body["authenticated"])
-        self.assertEqual(pin_body["role"], "engineer")
-        self.assertEqual(pin_body["admin_token"], "test-admin-token")
-        self.assertEqual(pin_body["expires_in_seconds"], 1800)
+        self.assertEqual(pin_res.status_code, 401)
 
-        # 2. Matching IGBT_ADMIN_TOKEN returns 200
+        # 2. Matching IGBT_ADMIN_TOKEN returns 200 with a freshly minted non-static session token
         token_res = self.client.post("/api/auth/verify", json={"passcode": "test-admin-token"})
         self.assertEqual(token_res.status_code, 200)
         token_body = token_res.json()
         self.assertTrue(token_body["authenticated"])
         self.assertEqual(token_body["role"], "engineer")
-        self.assertEqual(token_body["admin_token"], "test-admin-token")
+        self.assertTrue(token_body["admin_token"])
+        self.assertNotEqual(token_body["admin_token"], "test-admin-token")
         self.assertEqual(token_body["expires_in_seconds"], 1800)
+
+        # Minted session token is accepted by protected routes
+        cfg_payload = {
+            "camera_device_id": "CAM_STATION_01",
+            "camera_width": 1408,
+            "camera_height": 768,
+            "camera_covers_both_ends": True,
+            "rois": {
+                "tube_roi": [0.16, 0.42, 0.84, 0.58],
+                "label_roi": [0.43, 0.45, 0.57, 0.55],
+                "label_contact_roi": [0.40, 0.38, 0.60, 0.62],
+                "left_grip_zone": [0.16, 0.34, 0.31, 0.82],
+                "right_grip_zone": [0.69, 0.34, 0.84, 0.82],
+            },
+            "thresholds": {},
+        }
+        session_cfg_res = self.client.put(
+            "/api/config",
+            headers={"X-Admin-Token": token_body["admin_token"]},
+            json=cfg_payload,
+        )
+        self.assertEqual(session_cfg_res.status_code, 200)
 
         # 3. Wrong passcode "000000" returns 401
         bad_res = self.client.post("/api/auth/verify", json={"passcode": "000000"})
@@ -367,45 +393,32 @@ class FastAPIStationEndpointsTests(unittest.TestCase):
         extra_res = self.client.post("/api/auth/verify", json={"passcode": "888888", "role": "engineer"})
         self.assertEqual(extra_res.status_code, 422)
 
-        # 4. When IGBT_ADMIN_TOKEN is unset, verify falls back to "local-admin-token"
-        # while admin_or_station_token still returns 503 on protected endpoints
+        # 4. When neither IGBT_ADMIN_TOKEN nor IGBT_ENGINEER_PIN is set, fail closed (401)
         os.environ.pop("IGBT_ADMIN_TOKEN", None)
         try:
-            fallback_res = self.client.post("/api/auth/verify", json={"passcode": "888888"})
-            self.assertEqual(fallback_res.status_code, 200)
-            self.assertEqual(fallback_res.json()["admin_token"], "local-admin-token")
+            unconfigured_res = self.client.post("/api/auth/verify", json={"passcode": "888888"})
+            self.assertEqual(unconfigured_res.status_code, 401)
 
             cfg_res = self.client.put(
                 "/api/config",
                 headers={"X-Admin-Token": "local-admin-token"},
-                json={
-                    "camera_device_id": "CAM_STATION_01",
-                    "camera_width": 1408,
-                    "camera_height": 768,
-                    "camera_covers_both_ends": True,
-                    "rois": {
-                        "tube_roi": [0.16, 0.42, 0.84, 0.58],
-                        "label_roi": [0.43, 0.45, 0.57, 0.55],
-                        "label_contact_roi": [0.40, 0.38, 0.60, 0.62],
-                        "left_grip_zone": [0.16, 0.34, 0.31, 0.82],
-                        "right_grip_zone": [0.69, 0.34, 0.84, 0.82],
-                    },
-                    "thresholds": {},
-                },
+                json=cfg_payload,
             )
-            self.assertEqual(cfg_res.status_code, 503)
-            self.assertIn("IGBT_ADMIN_TOKEN_NOT_CONFIGURED", str(cfg_res.json()))
+            self.assertEqual(cfg_res.status_code, 401)
         finally:
             os.environ["IGBT_ADMIN_TOKEN"] = "test-admin-token"
 
-        # 5. Custom IGBT_ENGINEER_PIN overrides default PIN
+        # 5. Explicitly configured IGBT_ENGINEER_PIN mints a session token without echoing static admin token
         os.environ["IGBT_ENGINEER_PIN"] = "246810"
         try:
             custom_status = self.client.get("/api/auth/status")
             self.assertEqual(custom_status.status_code, 200)
+            self.assertTrue(custom_status.json()["pin_configured"])
             self.assertFalse(custom_status.json()["default_pin_active"])
             self.assertEqual(self.client.post("/api/auth/verify", json={"passcode": "888888"}).status_code, 401)
-            self.assertEqual(self.client.post("/api/auth/verify", json={"passcode": "246810"}).status_code, 200)
+            ok_pin = self.client.post("/api/auth/verify", json={"passcode": "246810"})
+            self.assertEqual(ok_pin.status_code, 200)
+            self.assertNotEqual(ok_pin.json()["admin_token"], "test-admin-token")
         finally:
             os.environ.pop("IGBT_ENGINEER_PIN", None)
 
@@ -554,6 +567,7 @@ class FastAPIStationEndpointsTests(unittest.TestCase):
             headers={
                 "Content-Type": "image/jpeg",
                 "Content-Length": str(len(jpg)),
+                "X-Station-Token": "test-station-token",
                 "X-Frame-Id": "10",
                 "X-Pipe-Color": "yellow",
                 "X-Operation-Event": "LIVE_TEST",
@@ -671,6 +685,17 @@ class FastAPIStationEndpointsTests(unittest.TestCase):
                 )
                 self.assertEqual(bad_reg.status_code, 422)
 
+            runs_root = Path(self._temp_dir.name) / "runs" / "label_classifier"
+            active_dir = runs_root / "mnetv3_active_01"
+            old_dir = runs_root / "mnetv3_old_02"
+            active_dir.mkdir(parents=True, exist_ok=True)
+            old_dir.mkdir(parents=True, exist_ok=True)
+            active_onnx_bytes = b"mock-onnx-model-active-01"
+            active_sha = hashlib.sha256(active_onnx_bytes).hexdigest()
+            (active_dir / "label_classifier.onnx").write_bytes(active_onnx_bytes)
+            (active_dir / "metrics.json").write_text("{}", encoding="utf-8")
+            (old_dir / "metrics.json").write_text("{}", encoding="utf-8")
+
             # Register two models with disk artifact folders
             r1 = self.client.post(
                 "/api/models",
@@ -678,7 +703,7 @@ class FastAPIStationEndpointsTests(unittest.TestCase):
                 json={
                     "model_name": "mobilenetv3-small-igbt-roi",
                     "model_version": "mnetv3_active_01",
-                    "sha256": "b" * 64,
+                    "sha256": active_sha,
                     "license_status": "reviewed",
                     "notes": "active model",
                 },
@@ -699,16 +724,24 @@ class FastAPIStationEndpointsTests(unittest.TestCase):
             active_id = r1.json()["model_id"]
             old_id = r2.json()["model_id"]
 
-            runs_root = Path(self._temp_dir.name) / "runs" / "label_classifier"
-            active_dir = runs_root / "mnetv3_active_01"
-            old_dir = runs_root / "mnetv3_old_02"
-            active_dir.mkdir(parents=True, exist_ok=True)
-            old_dir.mkdir(parents=True, exist_ok=True)
-            (active_dir / "metrics.json").write_text("{}", encoding="utf-8")
-            (old_dir / "metrics.json").write_text("{}", encoding="utf-8")
+            # Activating without token is rejected (401)
+            self.assertEqual(self.client.post(f"/api/models/{active_id}/activate").status_code, 401)
 
-            # Activate model 1
-            act = self.client.post(f"/api/models/{active_id}/activate")
+            # Activate model 1 with valid token & matching artifact digest
+            def _fake_load_onnx(onnx_path, model_version, expected_sha256=None, input_size=96):
+                actual = hashlib.sha256(Path(onnx_path).read_bytes()).hexdigest()
+                if expected_sha256 and actual != expected_sha256:
+                    raise ValueError("SHA mismatch")
+                with ui_app.LIVE_CAMERA._lock:
+                    ui_app.LIVE_CAMERA._onnx_model_version = model_version
+                    ui_app.LIVE_CAMERA._state["model_version"] = model_version
+                return {"model_version": model_version, "sha256": actual, "input_size": input_size}
+
+            with patch.object(ui_app, "_load_onnx_into_camera", side_effect=_fake_load_onnx):
+                act = self.client.post(
+                    f"/api/models/{active_id}/activate",
+                    headers={"X-Admin-Token": "test-admin-token"},
+                )
             self.assertEqual(act.status_code, 200)
 
             # Deleting active model must return 409 Conflict and preserve folder
@@ -830,9 +863,17 @@ class FastAPIStationEndpointsTests(unittest.TestCase):
         self.assertEqual(items[0]["image_url"], f"/api/dataset/sample/{s1_id}/image")
         self.assertEqual(self.client.get(items[0]["image_url"]).status_code, 200)
 
-        # Re-annotate s1 and ensure box_xyxy is preserved after manifest rewrite
+        # Re-annotate s1 (requires X-Admin-Token) and ensure box_xyxy is preserved after manifest rewrite
+        self.assertEqual(
+            self.client.patch(
+                f"/api/dataset/sample/{s1_id}",
+                json={"label": "covered", "physical_tube_id": "TUBE_PATCHED"},
+            ).status_code,
+            401,
+        )
         patch_res = self.client.patch(
             f"/api/dataset/sample/{s1_id}",
+            headers={"X-Admin-Token": "test-admin-token"},
             json={"label": "covered", "physical_tube_id": "TUBE_PATCHED"},
         )
         self.assertEqual(patch_res.status_code, 200)
@@ -885,10 +926,10 @@ class FastAPIStationEndpointsTests(unittest.TestCase):
         self.assertEqual(clr_ok.status_code, 200)
         self.assertEqual(clr_ok.json()["total_samples"], 0)
 
-        # When IGBT_ADMIN_TOKEN is unset, clear succeeds without token
+        # When IGBT_ADMIN_TOKEN is unset, clear fails closed (401)
         os.environ.pop("IGBT_ADMIN_TOKEN", None)
         try:
-            self.assertEqual(self.client.post("/api/dataset/clear").status_code, 200)
+            self.assertEqual(self.client.post("/api/dataset/clear").status_code, 401)
         finally:
             os.environ["IGBT_ADMIN_TOKEN"] = "test-admin-token"
 

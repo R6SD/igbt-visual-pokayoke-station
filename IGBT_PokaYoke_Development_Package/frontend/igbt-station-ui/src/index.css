@@ -14,24 +14,24 @@
   --font-sans: "PingFang SC", "Noto Sans SC", "Geist Variable", "Microsoft YaHei UI", system-ui, sans-serif;
   --font-mono: "Geist Variable", "Cascadia Mono", "SF Mono", Consolas, monospace;
 
-  --color-background: #f4f3ef;
-  --color-foreground: #141619;
-  --color-card: #ffffff;
-  --color-card-foreground: #141619;
-  --color-popover: #ffffff;
-  --color-popover-foreground: #141619;
-  --color-primary: #141619;
-  --color-primary-foreground: #ffffff;
-  --color-secondary: #eceae3;
-  --color-secondary-foreground: #141619;
-  --color-muted: #eceae3;
-  --color-muted-foreground: #666c77;
-  --color-accent: #eceae3;
-  --color-accent-foreground: #141619;
-  --color-destructive: #b9382c;
-  --color-border: #dcdad3;
-  --color-input: #c9c6bd;
-  --color-ring: #141619;
+  --color-background: var(--ground);
+  --color-foreground: var(--ink);
+  --color-card: var(--surface);
+  --color-card-foreground: var(--ink);
+  --color-popover: var(--surface);
+  --color-popover-foreground: var(--ink);
+  --color-primary: var(--accent);
+  --color-primary-foreground: var(--accent-ink);
+  --color-secondary: var(--surface-alt);
+  --color-secondary-foreground: var(--ink);
+  --color-muted: var(--surface-alt);
+  --color-muted-foreground: var(--ink-3);
+  --color-accent: var(--surface-alt);
+  --color-accent-foreground: var(--ink);
+  --color-destructive: var(--bad);
+  --color-border: var(--rule);
+  --color-input: var(--input-border);
+  --color-ring: var(--accent);
 
   --radius-sm: 2px;
   --radius-md: 4px;
@@ -46,6 +46,7 @@
   --surface-hover: #f7f6f2;
   --rule: #dcdad3;
   --rule-strong: #b9b6ac;
+  --input-border: #c9c6bd;
   --glass-divider: #dcdad3;
 
   --ink: #141619;
@@ -99,6 +100,7 @@
   --surface-hover: #252a32;
   --rule: rgba(255, 255, 255, 0.11);
   --rule-strong: rgba(255, 255, 255, 0.24);
+  --input-border: rgba(255, 255, 255, 0.18);
   --glass-divider: rgba(255, 255, 255, 0.11);
 
   --ink: #f3f4f6;
@@ -172,6 +174,7 @@ body {
 /* 官网展示页独立滚动视口（/?showcase=1） */
 .showcase-viewport {
   height: 100vh;
+  height: 100dvh;
   width: 100vw;
   overflow-y: auto;
   overflow-x: hidden;
@@ -223,6 +226,7 @@ summary:focus-visible,
    ========================================================================== */
 .shell {
   height: 100vh;
+  height: 100dvh;
   width: 100vw;
   overflow: hidden;
   display: flex;
@@ -540,7 +544,7 @@ summary:focus-visible,
    ========================================================================== */
 .andon {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: stretch;
   border-radius: var(--radius);
   border: 1px solid var(--rule);
@@ -548,6 +552,12 @@ summary:focus-visible,
   color: var(--ink);
   overflow: hidden;
   flex: none;
+}
+.andon-live {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: stretch;
+  min-width: 0;
 }
 .andon-word {
   display: flex;
@@ -1834,7 +1844,7 @@ summary:focus-visible,
 
 /* 二次确认弹窗 */
 .confirm-modal {
-  width: min(460px, 100%);
+  width: min(460px, calc(100vw - 48px));
 }
 .confirm-consequence {
   padding: 10px 12px;
@@ -2590,20 +2600,30 @@ summary:focus-visible,
   position: fixed;
   inset: 0;
   z-index: 70;
-  display: grid;
-  place-items: center;
-  padding: 24px;
   background: rgba(17, 19, 22, 0.56);
 }
 .modal {
-  width: min(620px, 100%);
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 71;
+  width: min(620px, calc(100vw - 48px));
   max-height: calc(100vh - 48px);
+  max-height: calc(100dvh - 48px);
   overflow-y: auto;
   background: var(--surface);
   border: 1px solid var(--rule-strong);
   border-radius: var(--radius);
 }
-.auth-modal { width: min(440px, 100%); }
+.modal:focus {
+  outline: none;
+}
+.modal:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.auth-modal { width: min(440px, calc(100vw - 48px)); }
 .auth-form { display: grid; gap: 14px; }
 .auth-input-wrap {
   position: relative;
@@ -2765,10 +2785,12 @@ summary:focus-visible,
   border-bottom: 1px solid var(--rule);
 }
 .th-row:last-child { border-bottom: 0; }
-.th-row b {
+.th-row b,
+.th-row label {
   display: block;
   font-size: 12.5px;
   font-weight: 500;
+  color: var(--ink);
 }
 .th-row [data-slot="input"] {
   text-align: right;
@@ -2778,6 +2800,19 @@ summary:focus-visible,
 .file-btn {
   position: relative;
   overflow: hidden;
+}
+.file-btn:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+@supports selector(:has(*)) {
+  .file-btn:focus-within {
+    outline: none;
+  }
+  .file-btn:has(input:focus-visible) {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
 }
 .file-btn input {
   position: absolute;

@@ -76,6 +76,23 @@ function isEditableTarget(target: EventTarget | null) {
   return false
 }
 
+function readStoredTheme(storageKey: string): Theme | null {
+  try {
+    const storedTheme = window.localStorage.getItem(storageKey)
+    return isTheme(storedTheme) ? storedTheme : null
+  } catch {
+    return null
+  }
+}
+
+function writeStoredTheme(storageKey: string, nextTheme: Theme): void {
+  try {
+    window.localStorage.setItem(storageKey, nextTheme)
+  } catch {
+    /* 浏览器存储不可用或配额已满时保持内存主题状态 */
+  }
+}
+
 export function ThemeProvider({
   children,
   defaultTheme = "system",
@@ -84,8 +101,8 @@ export function ThemeProvider({
   ...props
 }: ThemeProviderProps) {
   const [theme, setThemeState] = React.useState<Theme>(() => {
-    const storedTheme = localStorage.getItem(storageKey)
-    if (isTheme(storedTheme)) {
+    const storedTheme = readStoredTheme(storageKey)
+    if (storedTheme) {
       return storedTheme
     }
 
@@ -94,7 +111,7 @@ export function ThemeProvider({
 
   const setTheme = React.useCallback(
     (nextTheme: Theme) => {
-      localStorage.setItem(storageKey, nextTheme)
+      writeStoredTheme(storageKey, nextTheme)
       setThemeState(nextTheme)
     },
     [storageKey]
@@ -166,7 +183,7 @@ export function ThemeProvider({
                 ? "light"
                 : "dark"
 
-        localStorage.setItem(storageKey, nextTheme)
+        writeStoredTheme(storageKey, nextTheme)
         return nextTheme
       })
     }
@@ -180,7 +197,14 @@ export function ThemeProvider({
 
   React.useEffect(() => {
     const handleStorageChange = (event: StorageEvent) => {
-      if (event.storageArea !== localStorage) {
+      let storage: Storage
+      try {
+        storage = window.localStorage
+      } catch {
+        return
+      }
+
+      if (event.storageArea !== storage) {
         return
       }
 

@@ -88,6 +88,17 @@ export const deriveOutcome = (state: Data) => {
 
 export const C_LIMIT_MS = 1200
 
+/** 格式化 C 类确认计时秒数：未满 1200ms 时严格向下截断，避免 1199ms 提前显示 1.2 / 1.20 秒 */
+export function formatCTimerSeconds(ms: number, digits: 1 | 2 = 1): string {
+  const clamped = Math.max(0, Number.isFinite(ms) ? ms : 0)
+  const factor = digits === 2 ? 100 : 10
+  const stepMs = 1000 / factor
+  const maxSteps = Math.floor(C_LIMIT_MS / stepMs)
+  const flooredSteps = Math.floor(clamped / stepMs)
+  const safeSteps = clamped < C_LIMIT_MS ? Math.min(maxSteps - 1, flooredSteps) : flooredSteps
+  return (Math.max(0, safeSteps) / factor).toFixed(digits)
+}
+
 const reasonText: Record<string, string> = {
   BARE_HAND_VIOLATION: "违规报警：裸手触碰料管（必须佩戴白色防静电手套）",
   BARE_HAND_WARNING_NO_GLOVE: "作业规范警告：检测到裸手，请先佩戴白色防静电手套后再拿取料管",
@@ -149,7 +160,7 @@ export function guidanceFor(state: Data) {
     return { title: "轻转料管正对镜头", desc: "避开管壁反光" }
   }
   if (cTimer > 0 && cTimer < C_LIMIT_MS) {
-    return { title: "保持稳定", desc: `无标签 ${(cTimer / 1000).toFixed(1)} / 1.2 秒` }
+    return { title: "保持稳定", desc: `无标签 ${formatCTimerSeconds(cTimer, 1)} / 1.2 秒` }
   }
   if (outcome === "PASS") {
     return { title: "移入下一工序", desc: "放入合格品料盒" }

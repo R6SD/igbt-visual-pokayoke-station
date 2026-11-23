@@ -38,7 +38,9 @@ def validate_class_map(class_names: Iterable[str]) -> None:
         return
 
 
-def _valid_box(box: Box) -> bool:
+def _valid_box(box: Box | None) -> bool:
+    if box is None:
+        return False
     return len(box) == 4 and all(0.0 <= float(v) <= 1.0 for v in box) and box[2] > box[0] and box[3] > box[1]
 
 
