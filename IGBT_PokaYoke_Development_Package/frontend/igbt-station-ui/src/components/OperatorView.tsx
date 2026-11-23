@@ -1,8 +1,7 @@
-import { useEffect, useState } from "react"
 import { Camera, RotateCcw, ShieldAlert, ShieldCheck } from "lucide-react"
 import { Andon } from "@/components/Andon"
 import { CameraFrame } from "@/components/CameraFrame"
-import { C_LIMIT_MS, type Data, deriveOutcome, labelText, pipeText } from "@/lib/station"
+import { C_LIMIT_MS, type Data, deriveOutcome, formatCTimerSeconds, labelText, pipeText } from "@/lib/station"
 
 interface OperatorViewProps {
   state: Data
@@ -11,6 +10,8 @@ interface OperatorViewProps {
   passCount: number
   alarmCount: number
   avgTaktTime: number | null
+  statsScope?: "all" | "recent"
+  shutterKey?: number
   onManualTrigger?: () => void
   onResetAlarm?: () => void
 }
@@ -45,7 +46,7 @@ function operatorGuidanceFor(state: Data): { title: string; desc?: string } {
     return { title: "请轻转料管正对镜头", desc: "避开管壁反光与手部遮挡" }
   }
   if (cTimer > 0 && cTimer < C_LIMIT_MS) {
-    return { title: "请保持稳定", desc: `C 类撕除确认 ${(cTimer / 1000).toFixed(2)} / 1.20 秒` }
+    return { title: "请保持稳定", desc: `C 类撕除确认 ${formatCTimerSeconds(cTimer, 2)} / 1.20 秒` }
   }
   if (outcome === "PASS") {
     return { title: "合格放行", desc: "请移入合格品料盒，准备下一管" }
@@ -60,41 +61,19 @@ export function OperatorView({
   passCount,
   alarmCount,
   avgTaktTime,
+  statsScope = "recent",
+  shutterKey = 0,
   onManualTrigger,
   onResetAlarm,
 }: OperatorViewProps) {
-  const [shutterSeq, setShutterSeq] = useState(0)
-
   const cTimer = Math.max(0, Number(state.c_timer_ms || 0))
   const litSegments = Math.min(12, Math.floor((cTimer / C_LIMIT_MS) * 12))
   const yieldRate = totalCount > 0 ? ((passCount / totalCount) * 100).toFixed(1) : "—"
   const online = state.camera_status === "ONLINE"
   const frameSrc = (online && state.live_stream_url) || state.latest_evidence_url || evidence[0]?.url
-  const cropSrc = (online && state.live_crop_url) || frameSrc
+  const cropSrc = online && state.live_crop_url ? String(state.live_crop_url) : undefined
   const focusLocked = online && state.view_valid === true
   const isAlarmLatched = Boolean(state.alarm_latched || state.outcome === "ALARM" || state.bare_hand_violation)
-
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (
-        e.target instanceof HTMLInputElement ||
-        e.target instanceof HTMLTextAreaElement ||
-        document.querySelector('[role="dialog"]')
-      ) {
-        return
-      }
-      if (e.code === "Space" && !e.repeat) {
-        setShutterSeq((n) => n + 1)
-      }
-    }
-    window.addEventListener("keydown", onKeyDown)
-    return () => window.removeEventListener("keydown", onKeyDown)
-  }, [])
-
-  const handleManualCapture = () => {
-    setShutterSeq((n) => n + 1)
-    onManualTrigger?.()
-  }
 
   const gloveSideState = (active: unknown) =>
     active === true
@@ -120,13 +99,17 @@ export function OperatorView({
       ? labelText[state.label_status] || "待判定"
       : "等待料管入位"
 
-  const labelTone = state.bare_hand_violation || isAlarmLatched
-    ? "alarm"
-    : state.label_status === "crossed_out" || state.label_status === "covered" || state.label_status === "absent"
-      ? "pass"
-      : state.label_status === "complete"
-        ? "warn"
-        : "plain"
+  const labelTone =
+    state.bare_hand_violation || isAlarmLatched
+      ? "alarm"
+      : state.label_status === "crossed_out" || state.label_status === "covered" || state.label_status === "absent"
+        ? "pass"
+        : state.label_status === "complete"
+          ? "warn"
+          : "plain"
+
+  const statsAriaLabel = statsScope === "all" ? "累计周期统计" : "近 30 条周期统计"
+  const totalLabel = statsScope === "all" ? "累计检验" : "近30条检验"
 
   return (
     <div className="op-screen">
@@ -158,9 +141,10 @@ export function OperatorView({
               fill
               src={frameSrc}
               alt="现场 16:9 全景实时目检画面"
-              shutterKey={shutterSeq}
+              shutterKey={shutterKey}
               focusLocked={focusLocked}
               emptyTitle="等待相机画面"
+              errorTitle="相机画面不可用"
             />
           </div>
 
@@ -205,8 +189,10 @@ export function OperatorView({
                 fill
                 src={cropSrc}
                 alt="防呆标签 4 倍特写"
-                focusLocked={focusLocked}
-                emptyTitle="等待料管入位"
+                focusLocked={Boolean(focusLocked && cropSrc)}
+                emptyTitle={online ? "特写画面不可用" : "等待料管入位"}
+                emptyHint={online ? "当前未获取到 4× 标签特写流" : undefined}
+                errorTitle="特写画面不可用"
               />
             </div>
           </div>
@@ -214,7 +200,7 @@ export function OperatorView({
           <div className="op-section">
             <div className="op-section-head">
               <span className="op-section-title">C 类撕除确认</span>
-              <span className="op-section-meta">{(cTimer / 1000).toFixed(2)} / 1.20 秒</span>
+              <span className="op-section-meta">{formatCTimerSeconds(cTimer, 2)} / 1.20 秒</span>
             </div>
             <div
               className={`segments ${litSegments >= 12 ? "done" : ""}`}
@@ -237,16 +223,16 @@ export function OperatorView({
                 解除报警闭锁并复位
               </button>
             )}
-            <button type="button" className="btn block" onClick={handleManualCapture}>
+            <button type="button" className="btn block" onClick={onManualTrigger}>
               <Camera size={15} aria-hidden="true" />
               手动抓拍并归档
               <span className="op-kbd">空格</span>
             </button>
           </div>
 
-          <div className="op-stats" aria-label="本班计数">
+          <div className="op-stats" aria-label={statsAriaLabel}>
             <div className="op-stat">
-              <small>本班检验</small>
+              <small>{totalLabel}</small>
               <b>
                 {totalCount}
                 <em>管</em>

@@ -152,21 +152,27 @@ class StationRuntime:
         now_monotonic: float | None = None,
     ) -> dict:
         now = self._clock() if now_monotonic is None else float(now_monotonic)
-        self.pipe_color = pipe_color
-        if operator_anon_id:
-            self.operator_anon_id = operator_anon_id
-        self.view_evaluator.reset()
-        self.contact_tracker.reset()
+        before_state = self.fsm.state
+        candidate_operator = operator_anon_id or self.operator_anon_id
         self.fsm.process(
             FSMEvent(
                 kind="new_cycle",
                 cycle_id=cycle_id,
                 capture_monotonic_s=now,
                 pipe_color=pipe_color,
-                operator_anon_id=self.operator_anon_id,
+                operator_anon_id=candidate_operator,
             ),
             now_monotonic=now,
         )
+        accepted = before_state == FSMState.WAIT_PART and self.fsm.state == FSMState.VERIFY_INITIAL
+        if not accepted:
+            return {**self._last_snapshot, "event_type": "NEW_CYCLE_REJECTED"}
+
+        self.pipe_color = pipe_color
+        if operator_anon_id:
+            self.operator_anon_id = operator_anon_id
+        self.view_evaluator.reset()
+        self.contact_tracker.reset()
         self._last_snapshot = {
             **self._last_snapshot,
             "fsm_state": self.fsm.state.value,
@@ -183,7 +189,19 @@ class StationRuntime:
 
     def start_inspection(self, now_monotonic: float | None = None) -> dict:
         now = self._clock() if now_monotonic is None else float(now_monotonic)
+        before_state = self.fsm.state
         self.fsm.process(FSMEvent(kind="start_inspection", capture_monotonic_s=now), now_monotonic=now)
+        accepted = before_state == FSMState.READY and self.fsm.state == FSMState.INSPECTING
+        if not accepted:
+            return {
+                **self._last_snapshot,
+                "fsm_state": self.fsm.state.value,
+                "outcome": self.fsm.outcome,
+                "result_reason": self.fsm.result_reason,
+                "c_timer_ms": self.fsm.c_timer_ms,
+                "event_type": "INSPECTION_START_REJECTED",
+                "capture_monotonic_s": round(now, 4),
+            }
         self._last_snapshot = {
             **self._last_snapshot,
             "fsm_state": self.fsm.state.value,
@@ -202,6 +220,17 @@ class StationRuntime:
         now_monotonic: float | None = None,
     ) -> dict:
         now = self._clock() if now_monotonic is None else float(now_monotonic)
+        if not authorized:
+            self.fsm.process(
+                FSMEvent(
+                    kind="reset",
+                    reason=reason,
+                    reset_authorized=False,
+                    capture_monotonic_s=now,
+                ),
+                now_monotonic=now,
+            )
+            return dict(self._last_snapshot)
         self.view_evaluator.reset()
         self.contact_tracker.reset()
         if self.fsm.state not in {FSMState.WAIT_PART, FSMState.PASS, FSMState.ALARM, FSMState.FAULT, FSMState.REVIEW_REQUIRED}:
@@ -210,7 +239,7 @@ class StationRuntime:
             FSMEvent(
                 kind="reset",
                 reason=reason,
-                reset_authorized=authorized,
+                reset_authorized=True,
                 capture_monotonic_s=now,
             ),
             now_monotonic=now,
@@ -241,7 +270,7 @@ class StationRuntime:
         hand_detection_valid: bool = True,
         now_monotonic: float | None = None,
     ) -> dict:
-        now = float(observation.captured_monotonic_s if now_monotonic is None else now_monotonic)
+        now = self._clock() if now_monotonic is None else float(now_monotonic)
         if pipe_color is not None:
             self.pipe_color = pipe_color
 
@@ -549,6 +578,7 @@ def build_scenario_run(scenario: str) -> dict:
             "snapshot": snapshot,
             "transitions": runtime.fsm.transition_log(),
             "reference_image_path": str(ref_path),
+            "evidence_image_bytes": None,
             "evidence_kind": "initial_label",
             "pipe_color": pipe_color,
         }
@@ -573,6 +603,7 @@ def build_scenario_run(scenario: str) -> dict:
             "snapshot": snapshot,
             "transitions": runtime.fsm.transition_log(),
             "reference_image_path": str(ref_path),
+            "evidence_image_bytes": None,
             "evidence_kind": "anomaly",
             "pipe_color": pipe_color,
         }
@@ -594,6 +625,7 @@ def build_scenario_run(scenario: str) -> dict:
 
     runtime.start_inspection(now_monotonic=now)
 
+    evidence_image_bytes: bytes | None = None
     if scenario == "a_pass":
         for _ in range(6):
             obs = next_obs(dt=0.1)
@@ -672,6 +704,9 @@ def build_scenario_run(scenario: str) -> dict:
                 pipe_color=pipe_color,
                 now_monotonic=now,
             )
+        ok_enc, buf_enc = cv2.imencode(".jpg", glare_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+        if ok_enc:
+            evidence_image_bytes = bytes(buf_enc)
         evidence_kind = "anomaly"
 
     return {
@@ -679,6 +714,7 @@ def build_scenario_run(scenario: str) -> dict:
         "snapshot": snapshot,
         "transitions": runtime.fsm.transition_log(),
         "reference_image_path": str(ref_path),
+        "evidence_image_bytes": evidence_image_bytes,
         "evidence_kind": evidence_kind,
         "pipe_color": pipe_color,
     }

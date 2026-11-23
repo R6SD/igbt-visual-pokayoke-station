@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useRef, useState } from "react"
 import stationHeroImg from "@/assets/showcase/station-hero.png"
 import stationConceptImg from "@/assets/showcase/station-concept.png"
 import tubeYellowImg from "@/assets/showcase/tube-yellow.jpg"
@@ -67,11 +67,34 @@ const verdictCases: Record<
   },
 }
 
+const verdictKeys: VerdictKey[] = ["pass", "alarm", "blocked"]
+
 export function ShowcasePage({ onEnterStation }: ShowcasePageProps) {
   const [tube, setTube] = useState<TubeKind>("yellow")
   const [verdict, setVerdict] = useState<VerdictKey>("pass")
+  const verdictTabRefs = useRef<Partial<Record<VerdictKey, HTMLButtonElement | null>>>({})
 
   const current = verdictCases[verdict]
+
+  const handleVerdictTabKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>, currentKey: VerdictKey) => {
+    const idx = verdictKeys.indexOf(currentKey)
+    let nextIdx = -1
+    if (e.key === "ArrowDown" || e.key === "ArrowRight") {
+      nextIdx = (idx + 1) % verdictKeys.length
+    } else if (e.key === "ArrowUp" || e.key === "ArrowLeft") {
+      nextIdx = (idx - 1 + verdictKeys.length) % verdictKeys.length
+    } else if (e.key === "Home") {
+      nextIdx = 0
+    } else if (e.key === "End") {
+      nextIdx = verdictKeys.length - 1
+    }
+    if (nextIdx >= 0) {
+      e.preventDefault()
+      const nextKey = verdictKeys[nextIdx]
+      setVerdict(nextKey)
+      verdictTabRefs.current[nextKey]?.focus()
+    }
+  }
 
   return (
     <div className="sc">
@@ -211,17 +234,25 @@ export function ShowcasePage({ onEnterStation }: ShowcasePageProps) {
           </div>
 
           <div className="sc-logic-grid">
-            <div className="sc-state-list" role="tablist" aria-label="现场工况示例">
-              {(Object.keys(verdictCases) as VerdictKey[]).map((key) => {
+            <div className="sc-state-list" role="tablist" aria-label="现场工况示例" aria-orientation="vertical">
+              {verdictKeys.map((key) => {
                 const item = verdictCases[key]
+                const selected = verdict === key
                 return (
                   <button
                     key={key}
+                    ref={(el) => {
+                      verdictTabRefs.current[key] = el
+                    }}
+                    id={`sc-verdict-tab-${key}`}
                     type="button"
                     role="tab"
-                    aria-selected={verdict === key}
-                    className={`sc-state-btn ${verdict === key ? "on" : ""}`}
+                    tabIndex={selected ? 0 : -1}
+                    aria-selected={selected}
+                    aria-controls="sc-verdict-tabpanel"
+                    className={`sc-state-btn ${selected ? "on" : ""}`}
                     onClick={() => setVerdict(key)}
+                    onKeyDown={(e) => handleVerdictTabKeyDown(e, key)}
                   >
                     <b>{item.name}</b>
                     <span className={`sc-state-tag ${item.tone}`}>{item.code}</span>
@@ -231,7 +262,13 @@ export function ShowcasePage({ onEnterStation }: ShowcasePageProps) {
               })}
             </div>
 
-            <div className="sc-verdict-panel" role="tabpanel">
+            <div
+              id="sc-verdict-tabpanel"
+              className="sc-verdict-panel"
+              role="tabpanel"
+              aria-labelledby={`sc-verdict-tab-${verdict}`}
+              tabIndex={0}
+            >
               <div className="sc-verdict-top">
                 <div className={`sc-verdict-word ${current.tone}`}>{current.word}</div>
                 <span className={`sc-state-tag ${current.tone}`}>{current.code}</span>

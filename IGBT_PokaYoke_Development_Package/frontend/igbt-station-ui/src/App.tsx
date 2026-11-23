@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any -- 机器视觉 API 响应已定义在后端 SQLite 模式中 */
 import { Fragment, useCallback, useEffect, useRef, useState } from "react"
+import { AlertDialog, Dialog } from "radix-ui"
 import {
   AlertTriangle,
   Camera,
@@ -49,6 +50,7 @@ import {
   dateTimeOf,
   deriveOutcome,
   fmt,
+  formatCTimerSeconds,
   human,
   labelText,
   pipeText,
@@ -236,20 +238,112 @@ function toHeaderValue(raw: string, fallback: string): string {
   return encodeURIComponent(trimmed)
 }
 
-async function api<T = any>(path: string, options: RequestInit = {}, token = ""): Promise<T> {
+class ApiError extends Error {
+  status: number
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = "ApiError"
+    this.status = status
+  }
+}
+
+const POLL_TIMEOUT_MS = 4000
+const MIN_ROI_SPAN = 0.005
+
+function isValidRoiBox(box: unknown): box is [number, number, number, number] {
+  if (!Array.isArray(box) || box.length !== 4) return false
+  const [x1, y1, x2, y2] = box.map(Number)
+  if (![x1, y1, x2, y2].every(Number.isFinite)) return false
+  return x1 >= 0 && y1 >= 0 && x2 <= 1 && y2 <= 1 && x2 - x1 >= MIN_ROI_SPAN && y2 - y1 >= MIN_ROI_SPAN
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  if (target.isContentEditable) return true
+  return Boolean(target.closest('input, textarea, select, [contenteditable="true"]'))
+}
+
+function isInteractiveTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  if (target.isContentEditable) return true
+  return Boolean(
+    target.closest(
+      'button, a[href], input, select, textarea, summary, details, [contenteditable="true"], [role="button"], [role="link"], [role="tab"], [role="switch"], [role="checkbox"], [role="radio"], [role="menuitem"], [role="combobox"], [role="listbox"], [role="option"], [role="slider"]'
+    )
+  )
+}
+
+function readStoredThemePreference(): "light" | "dark" {
+  const q = new URLSearchParams(window.location.search).get("theme")
+  if (q === "dark" || q === "light") return q
+  try {
+    return window.localStorage.getItem("igbt-ui-theme") === "dark" ? "dark" : "light"
+  } catch {
+    return "light"
+  }
+}
+
+function writeStoredThemePreference(nextTheme: "light" | "dark"): void {
+  try {
+    window.localStorage.setItem("igbt-ui-theme", nextTheme)
+  } catch {
+    /* 浏览器存储不可用或配额满时保留内存主题状态 */
+  }
+}
+
+function isAbortError(err: unknown): boolean {
+  return err instanceof DOMException && err.name === "AbortError"
+}
+
+async function api<T = any>(
+  path: string,
+  options: RequestInit = {},
+  token = "",
+  timeoutMs?: number
+): Promise<T> {
   const headers = new Headers(options.headers)
   if (token) headers.set("X-Admin-Token", token)
-  const response = await fetch(path, { ...options, headers })
-  if (!response.ok) {
-    let reason = `HTTP ${response.status}`
-    try {
-      reason = (await response.json()).detail || reason
-    } catch {
-      /* 非 JSON 响应 */
+
+  let controller: AbortController | null = null
+  let timeoutId: number | null = null
+  let onExternalAbort: (() => void) | null = null
+  const externalSignal = options.signal
+
+  if (timeoutMs && timeoutMs > 0) {
+    controller = new AbortController()
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        controller.abort()
+      } else {
+        onExternalAbort = () => controller?.abort()
+        externalSignal.addEventListener("abort", onExternalAbort, { once: true })
+      }
     }
-    throw new Error(String(reason))
+    timeoutId = window.setTimeout(() => controller?.abort(), timeoutMs)
   }
-  return response.json() as Promise<T>
+
+  try {
+    const response = await fetch(path, {
+      ...options,
+      headers,
+      signal: controller ? controller.signal : externalSignal,
+    })
+    if (!response.ok) {
+      let reason = `HTTP ${response.status}`
+      try {
+        reason = (await response.json()).detail || reason
+      } catch {
+        /* 非 JSON 响应 */
+      }
+      throw new ApiError(String(reason), response.status)
+    }
+    return (await response.json()) as T
+  } finally {
+    if (timeoutId !== null) window.clearTimeout(timeoutId)
+    if (externalSignal && onExternalAbort) {
+      externalSignal.removeEventListener("abort", onExternalAbort)
+    }
+  }
 }
 
 function App() {
@@ -258,25 +352,24 @@ function App() {
     return sp.get("showcase") === "1" || sp.get("page") === "showcase"
   })
 
-  // 严格角色隔离：默认 operator，仅当 sessionStorage 中存在有效已验证会话时恢复 engineer，绝不硬编码明文口令
-  const [role, setRole] = useState<Role>(() => (readStoredSession() ? "engineer" : "operator"))
-  const [adminToken, setAdminToken] = useState<string>(() => readStoredSession()?.token || "")
+  // 严格角色隔离：默认 operator；会话主状态保存在内存中，sessionStorage 仅作刷新恢复（不可用时不强制登出）
+  const [engineerSession, setEngineerSession] = useState<StoredEngineerSession | null>(() => readStoredSession())
+  const role: Role = engineerSession ? "engineer" : "operator"
+  const adminToken = engineerSession?.token || ""
+
   const [step, setStep] = useState<EngineerStep>("monitor")
   const [step4Tab, setStep4Tab] = useState<RecordsSettingsTab>("records")
   const [authModalOpen, setAuthModalOpen] = useState(false)
   const loginTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const engineerEntryFocusRef = useRef<HTMLButtonElement | null>(null)
+  const shouldFocusEngineerRef = useRef(false)
   const lastActiveRef = useRef<number>(0)
-  const idleLimitRef = useRef<number>(IDLE_LOCK_MS)
 
-  const [theme, setTheme] = useState<"light" | "dark">(() => {
-    const q = new URLSearchParams(window.location.search).get("theme")
-    if (q === "dark" || q === "light") return q
-    return window.localStorage.getItem("igbt-ui-theme") === "dark" ? "dark" : "light"
-  })
+  const [theme, setTheme] = useState<"light" | "dark">(() => readStoredThemePreference())
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
-    window.localStorage.setItem("igbt-ui-theme", theme)
+    writeStoredThemePreference(theme)
   }, [theme])
 
   const [currentTime, setCurrentTime] = useState(new Date())
@@ -308,20 +401,58 @@ function App() {
     progress_pct: 0,
     history: [],
   })
+  const [trainingError, setTrainingError] = useState("")
   const [storageOverview, setStorageOverview] = useState<Data | null>(null)
   const [storageLoading, setStorageLoading] = useState(false)
+  const [storageError, setStorageError] = useState("")
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null)
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState("")
-  const [events, setEvents] = useState<Data[]>([])
   const [selectedCycleId, setSelectedCycleId] = useState<string>("")
+  const [cycleTimeline, setCycleTimeline] = useState<{
+    cycleId: string
+    events: Data[]
+    loading: boolean
+    error: string
+  }>({ cycleId: "", events: [], loading: false, error: "" })
   const [notice, setNotice] = useState("")
   const [refreshing, setRefreshing] = useState(false)
   const [simulating, setSimulating] = useState("")
   const [togglingMirror, setTogglingMirror] = useState(false)
+  const [captureShutterSeq, setCaptureShutterSeq] = useState(0)
   const [activeSnapshot, setActiveSnapshot] = useState<FilmstripItem | null>(null)
   const noticeTimerRef = useRef<number | null>(null)
   const refreshTimerRef = useRef<number | null>(null)
+
+  const roleRef = useRef<Role>(role)
+  const adminTokenRef = useRef<string>(adminToken)
+  const selectedCycleRef = useRef<string>(selectedCycleId)
+  const refreshSeqRef = useRef(0)
+  const scheduledInFlightRef = useRef(false)
+  const refreshAbortRef = useRef<AbortController | null>(null)
+  const eventsReqSeqRef = useRef(0)
+  const eventsAbortRef = useRef<AbortController | null>(null)
+  const eventsExplicitInFlightRef = useRef(false)
+
+  useEffect(() => {
+    roleRef.current = role
+  }, [role])
+  useEffect(() => {
+    adminTokenRef.current = adminToken
+  }, [adminToken])
+  useEffect(() => {
+    selectedCycleRef.current = selectedCycleId
+  }, [selectedCycleId])
+
+  // 登录成功后将键盘焦点移入工程师工作区首步导航控件
+  useEffect(() => {
+    if (role !== "engineer" || !shouldFocusEngineerRef.current) return
+    shouldFocusEngineerRef.current = false
+    const raf = window.requestAnimationFrame(() => {
+      engineerEntryFocusRef.current?.focus()
+    })
+    return () => window.cancelAnimationFrame(raf)
+  }, [role])
 
   const flash = useCallback((message: string) => {
     setNotice(message)
@@ -344,30 +475,42 @@ function App() {
       if (refreshTimerRef.current !== null) {
         window.clearTimeout(refreshTimerRef.current)
       }
+      refreshAbortRef.current?.abort()
+      eventsAbortRef.current?.abort()
     }
+  }, [])
+
+  const clearSelectedCycle = useCallback(() => {
+    selectedCycleRef.current = ""
+    setSelectedCycleId("")
+    eventsReqSeqRef.current += 1
+    eventsExplicitInFlightRef.current = false
+    eventsAbortRef.current?.abort()
+    eventsAbortRef.current = null
+    setCycleTimeline({ cycleId: "", events: [], loading: false, error: "" })
   }, [])
 
   const lockEngineerSession = useCallback(
     (reason?: string) => {
       clearStoredSession()
-      setAdminToken("")
-      setRole("operator")
+      setEngineerSession(null)
       setStep("monitor")
       setActiveSnapshot(null)
       setConfirmDialog(null)
       setStorageOverview(null)
+      setStorageError("")
+      setTrainingError("")
+      clearSelectedCycle()
       if (reason) flash(reason)
     },
-    [flash]
+    [clearSelectedCycle, flash]
   )
 
-  // 工程师会话 30 分钟无操作自动锁屏回退作业员屏
+  // 工程师会话 30 分钟无操作或令牌到期自动锁屏回退作业员屏（基于内存会话，不依赖 sessionStorage 写入成功）
   useEffect(() => {
-    if (role !== "engineer") return
+    if (!engineerSession) return
 
-    const initialStored = readStoredSession()
-    lastActiveRef.current = initialStored?.lastActiveAt ?? Date.now()
-    idleLimitRef.current = initialStored?.idleTimeoutMs ?? IDLE_LOCK_MS
+    lastActiveRef.current = Math.max(lastActiveRef.current, engineerSession.lastActiveAt || Date.now())
 
     let lastTouchWrite = 0
     const markActivity = () => {
@@ -389,9 +532,12 @@ function App() {
     activityEvents.forEach((ev) => window.addEventListener(ev, markActivity, { passive: true }))
 
     const checkInterval = window.setInterval(() => {
-      const stored = readStoredSession()
       const now = Date.now()
-      if (!stored || now - lastActiveRef.current >= idleLimitRef.current || now >= stored.expiresAt) {
+      const stored = readStoredSession()
+      if (stored && stored.token === engineerSession.token && stored.lastActiveAt > lastActiveRef.current) {
+        lastActiveRef.current = stored.lastActiveAt
+      }
+      if (now - lastActiveRef.current >= engineerSession.idleTimeoutMs || now >= engineerSession.expiresAt) {
         lockEngineerSession("工程师会话已超时自动锁定，已返回作业员视图")
       }
     }, 15_000)
@@ -400,109 +546,230 @@ function App() {
       activityEvents.forEach((ev) => window.removeEventListener(ev, markActivity))
       window.clearInterval(checkInterval)
     }
-  }, [role, lockEngineerSession])
+  }, [engineerSession, lockEngineerSession])
 
-  const openEvents = useCallback(
-    async (id: string) => {
-      setSelectedCycleId(id)
+  const loadCycleEvents = useCallback(
+    async (
+      id: string,
+      opts: { silent?: boolean; onlyIfNoExplicitSelection?: boolean } = {}
+    ) => {
+      if (!id) {
+        if (!selectedCycleRef.current) {
+          eventsReqSeqRef.current += 1
+          eventsAbortRef.current?.abort()
+          eventsAbortRef.current = null
+          setCycleTimeline({ cycleId: "", events: [], loading: false, error: "" })
+        }
+        return
+      }
+      if (opts.silent && eventsExplicitInFlightRef.current) {
+        return
+      }
+
+      const reqSeq = ++eventsReqSeqRef.current
+      eventsAbortRef.current?.abort()
+      const controller = new AbortController()
+      eventsAbortRef.current = controller
+
+      if (!opts.silent) {
+        eventsExplicitInFlightRef.current = true
+        setCycleTimeline((prev) => ({
+          cycleId: id,
+          events: prev.cycleId === id ? prev.events : [],
+          loading: true,
+          error: "",
+        }))
+      }
+
       try {
-        setEvents(await api<Data[]>(`/api/cycles/${encodeURIComponent(id)}/events?limit=100`))
-      } catch (e) {
-        flash(String(e))
+        const list = await api<Data[]>(
+          `/api/cycles/${encodeURIComponent(id)}/events?limit=100`,
+          { signal: controller.signal },
+          "",
+          POLL_TIMEOUT_MS
+        )
+        if (reqSeq !== eventsReqSeqRef.current || controller.signal.aborted) return
+        if (opts.onlyIfNoExplicitSelection && selectedCycleRef.current) return
+        if (selectedCycleRef.current && selectedCycleRef.current !== id) return
+        setCycleTimeline({ cycleId: id, events: list, loading: false, error: "" })
+      } catch (err) {
+        if (reqSeq !== eventsReqSeqRef.current || controller.signal.aborted || isAbortError(err)) return
+        if (opts.onlyIfNoExplicitSelection && selectedCycleRef.current) return
+        if (selectedCycleRef.current && selectedCycleRef.current !== id) return
+        const msg = err instanceof Error ? err.message : String(err)
+        if (!opts.silent) {
+          setCycleTimeline((prev) => ({
+            cycleId: id,
+            events: prev.cycleId === id ? prev.events : [],
+            loading: false,
+            error: msg,
+          }))
+          flash(`加载周期时间线失败：${msg}`)
+        }
+      } finally {
+        if (eventsAbortRef.current === controller) {
+          eventsAbortRef.current = null
+        }
+        if (reqSeq === eventsReqSeqRef.current && !opts.silent) {
+          eventsExplicitInFlightRef.current = false
+        }
       }
     },
     [flash]
   )
 
-  const roleRef = useRef<Role>(role)
-  const selectedCycleRef = useRef<string>(selectedCycleId)
-  useEffect(() => {
-    roleRef.current = role
-  }, [role])
-  useEffect(() => {
-    selectedCycleRef.current = selectedCycleId
-  }, [selectedCycleId])
+  const openEvents = useCallback(
+    async (id: string) => {
+      selectedCycleRef.current = id
+      setSelectedCycleId(id)
+      await loadCycleEvents(id, { silent: false })
+    },
+    [loadCycleEvents]
+  )
 
-  const refresh = useCallback(async (forceEngineerFetch = false) => {
-    setRefreshing(true)
-    const isEngineer = forceEngineerFetch || roleRef.current === "engineer"
-    try {
-      if (isEngineer) {
-        const [s, c, e, cfg, h, m, ds, tr] = await Promise.all([
-          api<Data>("/api/state"),
-          api<Data[]>("/api/cycles?limit=30"),
-          api<Data[]>("/api/evidence?limit=40"),
-          api<Data>("/api/config"),
-          api<Data[]>("/api/config/history?limit=20"),
-          api<Data[]>("/api/models?limit=30"),
-          api<Data>("/api/dataset/summary"),
-          api<Data>("/api/training/status"),
-        ])
-        setState(s)
-        setCycles(c)
-        setEvidence(e)
-        setConfig(cfg)
-        setHistory(h)
-        setModels(m)
-        setDatasetSummary(ds)
-        setTrainingStatus(tr)
-        setConnected(true)
-        setError("")
-        const targetCycleId = selectedCycleRef.current || s?.cycle_id || c?.[0]?.cycle_id
-        if (targetCycleId) {
-          try {
-            setEvents(await api<Data[]>(`/api/cycles/${encodeURIComponent(targetCycleId)}/events?limit=100`))
-          } catch {
-            /* 忽略周期事件查询异常 */
+  const refresh = useCallback(
+    async (forceEngineerFetch = false, scheduled = false) => {
+      if (scheduled && scheduledInFlightRef.current) return
+      if (scheduled) {
+        scheduledInFlightRef.current = true
+      } else {
+        refreshAbortRef.current?.abort()
+        setRefreshing(true)
+      }
+
+      const seq = ++refreshSeqRef.current
+      const controller = new AbortController()
+      refreshAbortRef.current = controller
+      const isEngineer = forceEngineerFetch || roleRef.current === "engineer"
+
+      try {
+        const signalOpt: RequestInit = { signal: controller.signal }
+        if (isEngineer) {
+          const [stateRes, cyclesRes, evidenceRes, cfgRes, historyRes, modelsRes, dsRes, trRes] =
+            await Promise.allSettled([
+              api<Data>("/api/state", signalOpt, "", POLL_TIMEOUT_MS),
+              api<Data[]>("/api/cycles?limit=30", signalOpt, "", POLL_TIMEOUT_MS),
+              api<Data[]>("/api/evidence?limit=40", signalOpt, "", POLL_TIMEOUT_MS),
+              api<Data>("/api/config", signalOpt, "", POLL_TIMEOUT_MS),
+              api<Data[]>("/api/config/history?limit=20", signalOpt, "", POLL_TIMEOUT_MS),
+              api<Data[]>("/api/models?limit=30", signalOpt, "", POLL_TIMEOUT_MS),
+              api<Data>("/api/dataset/summary", signalOpt, "", POLL_TIMEOUT_MS),
+              api<Data>("/api/training/status", signalOpt, "", POLL_TIMEOUT_MS),
+            ])
+
+          if (seq !== refreshSeqRef.current || controller.signal.aborted) return
+
+          if (stateRes.status === "fulfilled") {
+            setState(stateRes.value)
+            setConnected(true)
+            setError("")
+          } else if (!isAbortError(stateRes.reason)) {
+            setConnected(false)
+            setError(stateRes.reason instanceof Error ? stateRes.reason.message : "无法连接本地工作站服务")
+            setState({
+              camera_status: "FAULT",
+              view_valid: false,
+              label_status: "unknown",
+              fsm_state: "FAULT",
+              outcome: "FAULT",
+              c_timer_ms: 0,
+              mirror_horizontal: true,
+              view_valid_reasons: ["API_UNAVAILABLE"],
+              result_reason: "API_UNAVAILABLE_FAIL_CLOSED",
+            })
+          }
+
+          if (cyclesRes.status === "fulfilled") setCycles(cyclesRes.value)
+          if (evidenceRes.status === "fulfilled") setEvidence(evidenceRes.value)
+          if (cfgRes.status === "fulfilled") setConfig(cfgRes.value)
+          if (historyRes.status === "fulfilled") setHistory(historyRes.value)
+          if (modelsRes.status === "fulfilled") setModels(modelsRes.value)
+          if (dsRes.status === "fulfilled") setDatasetSummary(dsRes.value)
+
+          if (trRes.status === "fulfilled") {
+            setTrainingStatus(trRes.value)
+            setTrainingError("")
+          } else if (!isAbortError(trRes.reason)) {
+            setTrainingError(trRes.reason instanceof Error ? trRes.reason.message : "无法获取训练任务状态")
+          }
+
+          const explicitId = selectedCycleRef.current
+          const fallbackId =
+            (stateRes.status === "fulfilled" ? stateRes.value?.cycle_id : undefined) ||
+            (cyclesRes.status === "fulfilled" ? cyclesRes.value?.[0]?.cycle_id : undefined)
+          const targetCycleId = explicitId || fallbackId
+          if (targetCycleId) {
+            void loadCycleEvents(String(targetCycleId), {
+              silent: true,
+              onlyIfNoExplicitSelection: !explicitId,
+            })
+          } else if (!explicitId) {
+            void loadCycleEvents("")
           }
         } else {
-          setEvents([])
+          const [stateRes, cyclesRes, evidenceRes] = await Promise.allSettled([
+            api<Data>("/api/state", signalOpt, "", POLL_TIMEOUT_MS),
+            api<Data[]>("/api/cycles?limit=30", signalOpt, "", POLL_TIMEOUT_MS),
+            api<Data[]>("/api/evidence?limit=40", signalOpt, "", POLL_TIMEOUT_MS),
+          ])
+
+          if (seq !== refreshSeqRef.current || controller.signal.aborted) return
+
+          if (stateRes.status === "fulfilled") {
+            setState(stateRes.value)
+            setConnected(true)
+            setError("")
+          } else if (!isAbortError(stateRes.reason)) {
+            setConnected(false)
+            setError(stateRes.reason instanceof Error ? stateRes.reason.message : "无法连接本地工作站服务")
+            setState({
+              camera_status: "FAULT",
+              view_valid: false,
+              label_status: "unknown",
+              fsm_state: "FAULT",
+              outcome: "FAULT",
+              c_timer_ms: 0,
+              mirror_horizontal: true,
+              view_valid_reasons: ["API_UNAVAILABLE"],
+              result_reason: "API_UNAVAILABLE_FAIL_CLOSED",
+            })
+          }
+
+          if (cyclesRes.status === "fulfilled") setCycles(cyclesRes.value)
+          if (evidenceRes.status === "fulfilled") setEvidence(evidenceRes.value)
         }
-      } else {
-        const [s, c, e] = await Promise.all([
-          api<Data>("/api/state"),
-          api<Data[]>("/api/cycles?limit=30"),
-          api<Data[]>("/api/evidence?limit=40"),
-        ])
-        setState(s)
-        setCycles(c)
-        setEvidence(e)
-        setConnected(true)
-        setError("")
+      } finally {
+        if (scheduled) {
+          scheduledInFlightRef.current = false
+        }
+        if (refreshAbortRef.current === controller) {
+          refreshAbortRef.current = null
+        }
+        if (!scheduled) {
+          if (refreshTimerRef.current !== null) {
+            window.clearTimeout(refreshTimerRef.current)
+          }
+          refreshTimerRef.current = window.setTimeout(() => {
+            setRefreshing(false)
+            refreshTimerRef.current = null
+          }, 220)
+        }
       }
-    } catch (e) {
-      setConnected(false)
-      setError(e instanceof Error ? e.message : "无法连接本地工作站服务")
-      setState({
-        camera_status: "FAULT",
-        view_valid: false,
-        label_status: "unknown",
-        fsm_state: "FAULT",
-        outcome: "FAULT",
-        c_timer_ms: 0,
-        mirror_horizontal: true,
-        view_valid_reasons: ["API_UNAVAILABLE"],
-        result_reason: "API_UNAVAILABLE_FAIL_CLOSED",
-      })
-    } finally {
-      if (refreshTimerRef.current !== null) {
-        window.clearTimeout(refreshTimerRef.current)
-      }
-      refreshTimerRef.current = window.setTimeout(() => {
-        setRefreshing(false)
-        refreshTimerRef.current = null
-      }, 220)
-    }
-  }, [])
+    },
+    [loadCycleEvents]
+  )
 
   const loadStorageOverview = useCallback(async () => {
     if (roleRef.current !== "engineer") return
     setStorageLoading(true)
+    setStorageError("")
     try {
-      const ov = await api<Data>("/api/storage/overview")
+      const ov = await api<Data>("/api/storage/overview", {}, adminTokenRef.current, POLL_TIMEOUT_MS)
       setStorageOverview(ov)
-    } catch {
-      /* 忽略离线时的存储统计请求异常 */
+      setStorageError("")
+    } catch (err) {
+      setStorageOverview(null)
+      setStorageError(err instanceof Error ? err.message : "存储统计获取失败")
     } finally {
       setStorageLoading(false)
     }
@@ -512,9 +779,10 @@ function App() {
     ({ adminToken: verifiedToken, expiresInSeconds }: EngineerAuthResult) => {
       const stored = saveStoredSession(verifiedToken, expiresInSeconds)
       lastActiveRef.current = stored.lastActiveAt
-      idleLimitRef.current = stored.idleTimeoutMs
-      setAdminToken(verifiedToken)
-      setRole("engineer")
+      adminTokenRef.current = stored.token
+      roleRef.current = "engineer"
+      shouldFocusEngineerRef.current = true
+      setEngineerSession(stored)
       setStep("monitor")
       setAuthModalOpen(false)
       flash("工程师权限已解锁（30 分钟无操作将自动锁屏）")
@@ -525,10 +793,12 @@ function App() {
 
   const captureLiveFrame = useCallback(async () => {
     try {
-      const res = await api<Data>("/api/camera/capture", { method: "POST" })
+      const res = await api<Data>("/api/camera/capture", { method: "POST" }, adminTokenRef.current)
+      setCaptureShutterSeq((n) => n + 1)
       flash(`已抓拍当前画面并归档 (${res.cycle_id})`)
-      await refresh()
-    } catch {
+    } catch (err) {
+      flash(`抓拍归档失败：${err instanceof Error ? err.message : String(err)}`)
+    } finally {
       await refresh()
     }
   }, [flash, refresh])
@@ -536,11 +806,15 @@ function App() {
   const toggleAuxRois = useCallback(
     async (show: boolean) => {
       try {
-        await api<Data>("/api/camera/auxiliary_rois", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ show }),
-        })
+        await api<Data>(
+          "/api/camera/auxiliary_rois",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ show }),
+          },
+          adminTokenRef.current
+        )
         flash(show ? "已在实时画面叠加辅助参考框" : "已切换为纯动态目标跟随模式")
         await refresh(true)
       } catch (err) {
@@ -554,11 +828,15 @@ function App() {
     async (mirror: boolean) => {
       setTogglingMirror(true)
       try {
-        const res = await api<Data>("/api/camera/mirror", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mirror }),
-        })
+        const res = await api<Data>(
+          "/api/camera/mirror",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ mirror }),
+          },
+          adminTokenRef.current
+        )
         const nextMirror = res.mirror_horizontal !== false
         setState((prev) => ({ ...prev, mirror_horizontal: nextMirror }))
         flash(nextMirror ? "水平镜像对齐已开启（左右手与现实同步）" : "水平镜像已关闭（原始相机视角）")
@@ -575,11 +853,15 @@ function App() {
   const switchWorkMode = useCallback(
     async (mode: "debug" | "strict") => {
       try {
-        await api<Data>("/api/camera/work_mode", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ work_mode: mode }),
-        })
+        await api<Data>(
+          "/api/camera/work_mode",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ work_mode: mode }),
+          },
+          adminTokenRef.current
+        )
         flash(
           mode === "debug"
             ? "已切至【桌面调试模式】：免手套防误锁，适合桌面调参"
@@ -597,12 +879,23 @@ function App() {
     async (scenario: string) => {
       setSimulating(scenario)
       try {
-        await api<Data>(`/api/runtime/simulate/${encodeURIComponent(scenario)}`, {
-          method: "POST",
-        })
+        await api<Data>(
+          `/api/runtime/simulate/${encodeURIComponent(scenario)}`,
+          { method: "POST" },
+          adminTokenRef.current
+        )
         await refresh()
       } catch (e) {
-        flash(`操作失败：${e instanceof Error ? e.message : e}`)
+        if (
+          scenario === "reset" &&
+          roleRef.current === "operator" &&
+          e instanceof ApiError &&
+          (e.status === 401 || e.status === 403)
+        ) {
+          flash("实时报警复位需工程师权限，请先点击右上角「工程师登录」验证后再复位")
+        } else {
+          flash(`操作失败：${e instanceof Error ? e.message : e}`)
+        }
       } finally {
         setSimulating("")
       }
@@ -612,30 +905,31 @@ function App() {
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (authModalOpen || confirmDialog) return
+      if (showShowcase || e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return
       if (
-        e.target instanceof HTMLInputElement ||
-        e.target instanceof HTMLTextAreaElement ||
-        e.target instanceof HTMLSelectElement
+        authModalOpen ||
+        confirmDialog ||
+        activeSnapshot ||
+        document.querySelector('[role="dialog"], [role="alertdialog"]')
       ) {
         return
       }
       if (e.code === "Space") {
+        if (e.repeat || isInteractiveTarget(e.target)) return
         e.preventDefault()
         void captureLiveFrame()
       } else if (e.key.toLowerCase() === "t") {
+        if (e.repeat || isEditableTarget(e.target)) return
         setTheme((cur) => (cur === "light" ? "dark" : "light"))
-      } else if (e.key === "Escape") {
-        setActiveSnapshot(null)
       }
     }
     window.addEventListener("keydown", handleKeyDown)
     return () => window.removeEventListener("keydown", handleKeyDown)
-  }, [authModalOpen, confirmDialog, captureLiveFrame])
+  }, [showShowcase, authModalOpen, confirmDialog, activeSnapshot, captureLiveFrame])
 
   useEffect(() => {
-    const first = window.setTimeout(() => void refresh(), 0)
-    const id = window.setInterval(() => void refresh(), 750)
+    const first = window.setTimeout(() => void refresh(false, true), 0)
+    const id = window.setInterval(() => void refresh(false, true), 750)
     return () => {
       window.clearTimeout(first)
       window.clearInterval(id)
@@ -662,15 +956,34 @@ function App() {
     }
   })
 
-  const passCount = cycles.filter((c) => c.final_outcome === "PASS").length
-  const alarmCount = cycles.filter((c) => c.final_outcome === "ALARM" || c.final_outcome === "FAULT").length
-  const totalCount = cycles.length
+  const allSummary =
+    state.cycle_summary_all &&
+    typeof state.cycle_summary_all === "object" &&
+    typeof state.cycle_summary_all.total === "number" &&
+    Number.isFinite(state.cycle_summary_all.total)
+      ? state.cycle_summary_all
+      : null
+  const statsScope: "all" | "recent" = allSummary ? "all" : "recent"
+  const totalCount = allSummary ? Number(allSummary.total) : cycles.length
+  const passCount = allSummary
+    ? Number(allSummary.pass || 0)
+    : cycles.filter((c) => c.final_outcome === "PASS").length
+  const alarmCount = allSummary
+    ? Number(allSummary.alarm || 0) + Number(allSummary.fault || 0)
+    : cycles.filter((c) => c.final_outcome === "ALARM" || c.final_outcome === "FAULT").length
 
   const durations = cycles
     .filter((c) => c.final_outcome && c.created_at_utc && c.updated_at_utc)
     .map((c) => (Date.parse(c.updated_at_utc) - Date.parse(c.created_at_utc)) / 1000)
     .filter((d) => Number.isFinite(d) && d > 0 && d < 120)
   const avgTakt = durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : null
+
+  const displayedCycleId = selectedCycleId || cycleTimeline.cycleId
+  const displayedEvents = displayedCycleId && cycleTimeline.cycleId === displayedCycleId ? cycleTimeline.events : []
+  const timelineLoading =
+    Boolean(selectedCycleId && cycleTimeline.cycleId !== selectedCycleId) ||
+    (cycleTimeline.cycleId === displayedCycleId && cycleTimeline.loading)
+  const timelineError = cycleTimeline.cycleId === displayedCycleId ? cycleTimeline.error : ""
 
   const mirrorHorizontal = state.mirror_horizontal !== false
   const workMode = state.work_mode === "strict" ? "strict" : "debug"
@@ -743,14 +1056,15 @@ function App() {
                     ? isTraining
                       ? `${trainingStatus.progress_pct || 0}%`
                       : `${models.length}`
-                    : item.id === "records_settings" && cycles.length > 0
-                      ? `${cycles.length}`
+                    : item.id === "records_settings" && totalCount > 0
+                      ? `${totalCount}`
                       : null
 
               return (
                 <Fragment key={item.id}>
                   {idx > 0 && <ChevronRight size={13} className="studio-step-sep" aria-hidden="true" />}
                   <button
+                    ref={item.id === "monitor" ? engineerEntryFocusRef : undefined}
                     type="button"
                     className={`studio-step-btn ${active ? "on" : ""}`}
                     aria-current={active ? "step" : undefined}
@@ -837,6 +1151,8 @@ function App() {
             passCount={passCount}
             alarmCount={alarmCount}
             avgTaktTime={avgTakt}
+            statsScope={statsScope}
+            shutterKey={captureShutterSeq}
             onManualTrigger={() => void captureLiveFrame()}
             onResetAlarm={() => void simulateScenario("reset")}
           />
@@ -856,6 +1172,7 @@ function App() {
                 simulating={simulating}
                 mirrorHorizontal={mirrorHorizontal}
                 togglingMirror={togglingMirror}
+                shutterKey={captureShutterSeq}
                 onSimulate={(scenario) => void simulateScenario(scenario)}
                 onSwitchWorkMode={(mode) => void switchWorkMode(mode)}
                 onToggleAuxRois={(show) => void toggleAuxRois(show)}
@@ -878,6 +1195,7 @@ function App() {
                 models={models}
                 datasetSummary={datasetSummary}
                 trainingStatus={trainingStatus}
+                trainingError={trainingError}
                 token={adminToken}
                 flash={flash}
                 onSaved={() => refresh(true)}
@@ -896,25 +1214,29 @@ function App() {
                 datasetSummary={datasetSummary}
                 storageOverview={storageOverview}
                 storageLoading={storageLoading}
+                storageError={storageError}
                 cycles={cycles}
                 evidence={evidence}
-                events={events}
-                selectedCycleId={selectedCycleId || events[0]?.cycle_id || ""}
+                events={displayedEvents}
+                eventsLoading={timelineLoading}
+                eventsError={timelineError}
+                selectedCycleId={displayedCycleId}
                 filmstripItems={filmstripItems}
                 activeSnapshot={activeSnapshot}
                 passCount={passCount}
                 alarmCount={alarmCount}
                 totalCount={totalCount}
+                statsScope={statsScope}
                 token={adminToken}
                 mirrorHorizontal={mirrorHorizontal}
                 togglingMirror={togglingMirror}
                 flash={flash}
                 onConfirm={setConfirmDialog}
                 onSelectCycle={(id) => void openEvents(id)}
-                onClearSelectedCycle={() => {
-                  setSelectedCycleId("")
-                  setEvents([])
+                onRetryEvents={() => {
+                  if (displayedCycleId) void loadCycleEvents(displayedCycleId, { silent: false })
                 }}
+                onClearSelectedCycle={clearSelectedCycle}
                 onOpenSnapshot={(item) => {
                   setActiveSnapshot(item)
                   void openEvents(item.cycleId)
@@ -973,13 +1295,15 @@ function App() {
         triggerRef={loginTriggerRef}
       />
 
-      {role === "engineer" && activeSnapshot && (
-        <SnapshotModal item={activeSnapshot} onClose={() => setActiveSnapshot(null)} />
-      )}
+      <SnapshotModal
+        item={role === "engineer" ? activeSnapshot : null}
+        onClose={() => setActiveSnapshot(null)}
+      />
 
-      {role === "engineer" && confirmDialog && (
-        <ConfirmModal dialog={confirmDialog} onClose={() => setConfirmDialog(null)} />
-      )}
+      <ConfirmModal
+        dialog={role === "engineer" ? confirmDialog : null}
+        onClose={() => setConfirmDialog(null)}
+      />
 
       {notice && (
         <div className="toast" role="status">
@@ -993,54 +1317,94 @@ function App() {
   )
 }
 
-function ConfirmModal({ dialog, onClose }: { dialog: ConfirmDialogState; onClose: () => void }) {
+function ConfirmModal({ dialog, onClose }: { dialog: ConfirmDialogState | null; onClose: () => void }) {
+  const busyRef = useRef(false)
+  return (
+    <AlertDialog.Root
+      open={Boolean(dialog)}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen && !busyRef.current) onClose()
+      }}
+    >
+      {dialog && (
+        <ConfirmModalContent
+          key={`${dialog.title}:${dialog.description}`}
+          dialog={dialog}
+          busyRef={busyRef}
+          onClose={onClose}
+        />
+      )}
+    </AlertDialog.Root>
+  )
+}
+
+function ConfirmModalContent({
+  dialog,
+  busyRef,
+  onClose,
+}: {
+  dialog: ConfirmDialogState
+  busyRef: React.MutableRefObject<boolean>
+  onClose: () => void
+}) {
   const [acknowledged, setAcknowledged] = useState(false)
   const [busy, setBusy] = useState(false)
   const cancelBtnRef = useRef<HTMLButtonElement | null>(null)
 
   useEffect(() => {
-    const prev = document.activeElement instanceof HTMLElement ? document.activeElement : null
-    cancelBtnRef.current?.focus()
+    busyRef.current = busy
     return () => {
-      if (prev && document.contains(prev)) prev.focus()
+      busyRef.current = false
     }
-  }, [])
+  }, [busy, busyRef])
 
   const canConfirm = !busy && (!dialog.requireCheckLabel || acknowledged)
 
   const handleConfirm = async () => {
     if (!canConfirm) return
+    busyRef.current = true
     setBusy(true)
     try {
       await dialog.onConfirm()
+      busyRef.current = false
       onClose()
     } finally {
+      busyRef.current = false
       setBusy(false)
     }
   }
 
   return (
-    <div className="modal-scrim" onClick={() => (!busy ? onClose() : undefined)}>
-      <div
+    <AlertDialog.Portal>
+      <AlertDialog.Overlay
+        className="modal-scrim"
+        onClick={() => {
+          if (!busy) onClose()
+        }}
+      />
+      <AlertDialog.Content
         className="modal confirm-modal"
-        role="alertdialog"
-        aria-modal="true"
-        aria-labelledby="confirm-dialog-title"
-        aria-describedby="confirm-dialog-desc"
-        onClick={(e) => e.stopPropagation()}
-        onKeyDown={(e) => {
-          if (e.key === "Escape" && !busy) onClose()
+        onOpenAutoFocus={(e) => {
+          e.preventDefault()
+          cancelBtnRef.current?.focus()
+        }}
+        onEscapeKeyDown={(e) => {
+          if (busy) {
+            e.preventDefault()
+          }
         }}
       >
         <header className="panel-head">
-          <h2 id="confirm-dialog-title" className="flex items-center gap-1.5">
-            <ShieldAlert
-              size={15}
-              aria-hidden="true"
-              style={{ color: dialog.tone === "danger" ? "var(--bad)" : "var(--warn)" }}
-            />
-            {dialog.title}
-          </h2>
+          <AlertDialog.Title asChild>
+            <h2 id="confirm-dialog-title" className="flex items-center gap-1.5">
+              <ShieldAlert
+                size={15}
+                aria-hidden="true"
+                style={{ color: dialog.tone === "danger" ? "var(--bad)" : "var(--warn)" }}
+              />
+              {dialog.title}
+            </h2>
+          </AlertDialog.Title>
           <div className="right">
             <button
               type="button"
@@ -1054,8 +1418,10 @@ function ConfirmModal({ dialog, onClose }: { dialog: ConfirmDialogState; onClose
           </div>
         </header>
         <div className="panel-body grid gap-3">
-          <div id="confirm-dialog-desc" className={`confirm-consequence ${dialog.tone === "danger" ? "danger" : ""}`}>
-            <div>{dialog.description}</div>
+          <div className={`confirm-consequence ${dialog.tone === "danger" ? "danger" : ""}`}>
+            <AlertDialog.Description asChild>
+              <div id="confirm-dialog-desc">{dialog.description}</div>
+            </AlertDialog.Description>
             {dialog.consequences && dialog.consequences.length > 0 && (
               <ul>
                 {dialog.consequences.map((item) => (
@@ -1097,61 +1463,70 @@ function ConfirmModal({ dialog, onClose }: { dialog: ConfirmDialogState; onClose
             </button>
           </div>
         </div>
-      </div>
-    </div>
+      </AlertDialog.Content>
+    </AlertDialog.Portal>
   )
 }
 
-function SnapshotModal({ item, onClose }: { item: FilmstripItem; onClose: () => void }) {
-  const v = verdictOf(item.outcome)
+function SnapshotModal({ item, onClose }: { item: FilmstripItem | null; onClose: () => void }) {
   const closeBtnRef = useRef<HTMLButtonElement | null>(null)
-
-  useEffect(() => {
-    const prev = document.activeElement instanceof HTMLElement ? document.activeElement : null
-    closeBtnRef.current?.focus()
-    return () => {
-      if (prev && document.contains(prev)) prev.focus()
-    }
-  }, [])
+  const v = item ? verdictOf(item.outcome) : null
 
   return (
-    <div className="modal-scrim" onClick={onClose}>
-      <div
-        className="modal"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="snapshot-title"
-        onClick={(e) => e.stopPropagation()}
-        onKeyDown={(e) => {
-          if (e.key === "Escape") onClose()
-        }}
-      >
-        <header className="panel-head">
-          <h2 id="snapshot-title">检验快照</h2>
-          <span className="sub mono">{item.cycleId}</span>
-          <div className="right">
-            <button ref={closeBtnRef} type="button" className="icon-btn" onClick={onClose} aria-label="关闭">
-              <X size={15} aria-hidden="true" />
-            </button>
-          </div>
-        </header>
-        <div className="panel-body grid gap-4">
-          <CameraFrame src={item.url} alt="检验周期证据快照" emptyTitle="该周期无图像" />
-          <dl className="dl">
-            <dt>判定</dt>
-            <dd>
-              <span className={`tag ${v.tone}`}>{v.word}</span>
-            </dd>
-            <dt>时间</dt>
-            <dd className="mono">{dateTimeOf(item.timestamp)}</dd>
-            <dt>料管</dt>
-            <dd>{pipeText(item.pipeColor)}</dd>
-            <dt>初始标签</dt>
-            <dd>{labelText[item.labelStatus ?? ""] || "—"}</dd>
-          </dl>
-        </div>
-      </div>
-    </div>
+    <Dialog.Root
+      open={Boolean(item)}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen) onClose()
+      }}
+    >
+      {item && v && (
+        <Dialog.Portal>
+          <Dialog.Overlay className="modal-scrim" />
+          <Dialog.Content
+            className="modal"
+            onOpenAutoFocus={(e) => {
+              e.preventDefault()
+              closeBtnRef.current?.focus()
+            }}
+          >
+            <header className="panel-head">
+              <Dialog.Title asChild>
+                <h2 id="snapshot-title">检验快照</h2>
+              </Dialog.Title>
+              <span className="sub mono">{item.cycleId}</span>
+              <div className="right">
+                <button ref={closeBtnRef} type="button" className="icon-btn" onClick={onClose} aria-label="关闭">
+                  <X size={15} aria-hidden="true" />
+                </button>
+              </div>
+            </header>
+            <Dialog.Description className="sr-only">
+              检验周期 {item.cycleId} 证据快照与判定详情
+            </Dialog.Description>
+            <div className="panel-body grid gap-4">
+              <CameraFrame
+                src={item.url}
+                alt="检验周期证据快照"
+                emptyTitle="该周期无图像"
+                errorTitle="快照图像不可用"
+              />
+              <dl className="dl">
+                <dt>判定</dt>
+                <dd>
+                  <span className={`tag ${v.tone}`}>{v.word}</span>
+                </dd>
+                <dt>时间</dt>
+                <dd className="mono">{dateTimeOf(item.timestamp)}</dd>
+                <dt>料管</dt>
+                <dd>{pipeText(item.pipeColor)}</dd>
+                <dt>初始标签</dt>
+                <dd>{labelText[item.labelStatus ?? ""] || "—"}</dd>
+              </dl>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      )}
+    </Dialog.Root>
   )
 }
 
@@ -1176,6 +1551,7 @@ function LiveStudioWorkspace({
   simulating,
   mirrorHorizontal,
   togglingMirror,
+  shutterKey = 0,
   onSimulate,
   onSwitchWorkMode,
   onToggleAuxRois,
@@ -1197,6 +1573,7 @@ function LiveStudioWorkspace({
   simulating: string
   mirrorHorizontal: boolean
   togglingMirror: boolean
+  shutterKey?: number
   onSimulate: (scenario: string) => void
   onSwitchWorkMode: (mode: "debug" | "strict") => void
   onToggleAuxRois: (show: boolean) => void
@@ -1224,10 +1601,12 @@ function LiveStudioWorkspace({
   const [uploadLabel, setUploadLabel] = useState<SampleLabel>("complete")
   const [uploadingSample, setUploadingSample] = useState(false)
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
+  const uploadFileRef = useRef<File | null>(null)
   const previewUrlRef = useRef("")
 
   // 样本库筛选、加载与多选批量删除状态
   const [sampleFilter, setSampleFilter] = useState<SampleFilter>("")
+  const [samplesLoadedFilter, setSamplesLoadedFilter] = useState<SampleFilter | null>(null)
   const [samples, setSamples] = useState<Data[]>([])
   const [samplesLoading, setSamplesLoading] = useState(false)
   const [selectedSampleIds, setSelectedSampleIds] = useState<string[]>([])
@@ -1251,6 +1630,7 @@ function LiveStudioWorkspace({
       URL.revokeObjectURL(previewUrlRef.current)
       previewUrlRef.current = ""
     }
+    uploadFileRef.current = nextFile
     setUploadFile(nextFile)
     if (nextFile) {
       const nextUrl = URL.createObjectURL(nextFile)
@@ -1277,13 +1657,20 @@ function LiveStudioWorkspace({
   useEffect(() => {
     if (mode !== "collect") return
     let cancelled = false
+    const controller = new AbortController()
+    const requestedFilter = sampleFilter
     const params = new URLSearchParams({ limit: "200" })
-    if (sampleFilter) params.set("label", sampleFilter)
+    if (requestedFilter) params.set("label", requestedFilter)
     const timer = window.setTimeout(async () => {
       if (cancelled) return
       setSamplesLoading(true)
       try {
-        const res = await api<Data>(`/api/dataset/samples?${params.toString()}`)
+        const res = await api<Data>(
+          `/api/dataset/samples?${params.toString()}`,
+          { signal: controller.signal },
+          "",
+          POLL_TIMEOUT_MS
+        )
         if (cancelled) return
         const list: Data[] = Array.isArray(res)
           ? res
@@ -1293,12 +1680,17 @@ function LiveStudioWorkspace({
               ? res.items
               : []
         setSamples(list)
+        setSamplesLoadedFilter(requestedFilter)
         const validSet = new Set(list.map((s) => String(s.sample_id)))
         setSelectedSampleIds((prev) => prev.filter((id) => validSet.has(id)))
-      } catch {
-        if (!cancelled) {
+      } catch (err) {
+        if (!cancelled && !isAbortError(err)) {
           const fallback = recentSamplesRef.current
-          setSamples(sampleFilter ? fallback.filter((s) => s.label === sampleFilter) : fallback)
+          const filtered = requestedFilter ? fallback.filter((s) => s.label === requestedFilter) : fallback
+          setSamples(filtered)
+          setSamplesLoadedFilter(requestedFilter)
+          const validSet = new Set(filtered.map((s) => String(s.sample_id)))
+          setSelectedSampleIds((prev) => prev.filter((id) => validSet.has(id)))
         }
       } finally {
         if (!cancelled) setSamplesLoading(false)
@@ -1306,6 +1698,7 @@ function LiveStudioWorkspace({
     }, 0)
     return () => {
       cancelled = true
+      controller.abort()
       window.clearTimeout(timer)
     }
   }, [mode, sampleFilter, sampleReloadTick, datasetSummary.total_samples])
@@ -1324,11 +1717,13 @@ function LiveStudioWorkspace({
   const workMode = state.work_mode === "strict" ? "strict" : "debug"
   const counts = datasetSummary.class_counts || {}
   const liveSrc = (online && state.live_stream_url) || state.latest_evidence_url || evidence[0]?.url
-  const cropSrc = (online && state.live_crop_url) || state.latest_evidence_url
+  const cropSrc = online && state.live_crop_url ? String(state.live_crop_url) : undefined
 
-  const visibleSampleIds = samples.map((s) => String(s.sample_id))
+  const samplesSynced = !samplesLoading && samplesLoadedFilter === sampleFilter
+  const visibleSampleIds = samplesSynced ? samples.map((s) => String(s.sample_id)) : []
   const selectedIdSet = new Set(selectedSampleIds)
-  const allVisibleSelected = visibleSampleIds.length > 0 && visibleSampleIds.every((id) => selectedIdSet.has(id))
+  const allVisibleSelected =
+    samplesSynced && visibleSampleIds.length > 0 && visibleSampleIds.every((id) => selectedIdSet.has(id))
   const activeFilterLabel = sampleFilterOptions.find((o) => o.id === sampleFilter)?.label || "全部"
 
   const gripText = (v: unknown) => (v === true ? "已动态锁定" : v === false ? "未入画" : "无信号")
@@ -1342,12 +1737,14 @@ function LiveStudioWorkspace({
   }
 
   const toggleSampleSelection = (sampleId: string) => {
+    if (!samplesSynced) return
     setSelectedSampleIds((prev) =>
       prev.includes(sampleId) ? prev.filter((id) => id !== sampleId) : [...prev, sampleId]
     )
   }
 
   const toggleSelectAllVisible = () => {
+    if (!samplesSynced) return
     if (allVisibleSelected) {
       setSelectedSampleIds([])
     } else {
@@ -1386,7 +1783,8 @@ function LiveStudioWorkspace({
 
   const handleLocalSampleUpload = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!uploadFile) return flash("请先选择要加入训练集的本地 JPEG/PNG 图片")
+    const submittedFile = uploadFile
+    if (!submittedFile) return flash("请先选择要加入训练集的本地 JPEG/PNG 图片")
     setUploadingSample(true)
     try {
       const res = await api<Data>(
@@ -1394,20 +1792,22 @@ function LiveStudioWorkspace({
         {
           method: "POST",
           headers: {
-            "Content-Type": uploadFile.type || "image/jpeg",
+            "Content-Type": submittedFile.type || "image/jpeg",
             "X-Sample-Label": uploadLabel,
             "X-Pipe-Color": pipeColor,
             "X-Tube-Id": toHeaderValue(tubeGroup, "TUBE_UPLOAD_01"),
             "X-Batch-Id": toHeaderValue(batchGroup, "BATCH_UPLOAD"),
           },
-          body: uploadFile,
+          body: submittedFile,
         },
         token
       )
       const labelName = sampleClassDefs.find((c) => c.id === uploadLabel)?.short || uploadLabel
       flash(`已将本地图片加入【${labelName}】训练集 (${res.sample_id || "完成"})`)
-      selectUploadFile(null)
-      if (uploadInputRef.current) uploadInputRef.current.value = ""
+      if (uploadFileRef.current === submittedFile) {
+        selectUploadFile(null)
+        if (uploadInputRef.current) uploadInputRef.current.value = ""
+      }
       await onRefresh()
       reloadSamples()
       void onStorageChanged()
@@ -1449,6 +1849,7 @@ function LiveStudioWorkspace({
   }
 
   const requestBatchDeleteSelected = () => {
+    if (!samplesSynced) return
     const ids = [...selectedSampleIds]
     if (ids.length === 0) return
     onConfirm({
@@ -1484,6 +1885,7 @@ function LiveStudioWorkspace({
   }
 
   const requestClearCurrentClass = () => {
+    if (!samplesSynced) return
     if (!sampleFilter) {
       requestClearAllSamples()
       return
@@ -1763,8 +2165,10 @@ function LiveStudioWorkspace({
                 fill
                 src={liveSrc}
                 alt="全景 16:9 实时动态追踪画面"
+                shutterKey={shutterKey}
                 focusLocked={online && valid}
                 emptyTitle="等待相机画面"
+                errorTitle="相机画面不可用"
               />
             </div>
           )}
@@ -1827,8 +2231,10 @@ function LiveStudioWorkspace({
                 fill
                 src={cropSrc}
                 alt="4 倍动态跟随标签特写"
-                focusLocked={online && valid}
-                emptyTitle="等待锁定标签"
+                focusLocked={Boolean(online && valid && cropSrc)}
+                emptyTitle={online ? "特写画面不可用" : "等待锁定标签"}
+                emptyHint={online ? "当前未获取到 4× 标签特写流" : undefined}
+                errorTitle="特写画面不可用"
               />
             </div>
             <div className="inspector-verdict-row">
@@ -1849,7 +2255,7 @@ function LiveStudioWorkspace({
               <div className="flex items-baseline justify-between" style={{ marginBottom: 5 }}>
                 <span style={{ fontSize: 11.5, color: "var(--ink-3)" }}>C 类脱落确认计时</span>
                 <span className="mono" style={{ fontSize: 11.5 }}>
-                  {(timer / 1000).toFixed(2)} / 1.20 秒
+                  {formatCTimerSeconds(timer, 2)} / 1.20 秒
                 </span>
               </div>
               <div className={`segments ${litSegments >= 12 ? "done" : ""}`}>
@@ -2071,9 +2477,9 @@ function LiveStudioWorkspace({
                   </div>
                   <div className="grid grid-cols-2 gap-2">
                     <div className="field">
-                      <label>料管颜色</label>
+                      <label htmlFor="collect-pipe-color">料管颜色</label>
                       <Select value={pipeColor} onValueChange={(v) => setPipeColor(v as "yellow" | "blue")}>
-                        <SelectTrigger>
+                        <SelectTrigger id="collect-pipe-color">
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
@@ -2083,8 +2489,9 @@ function LiveStudioWorkspace({
                       </Select>
                     </div>
                     <div className="field">
-                      <label>物理料管分组号</label>
+                      <label htmlFor="collect-tube-group">物理料管分组号</label>
                       <Input
+                        id="collect-tube-group"
                         value={tubeGroup}
                         onChange={(e) => setTubeGroup(e.target.value)}
                         className="mono"
@@ -2093,8 +2500,9 @@ function LiveStudioWorkspace({
                     </div>
                   </div>
                   <div className="field">
-                    <label>生产批次号</label>
+                    <label htmlFor="collect-batch-group">生产批次号</label>
                     <Input
+                      id="collect-batch-group"
                       value={batchGroup}
                       onChange={(e) => setBatchGroup(e.target.value)}
                       className="mono"
@@ -2146,18 +2554,20 @@ function LiveStudioWorkspace({
                   <form className="upload-box" onSubmit={(e) => void handleLocalSampleUpload(e)}>
                     <div className="grid grid-cols-2 gap-2">
                       <div className="field">
-                        <label>选择本地图片</label>
+                        <label htmlFor="collect-upload-file">选择本地图片</label>
                         <Input
+                          id="collect-upload-file"
                           ref={uploadInputRef}
                           type="file"
                           accept="image/jpeg,image/png"
+                          disabled={uploadingSample}
                           onChange={(e) => selectUploadFile(e.target.files?.[0] || null)}
                         />
                       </div>
                       <div className="field">
-                        <label>目标训练类别</label>
+                        <label htmlFor="collect-upload-label">目标训练类别</label>
                         <Select value={uploadLabel} onValueChange={(v) => setUploadLabel(v as SampleLabel)}>
-                          <SelectTrigger>
+                          <SelectTrigger id="collect-upload-label">
                             <SelectValue />
                           </SelectTrigger>
                           <SelectContent>
@@ -2194,6 +2604,7 @@ function LiveStudioWorkspace({
                           type="button"
                           className="icon-btn"
                           style={{ width: 24, height: 24 }}
+                          disabled={uploadingSample}
                           aria-label="清除已选图片"
                           onClick={() => {
                             selectUploadFile(null)
@@ -2221,12 +2632,14 @@ function LiveStudioWorkspace({
                   <div className="inspector-section-head">
                     <h3>样本管理（筛选 / 改标注 / 批量删）</h3>
                     <span className="mono" style={{ fontSize: 11.5, color: "var(--ink-3)" }}>
-                      显示 {samples.length} / 总 {datasetSummary.total_samples || 0}
+                      {!samplesSynced
+                        ? "筛选加载中…"
+                        : `显示 ${samples.length} / 总 ${datasetSummary.total_samples || 0}`}
                     </span>
                   </div>
 
                   {/* 按类别筛选标签条 */}
-                  <div className="filter-chip-bar" role="tablist" aria-label="按训练类别筛选样本">
+                  <div className="filter-chip-bar" role="group" aria-label="按训练类别筛选样本">
                     {sampleFilterOptions.map((opt) => {
                       const cnt = opt.id === "" ? Number(datasetSummary.total_samples || 0) : Number(counts[opt.id] || 0)
                       const active = sampleFilter === opt.id
@@ -2234,8 +2647,7 @@ function LiveStudioWorkspace({
                         <button
                           key={opt.id || "all"}
                           type="button"
-                          role="tab"
-                          aria-selected={active}
+                          aria-pressed={active}
                           className={`filter-chip ${active ? "on" : ""}`}
                           onClick={() => {
                             setSampleFilter(opt.id)
@@ -2255,7 +2667,7 @@ function LiveStudioWorkspace({
                       <input
                         type="checkbox"
                         checked={allVisibleSelected}
-                        disabled={samples.length === 0 || bulkBusy}
+                        disabled={!samplesSynced || samples.length === 0 || bulkBusy}
                         onChange={toggleSelectAllVisible}
                       />
                       <span>
@@ -2267,7 +2679,7 @@ function LiveStudioWorkspace({
                         type="button"
                         className="btn ghost sm btn-outline-bad"
                         style={{ height: 24, padding: "0 8px", fontSize: 11.5 }}
-                        disabled={selectedSampleIds.length === 0 || bulkBusy}
+                        disabled={!samplesSynced || selectedSampleIds.length === 0 || bulkBusy}
                         onClick={requestBatchDeleteSelected}
                       >
                         <Trash2 size={11} aria-hidden="true" />
@@ -2277,7 +2689,7 @@ function LiveStudioWorkspace({
                         type="button"
                         className="btn ghost sm btn-outline-bad"
                         style={{ height: 24, padding: "0 8px", fontSize: 11.5 }}
-                        disabled={samples.length === 0 || bulkBusy}
+                        disabled={!samplesSynced || samples.length === 0 || bulkBusy}
                         onClick={requestClearCurrentClass}
                       >
                         {sampleFilter ? `清空${activeFilterLabel}` : "清空全部"}
@@ -2285,9 +2697,9 @@ function LiveStudioWorkspace({
                     </div>
                   </div>
 
-                  {samplesLoading && samples.length === 0 ? (
+                  {!samplesSynced ? (
                     <div className="empty" style={{ minHeight: 100 }}>
-                      正在加载样本列表…
+                      正在加载【{activeFilterLabel}】样本列表…
                     </div>
                   ) : samples.length > 0 ? (
                     <div className="grid grid-cols-2 gap-2">
@@ -2300,6 +2712,7 @@ function LiveStudioWorkspace({
                               <input
                                 type="checkbox"
                                 checked={checked}
+                                disabled={!samplesSynced || bulkBusy}
                                 aria-label={`选择样本 ${sid}`}
                                 onChange={() => toggleSampleSelection(sid)}
                               />
@@ -2352,8 +2765,9 @@ function LiveStudioWorkspace({
                   </summary>
                   <form className="inspector-group-body grid gap-2.5" onSubmit={(e) => void submitManualEvidence(e)}>
                     <div className="field">
-                      <label>本地 JPEG / PNG 图像</label>
+                      <label htmlFor="evidence-upload-file">本地 JPEG / PNG 图像</label>
                       <Input
+                        id="evidence-upload-file"
                         type="file"
                         accept="image/jpeg,image/png"
                         onChange={(e) => setFile(e.target.files?.[0] || null)}
@@ -2361,8 +2775,9 @@ function LiveStudioWorkspace({
                     </div>
                     <div className="grid grid-cols-2 gap-2">
                       <div className="field">
-                        <label>周期号（留空自动）</label>
+                        <label htmlFor="evidence-cycle-id">周期号（留空自动）</label>
                         <Input
+                          id="evidence-cycle-id"
                           list="cycle-options"
                           value={cycle}
                           onChange={(e) => setCycle(e.target.value)}
@@ -2376,9 +2791,9 @@ function LiveStudioWorkspace({
                         </datalist>
                       </div>
                       <div className="field">
-                        <label>证据类别</label>
+                        <label htmlFor="evidence-kind">证据类别</label>
                         <Select value={kind} onValueChange={setKind}>
-                          <SelectTrigger>
+                          <SelectTrigger id="evidence-kind">
                             <SelectValue />
                           </SelectTrigger>
                           <SelectContent>
@@ -2392,9 +2807,9 @@ function LiveStudioWorkspace({
                       </div>
                     </div>
                     <div className="field">
-                      <label>标签状态</label>
+                      <label htmlFor="evidence-label-status">标签状态</label>
                       <Select value={label} onValueChange={setLabel}>
-                        <SelectTrigger>
+                        <SelectTrigger id="evidence-label-status">
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
@@ -2429,6 +2844,7 @@ function TrainDeployStep({
   models,
   datasetSummary,
   trainingStatus,
+  trainingError,
   token,
   flash,
   onSaved,
@@ -2438,6 +2854,7 @@ function TrainDeployStep({
   models: Data[]
   datasetSummary: Data
   trainingStatus: Data
+  trainingError: string
   token: string
   flash: (s: string) => void
   onSaved: () => Promise<void>
@@ -2449,6 +2866,7 @@ function TrainDeployStep({
   const [lr, setLr] = useState("0.0025")
   const [resumeFromLatest, setResumeFromLatest] = useState(true)
   const [useAugmentation, setUseAugmentation] = useState(true)
+  const [trainFormError, setTrainFormError] = useState("")
   const [starting, setStarting] = useState(false)
   const [bootstrapping, setBootstrapping] = useState(false)
 
@@ -2477,7 +2895,37 @@ function TrainDeployStep({
     }
   }
 
-  const handleStartTraining = async () => {
+  const handleStartTraining = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const epochsVal = Number(epochs)
+    if (!epochs.trim() || !Number.isInteger(epochsVal) || epochsVal < 2 || epochsVal > 50) {
+      const msg = "训练轮数 (Epochs) 须为 2 ~ 50 之间的整数"
+      setTrainFormError(msg)
+      flash(msg)
+      return
+    }
+    const inputSizeVal = Number(inputSize)
+    if (!inputSize.trim() || !Number.isInteger(inputSizeVal) || inputSizeVal < 64 || inputSizeVal > 320) {
+      const msg = "输入尺寸 (px) 须为 64 ~ 320 之间的整数"
+      setTrainFormError(msg)
+      flash(msg)
+      return
+    }
+    const batchSizeVal = Number(batchSize)
+    if (!batchSize.trim() || !Number.isInteger(batchSizeVal) || batchSizeVal < 2 || batchSizeVal > 64) {
+      const msg = "批次大小 (Batch) 须为 2 ~ 64 之间的整数"
+      setTrainFormError(msg)
+      flash(msg)
+      return
+    }
+    const lrVal = Number(lr)
+    if (!lr.trim() || !Number.isFinite(lrVal) || lrVal <= 0 || lrVal > 0.1) {
+      const msg = "学习率 (LR) 须大于 0 且不超过 0.1"
+      setTrainFormError(msg)
+      flash(msg)
+      return
+    }
+    setTrainFormError("")
     setStarting(true)
     try {
       await api<Data>(
@@ -2486,10 +2934,10 @@ function TrainDeployStep({
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            epochs: Number(epochs) || 8,
-            input_size: Number(inputSize) || 96,
-            batch_size: Number(batchSize) || 8,
-            learning_rate: Number(lr) || 0.0025,
+            epochs: epochsVal,
+            input_size: inputSizeVal,
+            batch_size: batchSizeVal,
+            learning_rate: lrVal,
             resume_from_latest: resumeFromLatest,
             use_augmentation: useAugmentation,
           }),
@@ -2613,6 +3061,12 @@ function TrainDeployStep({
             </div>
           </header>
           <div className="panel-body grid gap-3">
+            {trainingError && (
+              <div className="auth-error" role="alert">
+                <AlertTriangle size={14} aria-hidden="true" />
+                <span>训练服务状态获取失败（不影响实时目检判定）：{trainingError}</span>
+              </div>
+            )}
             <div className="flex items-center justify-between gap-2">
               <b style={{ fontSize: 13 }}>{trainingStatus.message || "等待启动训练"}</b>
               <span className="mono" style={{ fontSize: 12, color: "var(--ink-3)" }}>
@@ -2747,70 +3201,112 @@ function TrainDeployStep({
                 </span>
               </div>
 
-              <div className="grid grid-cols-2 gap-2.5">
-                <div className="field">
-                  <label>训练轮数 (Epochs)</label>
-                  <Input type="number" min="2" max="50" value={epochs} onChange={(e) => setEpochs(e.target.value)} className="mono" />
+              <form className="grid gap-3" onSubmit={(e) => void handleStartTraining(e)} noValidate>
+                <div className="grid grid-cols-2 gap-2.5">
+                  <div className="field">
+                    <label htmlFor="train-epochs">训练轮数 (Epochs)</label>
+                    <Input
+                      id="train-epochs"
+                      type="number"
+                      min="2"
+                      max="50"
+                      step="1"
+                      value={epochs}
+                      onChange={(e) => {
+                        setEpochs(e.target.value)
+                        if (trainFormError) setTrainFormError("")
+                      }}
+                      className="mono"
+                    />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="train-input-size">输入尺寸 (px)</label>
+                    <Input
+                      id="train-input-size"
+                      type="number"
+                      min="64"
+                      max="320"
+                      step="1"
+                      value={inputSize}
+                      onChange={(e) => {
+                        setInputSize(e.target.value)
+                        if (trainFormError) setTrainFormError("")
+                      }}
+                      className="mono"
+                    />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="train-batch-size">批次大小 (Batch)</label>
+                    <Input
+                      id="train-batch-size"
+                      type="number"
+                      min="2"
+                      max="64"
+                      step="1"
+                      value={batchSize}
+                      onChange={(e) => {
+                        setBatchSize(e.target.value)
+                        if (trainFormError) setTrainFormError("")
+                      }}
+                      className="mono"
+                    />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="train-lr">学习率 (LR)</label>
+                    <Input
+                      id="train-lr"
+                      type="number"
+                      min="0.0001"
+                      max="0.1"
+                      step="0.0005"
+                      value={lr}
+                      onChange={(e) => {
+                        setLr(e.target.value)
+                        if (trainFormError) setTrainFormError("")
+                      }}
+                      className="mono"
+                    />
+                  </div>
                 </div>
-                <div className="field">
-                  <label>输入尺寸 (px)</label>
-                  <Input
-                    type="number"
-                    min="64"
-                    max="320"
-                    value={inputSize}
-                    onChange={(e) => setInputSize(e.target.value)}
-                    className="mono"
-                  />
-                </div>
-                <div className="field">
-                  <label>批次大小 (Batch)</label>
-                  <Input
-                    type="number"
-                    min="2"
-                    max="64"
-                    value={batchSize}
-                    onChange={(e) => setBatchSize(e.target.value)}
-                    className="mono"
-                  />
-                </div>
-                <div className="field">
-                  <label>学习率 (LR)</label>
-                  <Input type="number" step="0.0005" value={lr} onChange={(e) => setLr(e.target.value)} className="mono" />
-                </div>
-              </div>
 
-              <div className="grid gap-2">
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={resumeFromLatest}
-                    onChange={(e) => setResumeFromLatest(e.target.checked)}
-                  />
-                  基于上一版最优权重增量微调
-                </label>
-                <label className="check">
-                  <input
-                    type="checkbox"
-                    checked={useAugmentation}
-                    onChange={(e) => setUseAugmentation(e.target.checked)}
-                  />
-                  启用车间光学增强（光照 / 反光 / 微旋）
-                </label>
-              </div>
+                <div className="grid gap-2">
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={resumeFromLatest}
+                      onChange={(e) => setResumeFromLatest(e.target.checked)}
+                    />
+                    基于上一版最优权重增量微调
+                  </label>
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={useAugmentation}
+                      onChange={(e) => setUseAugmentation(e.target.checked)}
+                    />
+                    启用车间光学增强（光照 / 反光 / 微旋）
+                  </label>
+                </div>
 
-              <button
-                type="button"
-                className="btn block"
-                style={{ height: 40 }}
-                disabled={isTraining || starting || !datasetSummary.ready_to_train}
-                onClick={() => void handleStartTraining()}
-              >
-                <Play size={14} aria-hidden="true" />
-                {isTraining
-                  ? `训练中 ${trainingStatus.progress_pct || 0}%`
-                  : "启动 MobileNetV3 训练并导出 ONNX"}
-              </button>
+                {trainFormError && (
+                  <div className="auth-error" role="alert">
+                    <AlertTriangle size={14} aria-hidden="true" />
+                    <span>{trainFormError}</span>
+                  </div>
+                )}
+
+                <button
+                  type="submit"
+                  className="btn block"
+                  style={{ height: 40 }}
+                  disabled={isTraining || starting || !datasetSummary.ready_to_train}
+                >
+                  <Play size={14} aria-hidden="true" />
+                  {isTraining
+                    ? `训练中 ${trainingStatus.progress_pct || 0}%`
+                    : "启动 MobileNetV3 训练并导出 ONNX"}
+                </button>
+              </form>
             </section>
 
             {/* 已登记模型版本库（一键热加载） */}
@@ -2872,17 +3368,18 @@ function TrainDeployStep({
               <form className="inspector-group-body grid gap-2.5" onSubmit={(e) => void registerManual(e)}>
                 <div className="grid grid-cols-2 gap-2">
                   <div className="field">
-                    <label>模型名称</label>
-                    <Input value={name} onChange={(e) => setName(e.target.value)} required className="mono" />
+                    <label htmlFor="model-reg-name">模型名称</label>
+                    <Input id="model-reg-name" value={name} onChange={(e) => setName(e.target.value)} required className="mono" />
                   </div>
                   <div className="field">
-                    <label>版本号</label>
-                    <Input value={version} onChange={(e) => setVersion(e.target.value)} required className="mono" />
+                    <label htmlFor="model-reg-version">版本号</label>
+                    <Input id="model-reg-version" value={version} onChange={(e) => setVersion(e.target.value)} required className="mono" />
                   </div>
                 </div>
                 <div className="field">
-                  <label>权重文件 SHA256（64 位十六进制）</label>
+                  <label htmlFor="model-reg-sha256">权重文件 SHA256（64 位十六进制）</label>
                   <Input
+                    id="model-reg-sha256"
                     className="mono"
                     value={sha}
                     onChange={(e) => setSha(e.target.value)}
@@ -2893,8 +3390,8 @@ function TrainDeployStep({
                   />
                 </div>
                 <div className="field">
-                  <label>备注</label>
-                  <Input value={notes} onChange={(e) => setNotes(e.target.value)} />
+                  <label htmlFor="model-reg-notes">备注</label>
+                  <Input id="model-reg-notes" value={notes} onChange={(e) => setNotes(e.target.value)} />
                 </div>
                 <button type="submit" className="btn sm block" disabled={registering}>
                   {registering ? "登记中…" : "使用当前工程师会话登记"}
@@ -2911,6 +3408,12 @@ function TrainDeployStep({
 /* ==========================================================================
    步骤 4：记录与设置（3 子页：检测周期与证据 | 数据与数据库管理 | 相机镜像与系统参数）
    ========================================================================== */
+const step4SubTabs: { id: RecordsSettingsTab; label: string; icon: typeof ClipboardList }[] = [
+  { id: "records", label: "检测周期与证据", icon: ClipboardList },
+  { id: "storage", label: "数据与数据库管理", icon: HardDrive },
+  { id: "settings", label: "相机镜像与系统参数", icon: Sliders },
+]
+
 function RecordsSettingsStep({
   activeSubTab,
   onChangeSubTab,
@@ -2921,21 +3424,26 @@ function RecordsSettingsStep({
   datasetSummary,
   storageOverview,
   storageLoading,
+  storageError,
   cycles,
   evidence,
   events,
+  eventsLoading,
+  eventsError,
   selectedCycleId,
   filmstripItems,
   activeSnapshot,
   passCount,
   alarmCount,
   totalCount,
+  statsScope,
   token,
   mirrorHorizontal,
   togglingMirror,
   flash,
   onConfirm,
   onSelectCycle,
+  onRetryEvents,
   onClearSelectedCycle,
   onOpenSnapshot,
   onManualCapture,
@@ -2955,21 +3463,26 @@ function RecordsSettingsStep({
   datasetSummary: Data
   storageOverview: Data | null
   storageLoading: boolean
+  storageError: string
   cycles: Data[]
   evidence: Data[]
   events: Data[]
+  eventsLoading: boolean
+  eventsError: string
   selectedCycleId: string
   filmstripItems: FilmstripItem[]
   activeSnapshot: FilmstripItem | null
   passCount: number
   alarmCount: number
   totalCount: number
+  statsScope: "all" | "recent"
   token: string
   mirrorHorizontal: boolean
   togglingMirror: boolean
   flash: (s: string) => void
   onConfirm: (dialog: ConfirmDialogState) => void
   onSelectCycle: (cycleId: string) => void
+  onRetryEvents: () => void
   onClearSelectedCycle: () => void
   onOpenSnapshot: (item: FilmstripItem) => void
   onManualCapture: () => void
@@ -2981,6 +3494,22 @@ function RecordsSettingsStep({
   onGoStep: (step: EngineerStep, subTab?: RecordsSettingsTab) => void
 }) {
   const yieldRate = totalCount > 0 ? `${((passCount / totalCount) * 100).toFixed(1)}%` : "—"
+  const subTabRefs = useRef<Partial<Record<RecordsSettingsTab, HTMLButtonElement | null>>>({})
+
+  const handleSubTabKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>, currentId: RecordsSettingsTab) => {
+    const idx = step4SubTabs.findIndex((t) => t.id === currentId)
+    let nextIdx = -1
+    if (e.key === "ArrowRight") nextIdx = (idx + 1) % step4SubTabs.length
+    else if (e.key === "ArrowLeft") nextIdx = (idx - 1 + step4SubTabs.length) % step4SubTabs.length
+    else if (e.key === "Home") nextIdx = 0
+    else if (e.key === "End") nextIdx = step4SubTabs.length - 1
+    if (nextIdx >= 0) {
+      e.preventDefault()
+      const nextTab = step4SubTabs[nextIdx].id
+      onChangeSubTab(nextTab)
+      subTabRefs.current[nextTab]?.focus()
+    }
+  }
 
   const requestPurgeSimulated = () => {
     onConfirm({
@@ -3019,42 +3548,38 @@ function RecordsSettingsStep({
     <div className="studio-step4">
       <div className="studio-subbar">
         <div className="studio-subtabs" role="tablist" aria-label="记录与设置子页">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeSubTab === "records"}
-            className={`studio-subtab ${activeSubTab === "records" ? "on" : ""}`}
-            onClick={() => onChangeSubTab("records")}
-          >
-            <ClipboardList size={14} aria-hidden="true" />
-            检测周期与证据
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeSubTab === "storage"}
-            className={`studio-subtab ${activeSubTab === "storage" ? "on" : ""}`}
-            onClick={() => onChangeSubTab("storage")}
-          >
-            <HardDrive size={14} aria-hidden="true" />
-            数据与数据库管理
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={activeSubTab === "settings"}
-            className={`studio-subtab ${activeSubTab === "settings" ? "on" : ""}`}
-            onClick={() => onChangeSubTab("settings")}
-          >
-            <Sliders size={14} aria-hidden="true" />
-            相机镜像与系统参数
-          </button>
+          {step4SubTabs.map((tab) => {
+            const Icon = tab.icon
+            const selected = activeSubTab === tab.id
+            return (
+              <button
+                key={tab.id}
+                ref={(el) => {
+                  subTabRefs.current[tab.id] = el
+                }}
+                id={`step4-tab-${tab.id}`}
+                type="button"
+                role="tab"
+                tabIndex={selected ? 0 : -1}
+                aria-selected={selected}
+                aria-controls="step4-tabpanel"
+                className={`studio-subtab ${selected ? "on" : ""}`}
+                onClick={() => onChangeSubTab(tab.id)}
+                onKeyDown={(e) => handleSubTabKeyDown(e, tab.id)}
+              >
+                <Icon size={14} aria-hidden="true" />
+                {tab.label}
+              </button>
+            )
+          })}
         </div>
 
         <div className="studio-subbar-right">
           {activeSubTab === "records" ? (
             <>
-              <span className="tag plain mono">总 {totalCount}</span>
+              <span className="tag plain mono">
+                {statsScope === "all" ? `累计总 ${totalCount}` : `近30条 ${totalCount}`}
+              </span>
               <span className="tag pass mono">放行 {passCount}</span>
               <span className="tag alarm mono">报警 {alarmCount}</span>
               <span className="tag plain mono">良率 {yieldRate}</span>
@@ -3073,12 +3598,12 @@ function RecordsSettingsStep({
             </>
           ) : activeSubTab === "storage" ? (
             <>
-              {storageOverview?.business_db && (
+              {storageOverview?.business_db && !storageError && (
                 <span className="tag plain mono">
                   SQLite {fmt(storageOverview.business_db.db_size_kb, 1)} KB
                 </span>
               )}
-              {storageOverview?.training_dataset && (
+              {storageOverview?.training_dataset && !storageError && (
                 <span className="tag plain mono">
                   样本 {storageOverview.training_dataset.total_samples ?? 0} 张 ·{" "}
                   {fmt(storageOverview.training_dataset.dataset_size_mb, 2)} MB
@@ -3104,53 +3629,65 @@ function RecordsSettingsStep({
         </div>
       </div>
 
-      {activeSubTab === "records" ? (
-        <RecordsSubView
-          cycles={cycles}
-          evidence={evidence}
-          events={events}
-          selectedCycleId={selectedCycleId}
-          filmstripItems={filmstripItems}
-          activeSnapshot={activeSnapshot}
-          token={token}
-          flash={flash}
-          onConfirm={onConfirm}
-          onSelectCycle={onSelectCycle}
-          onClearSelectedCycle={onClearSelectedCycle}
-          onOpenSnapshot={onOpenSnapshot}
-          onSaved={onSaved}
-        />
-      ) : activeSubTab === "storage" ? (
-        <StorageManagerSubView
-          state={state}
-          models={models}
-          datasetSummary={datasetSummary}
-          storageOverview={storageOverview}
-          storageLoading={storageLoading}
-          token={token}
-          flash={flash}
-          onConfirm={onConfirm}
-          onSaved={onSaved}
-          onClearSelectedCycle={onClearSelectedCycle}
-          onChangeSubTab={onChangeSubTab}
-          onGoStep={onGoStep}
-        />
-      ) : (
-        <SettingsSubView
-          key={config.config_version ?? "initial"}
-          state={state}
-          config={config}
-          history={history}
-          token={token}
-          mirrorHorizontal={mirrorHorizontal}
-          togglingMirror={togglingMirror}
-          flash={flash}
-          onSaved={() => void onSaved()}
-          onToggleAuxRois={onToggleAuxRois}
-          onToggleMirror={onToggleMirror}
-          onSwitchWorkMode={onSwitchWorkMode}
-        />
-      )}
+      <div
+        id="step4-tabpanel"
+        role="tabpanel"
+        aria-labelledby={`step4-tab-${activeSubTab}`}
+        style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}
+      >
+        {activeSubTab === "records" ? (
+          <RecordsSubView
+            cycles={cycles}
+            evidence={evidence}
+            events={events}
+            eventsLoading={eventsLoading}
+            eventsError={eventsError}
+            selectedCycleId={selectedCycleId}
+            filmstripItems={filmstripItems}
+            activeSnapshot={activeSnapshot}
+            token={token}
+            flash={flash}
+            onConfirm={onConfirm}
+            onSelectCycle={onSelectCycle}
+            onRetryEvents={onRetryEvents}
+            onClearSelectedCycle={onClearSelectedCycle}
+            onOpenSnapshot={onOpenSnapshot}
+            onSaved={onSaved}
+          />
+        ) : activeSubTab === "storage" ? (
+          <StorageManagerSubView
+            state={state}
+            models={models}
+            datasetSummary={datasetSummary}
+            storageOverview={storageOverview}
+            storageLoading={storageLoading}
+            storageError={storageError}
+            token={token}
+            flash={flash}
+            onConfirm={onConfirm}
+            onSaved={onSaved}
+            onRefreshStorage={onRefreshStorage}
+            onClearSelectedCycle={onClearSelectedCycle}
+            onChangeSubTab={onChangeSubTab}
+            onGoStep={onGoStep}
+          />
+        ) : (
+          <SettingsSubView
+            key={config.config_version ?? "initial"}
+            state={state}
+            config={config}
+            history={history}
+            token={token}
+            mirrorHorizontal={mirrorHorizontal}
+            togglingMirror={togglingMirror}
+            flash={flash}
+            onSaved={() => void onSaved()}
+            onToggleAuxRois={onToggleAuxRois}
+            onToggleMirror={onToggleMirror}
+            onSwitchWorkMode={onSwitchWorkMode}
+          />
+        )}
+      </div>
     </div>
   )
 }
@@ -3159,6 +3696,8 @@ function RecordsSubView({
   cycles,
   evidence,
   events,
+  eventsLoading,
+  eventsError,
   selectedCycleId,
   filmstripItems,
   activeSnapshot,
@@ -3166,6 +3705,7 @@ function RecordsSubView({
   flash,
   onConfirm,
   onSelectCycle,
+  onRetryEvents,
   onClearSelectedCycle,
   onOpenSnapshot,
   onSaved,
@@ -3173,6 +3713,8 @@ function RecordsSubView({
   cycles: Data[]
   evidence: Data[]
   events: Data[]
+  eventsLoading: boolean
+  eventsError: string
   selectedCycleId: string
   filmstripItems: FilmstripItem[]
   activeSnapshot: FilmstripItem | null
@@ -3180,6 +3722,7 @@ function RecordsSubView({
   flash: (s: string) => void
   onConfirm: (dialog: ConfirmDialogState) => void
   onSelectCycle: (cycleId: string) => void
+  onRetryEvents: () => void
   onClearSelectedCycle: () => void
   onOpenSnapshot: (item: FilmstripItem) => void
   onSaved: () => Promise<void>
@@ -3336,10 +3879,27 @@ function RecordsSubView({
           <header className="panel-head">
             <h2>单周期状态跃迁时间线</h2>
             <span className="sub mono">{selectedCycleId || ""}</span>
-            <div className="right mono">{events.length} 步</div>
+            <div className="right mono">
+              {eventsLoading ? "加载中…" : `${events.length} 步`}
+            </div>
           </header>
           <div className="records-scroll">
-            {events.length ? (
+            {eventsLoading && events.length === 0 ? (
+              <div className="empty">正在加载周期 {selectedCycleId} 的状态跃迁…</div>
+            ) : eventsError ? (
+              <div className="panel-body grid gap-2">
+                <div className="auth-error" role="alert">
+                  <AlertTriangle size={14} aria-hidden="true" />
+                  <span>时间线加载失败：{eventsError}</span>
+                </div>
+                <div>
+                  <button type="button" className="btn ghost sm" onClick={onRetryEvents}>
+                    <RefreshCw size={12} aria-hidden="true" />
+                    重试加载
+                  </button>
+                </div>
+              </div>
+            ) : events.length ? (
               <ol className="timeline records-timeline">
                 {events.map((row) => (
                   <li key={row.event_id}>
@@ -3357,7 +3917,9 @@ function RecordsSubView({
                 ))}
               </ol>
             ) : (
-              <div className="empty">点击左侧周期行查看完整状态跃迁事件</div>
+              <div className="empty">
+                {selectedCycleId ? "该周期暂无状态跃迁事件" : "点击左侧周期行查看完整状态跃迁事件"}
+              </div>
             )}
           </div>
         </section>
@@ -3375,10 +3937,12 @@ function StorageManagerSubView({
   datasetSummary,
   storageOverview,
   storageLoading,
+  storageError,
   token,
   flash,
   onConfirm,
   onSaved,
+  onRefreshStorage,
   onClearSelectedCycle,
   onChangeSubTab,
   onGoStep,
@@ -3388,10 +3952,12 @@ function StorageManagerSubView({
   datasetSummary: Data
   storageOverview: Data | null
   storageLoading: boolean
+  storageError: string
   token: string
   flash: (s: string) => void
   onConfirm: (dialog: ConfirmDialogState) => void
   onSaved: () => Promise<void>
+  onRefreshStorage: () => void
   onClearSelectedCycle: () => void
   onChangeSubTab: (tab: RecordsSettingsTab) => void
   onGoStep: (step: EngineerStep, subTab?: RecordsSettingsTab) => void
@@ -3400,15 +3966,18 @@ function StorageManagerSubView({
   const tables = bdb.tables || {}
   const ds = storageOverview?.training_dataset || {}
   const ma = storageOverview?.model_artifacts || {}
+  const hasInventory = Boolean(storageOverview?.business_db && storageOverview.business_db.tables && !storageError)
+  const formatInventoryCount = (value: unknown) =>
+    typeof value === "number" && Number.isFinite(value) ? String(value) : "未知（统计获取失败）"
   const classCounts = ds.class_counts || datasetSummary.class_counts || {}
   const activeModelVersion = ma.active_model_version || state.model_version || ""
 
   const sqliteTableItems = [
-    { key: "cycles", name: "检测周期", count: tables.cycles },
-    { key: "events", name: "状态事件", count: tables.events },
-    { key: "evidence", name: "证据快照", count: tables.evidence },
-    { key: "configuration_history", name: "参数历史", count: tables.configuration_history },
-    { key: "model_registry", name: "模型版本", count: tables.model_registry },
+    { key: "cycles", name: "检测周期", count: hasInventory ? tables.cycles : undefined },
+    { key: "events", name: "状态事件", count: hasInventory ? tables.events : undefined },
+    { key: "evidence", name: "证据快照", count: hasInventory ? tables.evidence : undefined },
+    { key: "configuration_history", name: "参数历史", count: hasInventory ? tables.configuration_history : undefined },
+    { key: "model_registry", name: "模型版本", count: hasInventory ? tables.model_registry : undefined },
   ]
 
   const copyHash = (hash: string) => {
@@ -3510,12 +4079,24 @@ function StorageManagerSubView({
   }
 
   const requestDestroyAllBusiness = () => {
+    if (!hasInventory) {
+      flash("存储统计获取失败，当前业务记录数量未知，请先刷新存储统计核对后再执行全量销毁")
+      return
+    }
+    const cyclesText = formatInventoryCount(tables.cycles)
+    const eventsText = formatInventoryCount(tables.events)
+    const evidenceText = formatInventoryCount(tables.evidence)
+    const filesText = formatInventoryCount(bdb.evidence_files)
+    const sizeText =
+      typeof bdb.evidence_size_mb === "number" && Number.isFinite(bdb.evidence_size_mb)
+        ? `${fmt(bdb.evidence_size_mb, 2)} MB`
+        : "未知"
     onConfirm({
       title: "销毁全部业务周期与证据 + VACUUM 压缩空间",
       description: "高危操作：即将永久清空 SQLite 中全部检测周期、状态跃迁事件与磁盘证据快照，并执行 VACUUM 立即压缩数据库文件。",
       consequences: [
-        `删除全部 ${tables.cycles ?? 0} 条检测周期、${tables.events ?? 0} 条状态事件与 ${tables.evidence ?? 0} 条证据索引`,
-        `永久删除磁盘 data/evidence/ 下 ${bdb.evidence_files ?? 0} 个证据快照图片（释放约 ${fmt(bdb.evidence_size_mb, 2)} MB）`,
+        `删除全部 ${cyclesText} 条检测周期、${eventsText} 条状态事件与 ${evidenceText} 条证据索引`,
+        `永久删除磁盘 data/evidence/ 下 ${filesText} 个证据快照图片（释放约 ${sizeText}）`,
         "执行 SQLite VACUUM 收缩 station.sqlite3 磁盘占用；保留系统参数历史与模型版本库",
       ],
       confirmLabel: "确认永久销毁并 VACUUM",
@@ -3546,6 +4127,23 @@ function StorageManagerSubView({
 
   return (
     <div className="storage-layout" aria-label="数据与数据库管理中心">
+      {storageError && (
+        <div className="auth-error" role="alert" style={{ justifyContent: "space-between" }}>
+          <span className="inline-flex items-center gap-2">
+            <AlertTriangle size={15} aria-hidden="true" />
+            <span>存储统计获取失败，当前库存数量未知（{storageError}）。为防止误删，已暂时锁定全量业务库销毁。</span>
+          </span>
+          <button
+            type="button"
+            className="btn ghost sm"
+            disabled={storageLoading}
+            onClick={onRefreshStorage}
+          >
+            <RefreshCw size={12} aria-hidden="true" />
+            重新获取统计
+          </button>
+        </div>
+      )}
       {/* 顶部两列：后台存储逻辑架构卡（一眼看懂两套数据） */}
       <div className="storage-arch-grid">
         {/* 左卡：生产运行业务库 */}
@@ -3559,7 +4157,9 @@ function StorageManagerSubView({
             <div className="right mono">
               {storageLoading && !storageOverview
                 ? "统计中…"
-                : `${fmt(bdb.db_size_kb, 1)} KB · 证据 ${fmt(bdb.evidence_size_mb, 2)} MB`}
+                : !hasInventory
+                  ? "未知（统计获取失败）"
+                  : `${fmt(bdb.db_size_kb, 1)} KB · 证据 ${fmt(bdb.evidence_size_mb, 2)} MB`}
             </div>
           </header>
 
@@ -3569,7 +4169,7 @@ function StorageManagerSubView({
               {sqliteTableItems.map((t) => (
                 <div className="storage-metric-cell" key={t.key}>
                   <small>{t.name}</small>
-                  <b>{t.count ?? "—"}</b>
+                  <b>{hasInventory ? (t.count ?? "—") : "未知"}</b>
                   <code title={t.key}>{t.key}</code>
                 </div>
               ))}
@@ -3580,13 +4180,15 @@ function StorageManagerSubView({
               <div className="storage-path-row">
                 <span>SQLite 库</span>
                 <code>{bdb.db_path || "data/station.sqlite3"}</code>
-                <em>{fmt(bdb.db_size_kb, 1)} KB</em>
+                <em>{hasInventory ? `${fmt(bdb.db_size_kb, 1)} KB` : "未知"}</em>
               </div>
               <div className="storage-path-row">
                 <span>证据目录</span>
                 <code>{bdb.evidence_dir || "data/evidence"}</code>
                 <em>
-                  {bdb.evidence_files ?? 0} 张 · {fmt(bdb.evidence_size_mb, 2)} MB
+                  {hasInventory
+                    ? `${formatInventoryCount(bdb.evidence_files)} 张 · ${fmt(bdb.evidence_size_mb, 2)} MB`
+                    : "未知（统计获取失败）"}
                 </em>
               </div>
             </div>
@@ -3875,17 +4477,28 @@ function StorageManagerSubView({
               <div>
                 <h3>3. 销毁全部业务周期与证据 + VACUUM</h3>
                 <p>
-                  永久清空全部检测周期（<b className="mono">{tables.cycles ?? 0}</b> 条）、状态事件与证据快照，并执行 SQLite{" "}
-                  <code>VACUUM</code> 立即回收磁盘空间。
+                  {hasInventory ? (
+                    <>
+                      永久清空全部检测周期（<b className="mono">{formatInventoryCount(tables.cycles)}</b> 条）、状态事件与证据快照，并执行 SQLite{" "}
+                      <code>VACUUM</code> 立即回收磁盘空间。
+                    </>
+                  ) : storageLoading ? (
+                    <>正在核对当前业务库记录数量，加载完成后可确认操作…</>
+                  ) : (
+                    <>
+                      当前业务库记录数量<b>未知（统计获取失败）</b>，需先成功刷新存储统计核对后再执行全量销毁。
+                    </>
+                  )}
                 </p>
               </div>
               <button
                 type="button"
                 className="btn btn-danger sm block"
+                disabled={storageLoading || !hasInventory}
                 onClick={requestDestroyAllBusiness}
               >
                 <ShieldAlert size={13} aria-hidden="true" />
-                销毁全部业务周期与证据 + VACUUM 压缩空间
+                {hasInventory ? "销毁全部业务周期与证据 + VACUUM 压缩空间" : "需先成功获取存储统计"}
               </button>
             </div>
           </div>
@@ -3943,8 +4556,6 @@ function SettingsSubView({
     im.onload = () => {
       setImage(im)
       setCanvasSize([im.naturalWidth || 1920, im.naturalHeight || 1080])
-      setWidth(String(im.naturalWidth || 1920))
-      setHeight(String(im.naturalHeight || 1080))
     }
     im.src = src
   }, [])
@@ -3956,8 +4567,6 @@ function SettingsSubView({
     im.onload = () => {
       setImage(im)
       setCanvasSize([im.naturalWidth || 1920, im.naturalHeight || 1080])
-      setWidth(String(im.naturalWidth || 1920))
-      setHeight(String(im.naturalHeight || 1080))
     }
     im.onerror = () => loadPresetFrame(tubeYellowImg)
     im.src = `/api/camera/frame.jpg?t=${Date.now()}`
@@ -4031,9 +4640,7 @@ function SettingsSubView({
     const im = new Image()
     im.onload = () => {
       setImage(im)
-      setCanvasSize([im.naturalWidth, im.naturalHeight])
-      setWidth(String(im.naturalWidth))
-      setHeight(String(im.naturalHeight))
+      setCanvasSize([im.naturalWidth || 1920, im.naturalHeight || 1080])
       URL.revokeObjectURL(url)
     }
     im.onerror = () => {
@@ -4046,8 +4653,9 @@ function SettingsSubView({
   const save = async () => {
     if (!token) return flash("当前工程师会话无效，请重新验证登录")
     const required = both ? roiNames : roiNames.slice(0, 3)
-    if (required.some((k) => !rois[k])) {
-      return flash(`尚未标定：${required.filter((k) => !rois[k]).map((k) => roiLabels[k]).join("、")}`)
+    const invalidRois = required.filter((k) => !isValidRoiBox(rois[k]))
+    if (invalidRois.length > 0) {
+      return flash(`ROI 区域未标定或面积无效：${invalidRois.map((k) => roiLabels[k]).join("、")}`)
     }
     try {
       await api(
@@ -4106,10 +4714,15 @@ function SettingsSubView({
             >
               重置五区
             </button>
-            <label className="btn ghost sm file-btn">
+            <label htmlFor="settings-roi-image" className="btn ghost sm file-btn">
               <Upload size={13} aria-hidden="true" />
               载入
-              <input type="file" accept="image/*" onChange={(e) => loadImage(e.target.files?.[0])} />
+              <input
+                id="settings-roi-image"
+                type="file"
+                accept="image/*"
+                onChange={(e) => loadImage(e.target.files?.[0])}
+              />
             </label>
           </div>
         </header>
@@ -4128,15 +4741,20 @@ function SettingsSubView({
               onPointerUp={(e) => {
                 if (!drag) return
                 const p = point(e)
-                const box = [
+                const box: [number, number, number, number] = [
                   Math.min(drag[0], p[0]),
                   Math.min(drag[1], p[1]),
                   Math.max(drag[0], p[0]),
                   Math.max(drag[1], p[1]),
                 ]
-                setRois((r: Data) => ({ ...r, [target]: box }))
                 setDrag(null)
+                if (!isValidRoiBox(box)) {
+                  flash("拖拽选区面积为零或过小，已保留原有 ROI 区域")
+                  return
+                }
+                setRois((r: Data) => ({ ...r, [target]: box }))
               }}
+              onPointerCancel={() => setDrag(null)}
             />
           </div>
         </div>
@@ -4250,9 +4868,10 @@ function SettingsSubView({
                 {thresholdFields.map(([key, label, step]) => (
                   <div className="th-row" key={key}>
                     <div>
-                      <b>{label}</b>
+                      <label htmlFor={`threshold-${key}`}>{label}</label>
                     </div>
                     <Input
+                      id={`threshold-${key}`}
                       type="number"
                       step={step}
                       value={thresholds[key] ?? ""}
@@ -4279,17 +4898,34 @@ function SettingsSubView({
               </summary>
               <div className="inspector-group-body grid gap-3">
                 <div className="field">
-                  <label>设备 ID</label>
-                  <Input value={device} onChange={(e) => setDevice(e.target.value)} className="mono" />
+                  <label htmlFor="settings-camera-device">设备 ID</label>
+                  <Input
+                    id="settings-camera-device"
+                    value={device}
+                    onChange={(e) => setDevice(e.target.value)}
+                    className="mono"
+                  />
                 </div>
                 <div className="grid grid-cols-2 gap-2.5">
                   <div className="field">
-                    <label>采集宽度</label>
-                    <Input type="number" value={width} onChange={(e) => setWidth(e.target.value)} className="mono" />
+                    <label htmlFor="settings-camera-width">采集宽度</label>
+                    <Input
+                      id="settings-camera-width"
+                      type="number"
+                      value={width}
+                      onChange={(e) => setWidth(e.target.value)}
+                      className="mono"
+                    />
                   </div>
                   <div className="field">
-                    <label>采集高度</label>
-                    <Input type="number" value={height} onChange={(e) => setHeight(e.target.value)} className="mono" />
+                    <label htmlFor="settings-camera-height">采集高度</label>
+                    <Input
+                      id="settings-camera-height"
+                      type="number"
+                      value={height}
+                      onChange={(e) => setHeight(e.target.value)}
+                      className="mono"
+                    />
                   </div>
                 </div>
                 <label className="check">

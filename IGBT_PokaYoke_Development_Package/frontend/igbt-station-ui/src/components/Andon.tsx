@@ -15,13 +15,15 @@ export function Andon({ state, compact, meta, guide }: AndonProps) {
   const g = guide ?? guidanceFor(state)
 
   return (
-    <section className={`andon ${v.tone} ${compact ? "compact" : ""}`} aria-live="polite">
-      <div className="andon-word">
-        <strong>{v.word}</strong>
-      </div>
-      <div className="andon-guide">
-        <b>{g.title}</b>
-        {g.desc && <p>{g.desc}</p>}
+    <section className={`andon ${v.tone} ${compact ? "compact" : ""}`} aria-label="工位判定状态">
+      <div className="andon-live" aria-live="polite" aria-atomic="true">
+        <div className="andon-word">
+          <strong>{v.word}</strong>
+        </div>
+        <div className="andon-guide">
+          <b>{g.title}</b>
+          {g.desc && <p>{g.desc}</p>}
+        </div>
       </div>
       <div className="andon-meta">
         {meta.map((m) => (

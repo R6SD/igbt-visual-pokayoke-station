@@ -190,7 +190,10 @@ class ViewValidEvaluator:
 
         if valid_box(cfg.rois.label_roi):
             for box in obs.occluder_boxes_norm:
-                if valid_box(box) and box_intersection_fraction(box, cfg.rois.label_roi) >= 0.03:
+                if valid_box(box) and (
+                    box_intersection_fraction(box, cfg.rois.label_roi) >= 0.03
+                    or box_intersection_fraction(cfg.rois.label_roi, box) >= 0.03
+                ):
                     reasons.append("DETECTED_OCCLUDER_OVERLAPS_LABEL_ROI")
                     break
         quality = measure_label_quality(frame, cfg.rois.label_roi)
