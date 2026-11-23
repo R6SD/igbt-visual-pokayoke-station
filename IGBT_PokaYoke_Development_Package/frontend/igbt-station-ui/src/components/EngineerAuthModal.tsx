@@ -137,18 +137,33 @@ function EngineerAuthDialogContent({
         signal: controller.signal,
       })
 
-      if (unmountedRef.current || reqSeq !== requestSeqRef.current || controller.signal.aborted) {
+      if (unmountedRef.current || reqSeq !== requestSeqRef.current) {
+        return
+      }
+      if (timedOut) {
+        throw new DOMException("Verification timed out", "AbortError")
+      }
+      if (controller.signal.aborted) {
         return
       }
 
       let data: Record<string, unknown> = {}
       try {
         data = (await response.json()) as Record<string, unknown>
-      } catch {
+      } catch (parseErr) {
+        if (timedOut || controller.signal.aborted) {
+          throw parseErr
+        }
         data = {}
       }
 
-      if (unmountedRef.current || reqSeq !== requestSeqRef.current || controller.signal.aborted) {
+      if (unmountedRef.current || reqSeq !== requestSeqRef.current) {
+        return
+      }
+      if (timedOut) {
+        throw new DOMException("Verification timed out", "AbortError")
+      }
+      if (controller.signal.aborted) {
         return
       }
 

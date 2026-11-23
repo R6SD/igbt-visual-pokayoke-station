@@ -42,6 +42,8 @@ MANIFEST_FIELDS = [
     "video_group_id",
     "pipe_color",
     "box_xyxy",
+    "crop_box_xyxy",
+    "source_digest",
     "captured_at_utc",
 ]
 
@@ -134,6 +136,7 @@ class TrainingManager:
         self._data_root_getter = data_root_getter
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        self._pending_metrics_write: tuple[Path, dict[str, Any]] | None = None
         self._status: dict[str, Any] = {
             "state": "IDLE",
             "message": "等待启动训练",
@@ -145,6 +148,8 @@ class TrainingManager:
             "exported": False,
             "activated": False,
             "activation_status": None,
+            "metrics_persisted": True,
+            "metrics_write_error": None,
             "error": None,
             "updated_at_utc": _utc_now(),
         }
@@ -188,11 +193,22 @@ class TrainingManager:
 
     def _append_manifest_row(self, row: dict[str, str]) -> None:
         path = self._manifest_path()
-        exists = path.is_file()
-        with path.open("a", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS, extrasaction="ignore")
-            if not exists:
-                writer.writeheader()
+        if path.is_file():
+            with path.open("r", newline="", encoding="utf-8-sig") as rf:
+                reader = csv.DictReader(rf)
+                existing_fields = list(reader.fieldnames or [])
+                if existing_fields != MANIFEST_FIELDS:
+                    existing_rows = list(reader)
+                    existing_rows.append(row)
+                    self._write_all_manifest_rows(existing_rows)
+                    return
+            with path.open("a", newline="", encoding="utf-8-sig") as af:
+                writer = csv.DictWriter(af, fieldnames=MANIFEST_FIELDS, extrasaction="ignore")
+                writer.writerow(row)
+            return
+        with path.open("w", newline="", encoding="utf-8-sig") as wf:
+            writer = csv.DictWriter(wf, fieldnames=MANIFEST_FIELDS, extrasaction="ignore")
+            writer.writeheader()
             writer.writerow(row)
 
     def _try_unlink_in_dataset(self, file_path: Path) -> tuple[bool, bool, str | None]:
@@ -232,13 +248,13 @@ class TrainingManager:
         }
 
     def _load_coco_doc(self, coco_path: Path) -> tuple[dict[str, Any] | None, bool]:
-        """Load existing COCO JSON strictly; never treat read/parse failures as an empty dataset."""
+        """Load existing COCO JSON strictly; never treat read/decode/parse failures as an empty dataset."""
         if not coco_path.is_file():
             return self._empty_coco_doc(), True
         try:
             raw = coco_path.read_text(encoding="utf-8")
             doc = json.loads(raw)
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             logger.error("Preserving existing COCO annotations file after read failure (%s): %s", coco_path, exc)
             return None, False
         if not isinstance(doc, dict) or not isinstance(doc.get("images"), list) or not isinstance(doc.get("annotations"), list):
@@ -314,7 +330,11 @@ class TrainingManager:
             )
             next_img_id += 1
             next_ann_id += 1
-        _write_json_atomic(coco_path, coco)
+        try:
+            _write_json_atomic(coco_path, coco)
+        except OSError as exc:
+            logger.error("Failed to persist COCO annotations (%s); preserving existing file: %s", coco_path, exc)
+            return False
         return True
 
     def _append_coco_annotation(
@@ -340,6 +360,20 @@ class TrainingManager:
             ]
         )
 
+    @staticmethod
+    def _parse_csv_box(raw_box: str | None) -> list[float] | None:
+        text = (raw_box or "").strip()
+        if not text:
+            return None
+        parts = text.split(",")
+        if len(parts) != 4:
+            return None
+        try:
+            vals = [float(p) for p in parts]
+        except ValueError:
+            return None
+        return vals if _is_valid_box_coords(vals) else None
+
     def rebuild_coco_from_manifest(self) -> dict[str, Any]:
         """Rebuild annotations_coco.json cleanly from the authoritative manifest CSV and saved image dimensions."""
         with self._lock:
@@ -352,16 +386,11 @@ class TrainingManager:
                     img_h, img_w = int(img.shape[0]), int(img.shape[1])
                 else:
                     img_w, img_h = SAVED_IMAGE_WIDTH, SAVED_IMAGE_HEIGHT
-                crop_box: list[float] | None = None
                 sid = str(r.get("sample_id") or "")
-                raw_box = (r.get("box_xyxy") or "").strip()
-                if sid.startswith("STD_") and raw_box:
-                    parts = raw_box.split(",")
-                    if len(parts) == 4:
-                        try:
-                            crop_box = [float(p) for p in parts]
-                        except ValueError:
-                            crop_box = None
+                # Prefer persisted crop-space coordinates; keep legacy fallback for older rows without crop_box_xyxy.
+                crop_box = self._parse_csv_box(r.get("crop_box_xyxy"))
+                if crop_box is None and sid.startswith("STD_"):
+                    crop_box = self._parse_csv_box(r.get("box_xyxy"))
                 self._append_coco_entry(
                     coco=coco,
                     img_id=idx,
@@ -391,7 +420,10 @@ class TrainingManager:
             return
         coco["images"] = [im for im in coco.get("images", []) if not (isinstance(im, dict) and im.get("id") in removed_img_ids)]
         coco["annotations"] = [an for an in coco.get("annotations", []) if not (isinstance(an, dict) and an.get("image_id") in removed_img_ids)]
-        _write_json_atomic(coco_path, coco)
+        try:
+            _write_json_atomic(coco_path, coco)
+        except OSError as exc:
+            logger.warning("Failed to persist COCO sync delete (%s): %s", coco_path, exc)
 
     def _sync_coco_update(self, sample_id: str, new_rel_path: str, new_label: str) -> None:
         coco_path = self._dataset_dir() / "annotations_coco.json"
@@ -411,7 +443,10 @@ class TrainingManager:
         for an in coco.get("annotations", []):
             if isinstance(an, dict) and an.get("image_id") in updated_img_ids:
                 an["category_id"] = cat_id
-        _write_json_atomic(coco_path, coco)
+        try:
+            _write_json_atomic(coco_path, coco)
+        except OSError as exc:
+            logger.warning("Failed to persist COCO sync update (%s): %s", coco_path, exc)
 
     def _save_sample_image(
         self,
@@ -476,6 +511,8 @@ class TrainingManager:
                 "video_group_id": v_id,
                 "pipe_color": pipe_color,
                 "box_xyxy": box_str,
+                "crop_box_xyxy": ",".join(f"{v:.4f}" for v in resolved_coco_box),
+                "source_digest": "",
                 "captured_at_utc": _utc_now(),
             }
             self._append_manifest_row(row)
@@ -965,9 +1002,8 @@ class TrainingManager:
     ) -> dict[str, Any]:
         """Generate 48 labeled synthetic ROI samples + 4 challenge samples across 4 groups, writing both manifest and COCO.
 
-        Source-lineage isolation (BE-24): never blends the same live source crop across multiple groups.
-        A single live_crop_bgr is confined strictly to one group (TUBE_G01); distinct live_crops (deduplicated
-        by content digest) are mapped at most one per group.
+        Source-lineage isolation (BE-24 / R2-15): never blends the same live source crop across multiple groups,
+        and pins previously seen source digests to their original group across repeated bootstrap calls.
         """
         rng = random.Random(202611)
         groups = [
@@ -976,8 +1012,9 @@ class TrainingManager:
             ("TUBE_G03", "BATCH_2026_03", "VID_G03", "yellow"),
             ("TUBE_G04", "BATCH_2026_04", "VID_G04", "blue"),
         ]
+        group_idx_by_tube = {g[0]: idx for idx, g in enumerate(groups)}
 
-        distinct_sources: list[np.ndarray] = []
+        distinct_sources: list[tuple[np.ndarray, str]] = []
         seen_digests: set[str] = set()
         raw_sources: list[np.ndarray] = []
         if live_crops:
@@ -991,12 +1028,41 @@ class TrainingManager:
             digest = hashlib.sha256(np.ascontiguousarray(src).tobytes()).hexdigest()
             if digest not in seen_digests:
                 seen_digests.add(digest)
-                distinct_sources.append(src)
+                distinct_sources.append((src, digest))
 
-        group_sources: list[np.ndarray | None] = [
-            distinct_sources[idx] if idx < len(distinct_sources) else None for idx in range(len(groups))
-        ]
-        live_crop_groups = [groups[idx][0] for idx, src in enumerate(group_sources) if src is not None]
+        # Inspect existing manifest lineage so repeated bootstrap calls keep each source pinned to one group
+        existing_source_to_groups: dict[str, set[str]] = defaultdict(set)
+        existing_group_to_sources: dict[str, set[str]] = defaultdict(set)
+        with self._lock:
+            for existing_row in self._read_manifest_rows():
+                src_dig = (existing_row.get("source_digest") or "").strip()
+                tk = (existing_row.get("physical_tube_id") or "").strip()
+                if src_dig and tk and not _is_ungrouped_tube(tk):
+                    existing_source_to_groups[src_dig].add(tk)
+                    existing_group_to_sources[tk].add(src_dig)
+
+        group_sources: list[tuple[np.ndarray, str] | None] = [None] * len(groups)
+        unpinned_sources: list[tuple[np.ndarray, str]] = []
+        for src, digest in distinct_sources:
+            prior_groups = existing_source_to_groups.get(digest)
+            if prior_groups:
+                # Pin to the existing group if uniquely within our bootstrap groups; never assign to a second group
+                if len(prior_groups) == 1:
+                    pinned_tube = next(iter(prior_groups))
+                    if pinned_tube in group_idx_by_tube:
+                        slot = group_idx_by_tube[pinned_tube]
+                        if group_sources[slot] is None:
+                            group_sources[slot] = (src, digest)
+                continue
+            unpinned_sources.append((src, digest))
+
+        # Assign new distinct sources to unoccupied slots, preferring groups with no prior source digest
+        open_slots = [idx for idx in range(len(groups)) if group_sources[idx] is None]
+        open_slots.sort(key=lambda idx: (len(existing_group_to_sources.get(groups[idx][0], set())), idx))
+        for (src, digest), slot in zip(unpinned_sources, open_slots, strict=False):
+            group_sources[slot] = (src, digest)
+
+        live_crop_groups = [groups[idx][0] for idx, item in enumerate(group_sources) if item is not None]
 
         ds_dir = self._dataset_dir()
         created = 0
@@ -1004,7 +1070,9 @@ class TrainingManager:
         pending_coco: list[dict[str, Any]] = []
 
         for g_idx, (tube_id, batch_id, vid_id, p_color) in enumerate(groups):
-            group_base_bgr = group_sources[g_idx]
+            slot_item = group_sources[g_idx]
+            group_base_bgr = slot_item[0] if slot_item is not None else None
+            group_source_digest = slot_item[1] if slot_item is not None else ""
             for label in CLASSES:
                 for k in range(3):
                     variant = g_idx * 10 + k
@@ -1018,6 +1086,7 @@ class TrainingManager:
                     if ok:
                         abs_path.write_bytes(bytes(buf))
                         img_h, img_w = int(img.shape[0]), int(img.shape[1])
+                        box_csv = ",".join(f"{v:.4f}" for v in box_norm)
                         pending_rows.append(
                             {
                                 "sample_id": sample_id,
@@ -1027,7 +1096,9 @@ class TrainingManager:
                                 "batch_id": batch_id,
                                 "video_group_id": vid_id,
                                 "pipe_color": p_color,
-                                "box_xyxy": ",".join(f"{v:.4f}" for v in box_norm),
+                                "box_xyxy": box_csv,
+                                "crop_box_xyxy": box_csv,
+                                "source_digest": group_source_digest,
                                 "captured_at_utc": _utc_now(),
                             }
                         )
@@ -1055,6 +1126,7 @@ class TrainingManager:
             if ok:
                 abs_path.write_bytes(bytes(buf))
                 img_h, img_w = int(img.shape[0]), int(img.shape[1])
+                box_csv = ",".join(f"{v:.4f}" for v in box_norm)
                 pending_rows.append(
                     {
                         "sample_id": sample_id,
@@ -1064,7 +1136,9 @@ class TrainingManager:
                         "batch_id": f"BATCH_CHAL_ISO_{k + 1:02d}",
                         "video_group_id": f"VID_CHAL_ISO_{k + 1:02d}",
                         "pipe_color": "yellow",
-                        "box_xyxy": ",".join(f"{v:.4f}" for v in box_norm),
+                        "box_xyxy": box_csv,
+                        "crop_box_xyxy": box_csv,
+                        "source_digest": "",
                         "captured_at_utc": _utc_now(),
                     }
                 )
@@ -1094,12 +1168,33 @@ class TrainingManager:
         return summary
 
     @classmethod
+    def _row_image_digest(cls, row: dict[str, str]) -> str:
+        cached = (row.get("image_sha256") or "").strip()
+        if cached:
+            return cached
+        raw_abs = (row.get("abs_path") or "").strip()
+        if not raw_abs:
+            return ""
+        p = Path(raw_abs)
+        if not p.is_file():
+            return ""
+        try:
+            digest = _sha256_file(p)
+        except OSError:
+            return ""
+        row["image_sha256"] = digest
+        return digest
+
+    @classmethod
     def _select_group_split(
         cls,
         rows: list[dict[str, str]],
         forbidden_holdout_groups: set[str] | None = None,
+        forbidden_holdout_sample_ids: set[str] | None = None,
+        forbidden_holdout_image_digests: set[str] | None = None,
+        forbidden_holdout_source_digests: set[str] | None = None,
     ) -> dict[str, Any]:
-        """Select a leak-free group split ensuring train covers all required classes and holdouts exclude ungrouped/forbidden groups."""
+        """Select a leak-free group split with O(1) per-pair coverage checks and group/sample/image/source provenance isolation."""
         by_tube: dict[str, list[dict[str, str]]] = defaultdict(list)
         ungrouped_rows: list[dict[str, str]] = []
         challenges: list[dict[str, str]] = []
@@ -1118,25 +1213,68 @@ class TrainingManager:
         if len(tube_keys) < 3:
             raise ValueError("独立料管分组不足 3 组，无法构建无泄漏的 train/val/test 划分（未分组样本不计入独立料管组）")
 
-        forbidden = {g for g in (forbidden_holdout_groups or set()) if not _is_ungrouped_tube(g)}
-        holdout_candidates = [tk for tk in tube_keys if tk not in forbidden]
+        forbidden_groups = {g for g in (forbidden_holdout_groups or set()) if not _is_ungrouped_tube(g)}
+        forbidden_samples = {s.strip() for s in (forbidden_holdout_sample_ids or set()) if isinstance(s, str) and s.strip()}
+        forbidden_images = {d.strip().lower() for d in (forbidden_holdout_image_digests or set()) if isinstance(d, str) and d.strip()}
+        forbidden_sources = {s.strip().lower() for s in (forbidden_holdout_source_digests or set()) if isinstance(s, str) and s.strip()}
+
+        # Track source_digest occurrences across all groups + ungrouped so one source can never span multiple partitions (R2-15)
+        tube_sources: dict[str, set[str]] = {}
+        source_occurrences: dict[str, int] = defaultdict(int)
+        for tk in tube_keys:
+            srcs = {(r.get("source_digest") or "").strip().lower() for r in by_tube[tk] if (r.get("source_digest") or "").strip()}
+            tube_sources[tk] = srcs
+            for src in srcs:
+                source_occurrences[src] += 1
+        ungrouped_sources = {
+            (r.get("source_digest") or "").strip().lower()
+            for r in ungrouped_rows
+            if (r.get("source_digest") or "").strip()
+        }
+        for src in ungrouped_sources:
+            source_occurrences[src] += 1
+
+        ineligible_tubes: set[str] = set()
+        for tk in tube_keys:
+            if tk in forbidden_groups:
+                ineligible_tubes.add(tk)
+                continue
+            if any(source_occurrences[src] > 1 for src in tube_sources[tk]):
+                ineligible_tubes.add(tk)
+                continue
+            if forbidden_sources and (tube_sources[tk] & forbidden_sources):
+                ineligible_tubes.add(tk)
+                continue
+            if forbidden_samples and any((r.get("sample_id") or "").strip() in forbidden_samples for r in by_tube[tk]):
+                ineligible_tubes.add(tk)
+                continue
+            if forbidden_images and any(cls._row_image_digest(r).lower() in forbidden_images for r in by_tube[tk]):
+                ineligible_tubes.add(tk)
+                continue
+
+        holdout_candidates = [tk for tk in tube_keys if tk not in ineligible_tubes]
         if len(holdout_candidates) < 2:
             raise ValueError(
                 "可用于验证/测试留出的未训练独立料管组不足 2 组"
-                + (f"（历史已训练分组：{', '.join(sorted(forbidden))}）" if forbidden else "")
+                + (f"（历史已训练/共享源分组：{', '.join(sorted(ineligible_tubes))}）" if ineligible_tubes else "")
             )
 
         tube_labels = {tk: {r["label"] for r in by_tube[tk]} for tk in tube_keys}
-        required_classes = set(CLASSES)
+        ungrouped_labels = {r["label"] for r in ungrouped_rows if r.get("label") in CLASSES}
+        # Precompute per-class independent-group counts once (R2-34) and count train-only ungrouped labels (R2-16)
+        class_group_counts = {c: sum(1 for tk in tube_keys if c in tube_labels[tk]) for c in CLASSES}
+        classes_needed_from_tubes = [c for c in CLASSES if c not in ungrouped_labels]
 
         def _pair_is_valid(val_tk: str, test_tk: str) -> bool:
-            train_tubes_local = [tk for tk in tube_keys if tk not in {val_tk, test_tk}]
-            if not train_tubes_local:
+            if len(tube_keys) <= 2:
                 return False
-            train_lbls: set[str] = set()
-            for tk in train_tubes_local:
-                train_lbls |= tube_labels[tk]
-            return required_classes.issubset(train_lbls)
+            v_lbls = tube_labels[val_tk]
+            t_lbls = tube_labels[test_tk]
+            for c in classes_needed_from_tubes:
+                remaining = class_group_counts[c] - (1 if c in v_lbls else 0) - (1 if c in t_lbls else 0)
+                if remaining <= 0:
+                    return False
+            return True
 
         chosen: tuple[str, str] | None = None
         full_holdouts = [tk for tk in holdout_candidates if len(tube_labels[tk]) == len(CLASSES)]
@@ -1146,11 +1284,11 @@ class TrainingManager:
         if chosen is None:
             best_score: tuple[int, int, int, int] | None = None
             for i, val_tk in enumerate(holdout_candidates):
+                v_cnt = len(tube_labels[val_tk])
                 for j in range(i + 1, len(holdout_candidates)):
                     test_tk = holdout_candidates[j]
                     if not _pair_is_valid(val_tk, test_tk):
                         continue
-                    v_cnt = len(tube_labels[val_tk])
                     t_cnt = len(tube_labels[test_tk])
                     score = (v_cnt + t_cnt, min(v_cnt, t_cnt), i, j)
                     if best_score is None or score > best_score:
@@ -1158,16 +1296,16 @@ class TrainingManager:
                         chosen = (val_tk, test_tk)
 
         if chosen is None:
-            groups_per_class = {c: sum(1 for tk in tube_keys if c in tube_labels[tk]) for c in CLASSES}
-            deficient = [c for c in CLASSES if groups_per_class[c] < 3]
+            deficient = [c for c in classes_needed_from_tubes if class_group_counts[c] < 3]
             if not deficient:
-                # Forbidden holdouts prevented leaving full class coverage in train
                 fallback_val, fallback_test = holdout_candidates[-2], holdout_candidates[-1]
-                rem_labels: set[str] = set()
-                for tk in tube_keys:
-                    if tk not in {fallback_val, fallback_test}:
-                        rem_labels |= tube_labels[tk]
-                deficient = [c for c in CLASSES if c not in rem_labels] or list(CLASSES)
+                v_lbls = tube_labels[fallback_val]
+                t_lbls = tube_labels[fallback_test]
+                deficient = [
+                    c
+                    for c in classes_needed_from_tubes
+                    if class_group_counts[c] - (1 if c in v_lbls else 0) - (1 if c in t_lbls else 0) <= 0
+                ] or list(CLASSES)
             raise ValueError(
                 f"当前独立料管分组布局无法构建覆盖全部 4 类的训练集，以下类别需要更多独立料管组：{', '.join(deficient)}"
             )
@@ -1197,8 +1335,8 @@ class TrainingManager:
             )
         if not val_rows or not test_rows:
             raise ValueError("分组划分校验未通过，验证集或测试集为空")
-        if val_tube in forbidden or test_tube in forbidden:
-            raise ValueError("分组划分校验未通过，验证或测试集包含历史已训练分组")
+        if val_tube in ineligible_tubes or test_tube in ineligible_tubes:
+            raise ValueError("分组划分校验未通过，验证或测试集包含不可留出分组")
 
         return {
             "train_rows": train_rows,
@@ -1337,7 +1475,7 @@ class TrainingManager:
         return run_id, run_dir
 
     def _snapshot_manifest_for_run(self, rows: list[dict[str, str]], run_dir: Path) -> tuple[list[dict[str, str]], Path]:
-        """Copy selected dataset images into a run-scoped immutable snapshot directory (must be called under self._lock)."""
+        """Copy selected dataset images into a run-scoped immutable snapshot directory and hash each image (called under self._lock)."""
         snapshot_dir = run_dir / "_input_snapshot"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         snapshotted: list[dict[str, str]] = []
@@ -1348,33 +1486,115 @@ class TrainingManager:
             suffix = src.suffix or ".jpg"
             safe_sid = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in str(r.get("sample_id") or f"row{idx}"))
             dst = snapshot_dir / f"{idx:05d}_{safe_sid}{suffix}"
-            shutil.copyfile(src, dst)
-            snapshotted.append({**r, "abs_path": str(dst)})
+            img_bytes = src.read_bytes()
+            img_sha = hashlib.sha256(img_bytes).hexdigest()
+            dst.write_bytes(img_bytes)
+            snapshotted.append({**r, "abs_path": str(dst), "image_sha256": img_sha})
         return snapshotted, snapshot_dir
 
     @staticmethod
-    def _read_checkpoint_seen_groups(pth_candidate: Path, ckpt: dict[str, Any]) -> set[str] | None:
-        """Extract previously trained group provenance from checkpoint payload or sibling metrics.json."""
-        for key in ("seen_groups", "train_groups"):
-            raw = ckpt.get(key)
+    def _extract_str_set(container: dict[str, Any], keys: tuple[str, ...], *, exclude_ungrouped: bool = False) -> set[str]:
+        for key in keys:
+            raw = container.get(key)
             if isinstance(raw, list) and raw and all(isinstance(x, str) and x.strip() for x in raw):
-                groups = {x.strip() for x in raw if not _is_ungrouped_tube(x)}
-                if groups:
-                    return groups
+                vals = {x.strip() for x in raw if not (exclude_ungrouped and _is_ungrouped_tube(x))}
+                if vals:
+                    return vals
+        return set()
+
+    @classmethod
+    def _read_checkpoint_provenance(cls, pth_candidate: Path, ckpt: dict[str, Any]) -> dict[str, set[str]] | None:
+        """Extract previously trained group, sample ID, image digest, and source lineage from checkpoint or sibling metrics.json."""
+        meta: dict[str, Any] = {}
         metrics_path = pth_candidate.parent / "metrics.json"
         if metrics_path.is_file():
             try:
-                meta = json.loads(metrics_path.read_text(encoding="utf-8"))
-                if isinstance(meta, dict):
-                    for key in ("seen_groups", "train_groups"):
-                        raw = meta.get(key)
-                        if isinstance(raw, list) and raw and all(isinstance(x, str) and x.strip() for x in raw):
-                            groups = {x.strip() for x in raw if not _is_ungrouped_tube(x)}
-                            if groups:
-                                return groups
-            except (OSError, json.JSONDecodeError) as exc:
+                loaded = json.loads(metrics_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    meta = loaded
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 logger.warning("Failed to read provenance metrics for checkpoint %s: %s", pth_candidate, exc)
-        return None
+
+        seen_groups = cls._extract_str_set(ckpt, ("seen_groups", "train_groups"), exclude_ungrouped=True) or cls._extract_str_set(
+            meta, ("seen_groups", "train_groups"), exclude_ungrouped=True
+        )
+        seen_samples = cls._extract_str_set(ckpt, ("seen_sample_ids", "train_sample_ids")) or cls._extract_str_set(
+            meta, ("seen_sample_ids", "train_sample_ids")
+        )
+        seen_images = {
+            d.lower()
+            for d in (
+                cls._extract_str_set(ckpt, ("seen_image_digests", "train_image_digests"))
+                or cls._extract_str_set(meta, ("seen_image_digests", "train_image_digests"))
+            )
+        }
+        seen_sources = {
+            s.lower()
+            for s in (
+                cls._extract_str_set(ckpt, ("seen_source_digests", "train_source_digests"))
+                or cls._extract_str_set(meta, ("seen_source_digests", "train_source_digests"))
+            )
+        }
+
+        if not seen_groups and not seen_samples and not seen_images:
+            return None
+        return {
+            "seen_groups": seen_groups,
+            "seen_sample_ids": seen_samples,
+            "seen_image_digests": seen_images,
+            "seen_source_digests": seen_sources,
+        }
+
+    @classmethod
+    def _read_checkpoint_seen_groups(cls, pth_candidate: Path, ckpt: dict[str, Any]) -> set[str] | None:
+        prov = cls._read_checkpoint_provenance(pth_candidate, ckpt)
+        if prov is None or not prov["seen_groups"]:
+            return None
+        return prov["seen_groups"]
+
+    def _persist_metrics_with_retry(self, metrics_path: Path, payload: dict[str, Any], attempts: int = 3) -> str | None:
+        """Persist metrics.json atomically with bounded retry; never raises so confirmed model activation is preserved (R2-18)."""
+        last_err: str | None = None
+        disk_payload = {**payload, "metrics_persisted": True, "metrics_write_error": None}
+        for attempt in range(max(1, attempts)):
+            try:
+                _write_json_atomic(metrics_path, disk_payload)
+                with self._lock:
+                    self._pending_metrics_write = None
+                return None
+            except OSError as exc:
+                last_err = str(exc) or exc.__class__.__name__
+                logger.warning(
+                    "Failed to write metrics.json (%s, attempt %d/%d): %s",
+                    metrics_path,
+                    attempt + 1,
+                    attempts,
+                    last_err,
+                )
+                if attempt + 1 < attempts:
+                    time.sleep(0.05)
+        with self._lock:
+            self._pending_metrics_write = (metrics_path, disk_payload)
+        return last_err
+
+    def retry_persist_latest_metrics(self) -> bool:
+        """Retry writing the most recent failed metrics.json update without altering active model status."""
+        with self._lock:
+            pending = self._pending_metrics_write
+        if pending is None:
+            return True
+        metrics_path, payload = pending
+        err = self._persist_metrics_with_retry(metrics_path, payload, attempts=1)
+        if err is None:
+            with self._lock:
+                self._status["metrics_persisted"] = True
+                self._status["metrics_write_error"] = None
+                if isinstance(self._status.get("latest_run"), dict):
+                    self._status["latest_run"]["metrics_persisted"] = True
+                    self._status["latest_run"]["metrics_write_error"] = None
+                self._status["updated_at_utc"] = _utc_now()
+            return True
+        return False
 
     def get_training_status(self) -> dict[str, Any]:
         with self._lock:
@@ -1409,6 +1629,7 @@ class TrainingManager:
                 raise
 
             mode_desc = "增量微调 (Fine-tune)" if resume_from_latest else "从零初始化训练"
+            self._pending_metrics_write = None
             self._status = {
                 "state": "TRAINING",
                 "message": f"正在执行分组防泄漏审计与启动 {mode_desc}…",
@@ -1420,6 +1641,8 @@ class TrainingManager:
                 "exported": False,
                 "activated": False,
                 "activation_status": None,
+                "metrics_persisted": True,
+                "metrics_write_error": None,
                 "error": None,
                 "updated_at_utc": _utc_now(),
             }
@@ -1513,6 +1736,9 @@ class TrainingManager:
             model = _FastConvergingMobileNetV3(base_mnet, len(CLASSES)).to(device)
             resumed_from: str | None = None
             resumed_seen_groups: set[str] = set()
+            resumed_seen_sample_ids: set[str] = set()
+            resumed_seen_image_digests: set[str] = set()
+            resumed_seen_source_digests: set[str] = set()
             split: dict[str, Any] | None = None
 
             if resume_from_latest:
@@ -1533,8 +1759,8 @@ class TrainingManager:
                         logger.debug("Skipping incompatible checkpoint %s: %s", pth_candidate, exc)
                         continue
 
-                    prior_seen = self._read_checkpoint_seen_groups(pth_candidate, ckpt)
-                    if prior_seen is None:
+                    prior_prov = self._read_checkpoint_provenance(pth_candidate, ckpt)
+                    if prior_prov is None:
                         logger.warning(
                             "Rejecting warm-start checkpoint %s without training group provenance",
                             pth_candidate.parent.name,
@@ -1543,7 +1769,13 @@ class TrainingManager:
                         continue
 
                     try:
-                        candidate_split = self._select_group_split(rows, forbidden_holdout_groups=prior_seen)
+                        candidate_split = self._select_group_split(
+                            rows,
+                            forbidden_holdout_groups=prior_prov["seen_groups"],
+                            forbidden_holdout_sample_ids=prior_prov["seen_sample_ids"],
+                            forbidden_holdout_image_digests=prior_prov["seen_image_digests"],
+                            forbidden_holdout_source_digests=prior_prov["seen_source_digests"],
+                        )
                     except ValueError as split_exc:
                         logger.warning(
                             "Rejecting warm-start checkpoint %s due to holdout leakage risk: %s",
@@ -1560,7 +1792,10 @@ class TrainingManager:
                         continue
 
                     resumed_from = pth_candidate.parent.name
-                    resumed_seen_groups = prior_seen
+                    resumed_seen_groups = prior_prov["seen_groups"]
+                    resumed_seen_sample_ids = prior_prov["seen_sample_ids"]
+                    resumed_seen_image_digests = prior_prov["seen_image_digests"]
+                    resumed_seen_source_digests = prior_prov["seen_source_digests"]
                     split = candidate_split
                     break
 
@@ -1581,12 +1816,29 @@ class TrainingManager:
             train_groups: list[str] = split["train_groups"]
             val_groups: list[str] = split["val_groups"]
             test_groups: list[str] = split["test_groups"]
+            train_sample_ids = sorted({(r.get("sample_id") or "").strip() for r in train_rows if (r.get("sample_id") or "").strip()})
+            train_image_digests = sorted({self._row_image_digest(r).lower() for r in train_rows if self._row_image_digest(r)})
+            train_source_digests = sorted(
+                {(r.get("source_digest") or "").strip().lower() for r in train_rows if (r.get("source_digest") or "").strip()}
+            )
             cumulative_seen_groups = sorted(resumed_seen_groups | set(train_groups))
+            cumulative_seen_sample_ids = sorted(resumed_seen_sample_ids | set(train_sample_ids))
+            cumulative_seen_image_digests = sorted(resumed_seen_image_digests | set(train_image_digests))
+            cumulative_seen_source_digests = sorted(resumed_seen_source_digests | set(train_source_digests))
 
+            holdout_rows = [*val_rows, *test_rows]
             if resumed_seen_groups and not (
                 set(val_groups).isdisjoint(resumed_seen_groups) and set(test_groups).isdisjoint(resumed_seen_groups)
             ):
                 raise RuntimeError("Warm-start holdout leakage detected: previously trained group placed in holdout")
+            if resumed_seen_sample_ids and any((r.get("sample_id") or "").strip() in resumed_seen_sample_ids for r in holdout_rows):
+                raise RuntimeError("Warm-start holdout leakage detected: previously trained sample placed in holdout")
+            if resumed_seen_image_digests and any(self._row_image_digest(r).lower() in resumed_seen_image_digests for r in holdout_rows):
+                raise RuntimeError("Warm-start holdout leakage detected: previously trained image placed in holdout")
+            if resumed_seen_source_digests and any(
+                (r.get("source_digest") or "").strip().lower() in resumed_seen_source_digests for r in holdout_rows
+            ):
+                raise RuntimeError("Warm-start holdout leakage detected: previously trained source placed in holdout")
 
             eval_tf = transforms.Compose(
                 [
@@ -1718,6 +1970,12 @@ class TrainingManager:
                     "input_size": input_size,
                     "train_groups": train_groups,
                     "seen_groups": cumulative_seen_groups,
+                    "train_sample_ids": train_sample_ids,
+                    "seen_sample_ids": cumulative_seen_sample_ids,
+                    "train_image_digests": train_image_digests,
+                    "seen_image_digests": cumulative_seen_image_digests,
+                    "train_source_digests": train_source_digests,
+                    "seen_source_digests": cumulative_seen_source_digests,
                     "val_groups": val_groups,
                     "test_groups": test_groups,
                     "resumed_from": resumed_from,
@@ -1787,6 +2045,12 @@ class TrainingManager:
                 "challenge_samples": len(challenges),
                 "train_groups": train_groups,
                 "seen_groups": cumulative_seen_groups,
+                "train_sample_ids": train_sample_ids,
+                "seen_sample_ids": cumulative_seen_sample_ids,
+                "train_image_digests": train_image_digests,
+                "seen_image_digests": cumulative_seen_image_digests,
+                "train_source_digests": train_source_digests,
+                "seen_source_digests": cumulative_seen_source_digests,
                 "val_groups": val_groups,
                 "test_groups": test_groups,
                 "contains_synthetic_bootstrap": any_synthetic,
@@ -1901,18 +2165,29 @@ class TrainingManager:
             run_summary["activated"] = activated
             run_summary["activation_status"] = "activated" if activated else "activation_failed"
             run_summary["activation_error"] = activation_error
-            _write_json_atomic(metrics_path, run_summary)
+            metrics_write_err = self._persist_metrics_with_retry(metrics_path, run_summary)
+            run_summary["metrics_persisted"] = metrics_write_err is None
+            run_summary["metrics_write_error"] = metrics_write_err
 
             if activated:
+                if metrics_write_err is None:
+                    done_msg = f"训练与 ONNX 导出完成（测试集准确率 {test_res['accuracy'] * 100:.1f}%，已热加载至实时相机引擎）"
+                else:
+                    done_msg = (
+                        f"训练与 ONNX 导出完成（测试集准确率 {test_res['accuracy'] * 100:.1f}%，"
+                        f"已热加载至实时相机引擎；但 metrics.json 写入失败，待重试：{metrics_write_err}）"
+                    )
                 with self._lock:
                     self._status.update(
                         {
                             "state": "COMPLETED",
-                            "message": f"训练与 ONNX 导出完成（测试集准确率 {test_res['accuracy'] * 100:.1f}%，已热加载至实时相机引擎）",
+                            "message": done_msg,
                             "progress_pct": 100,
                             "exported": True,
                             "activated": True,
                             "activation_status": "activated",
+                            "metrics_persisted": metrics_write_err is None,
+                            "metrics_write_error": metrics_write_err,
                             "latest_run": run_summary,
                             "error": None,
                             "updated_at_utc": _utc_now(),
@@ -1930,6 +2205,8 @@ class TrainingManager:
                             "exported": True,
                             "activated": False,
                             "activation_status": "activation_failed",
+                            "metrics_persisted": metrics_write_err is None,
+                            "metrics_write_error": metrics_write_err,
                             "latest_run": run_summary,
                             "updated_at_utc": _utc_now(),
                         }

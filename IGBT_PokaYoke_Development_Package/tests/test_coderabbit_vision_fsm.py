@@ -431,67 +431,127 @@ class FSMHardeningTests(unittest.TestCase):
         fsm.process(self._obs(clock[0], fid, label_class="absent"), now_monotonic=clock[0])
         self.assertEqual(fsm.state, FSMState.VERIFY_C_ABSENT)
 
-        # Advance in <= 0.15s steps to t0 + 1.1996s (1199.6 ms -> rounds to 1200, MUST NOT PASS!)
+        # Advance in <= 0.15s steps to t0 + 1.1996s (1199.6 ms -> MUST NOT PASS, c_timer_ms <= 1199 per R2-32!)
         for offset in (0.15, 0.30, 0.45, 0.60, 0.75, 0.90, 1.05, 1.1996):
             clock[0] = t0 + offset
             fid += 1
             fsm.process(self._obs(clock[0], fid, label_class="absent"), now_monotonic=clock[0])
         self.assertEqual(fsm.state, FSMState.VERIFY_C_ABSENT)
         self.assertNotEqual(fsm.outcome, "PASS")
+        self.assertEqual(fsm.c_timer_ms, 1199)
 
-        # Advance past 1200.0 ms -> PASS
+        # Advance past 1200.0 ms -> PASS with confirmed c_timer_ms == 1200
         clock[0] = t0 + 1.2000
         fid += 1
         fsm.process(self._obs(clock[0], fid, label_class="absent"), now_monotonic=clock[0])
         self.assertEqual(fsm.state, FSMState.PASS)
         self.assertEqual(fsm.result_reason, "C_REMOVED")
+        self.assertEqual(fsm.c_timer_ms, 1200)
 
-    def test_BE51_frame_id_baseline_not_advanced_on_rejected_gap(self) -> None:
+    def test_BE51_and_R2_11_frame_id_baseline_nonmonotonic_and_forward_gap(self) -> None:
         fsm, clock = self._make_fsm()
         fsm.process(FSMEvent(kind="new_cycle", cycle_id="CYC_FID"), now_monotonic=clock[0])
         clock[0] += 0.1
         fsm.process(self._obs(clock[0], 100, label_class="complete"), now_monotonic=clock[0])
         self.assertEqual(fsm._last_frame_id, 100)
+        ts_100 = fsm._last_capture
 
-        # Gap frame with lower frame_id=5 must be rejected and NOT overwrite baseline 100
+        # Nonmonotonic gap frame (frame_id=5 <= 100) must be rejected and leave BOTH markers unchanged (BE-51, R2-11)
         clock[0] += 0.35
         fsm.process(self._obs(clock[0], 5, label_class="complete"), now_monotonic=clock[0])
         self.assertEqual(fsm.result_reason, "FRAME_ID_NOT_MONOTONIC")
         self.assertEqual(fsm._last_frame_id, 100)
+        self.assertEqual(fsm._last_capture, ts_100)
 
         # Follow-up frame_id=6 (>5, <=100) must STILL be rejected!
         clock[0] += 0.1
         fsm.process(self._obs(clock[0], 6, label_class="complete"), now_monotonic=clock[0])
         self.assertEqual(fsm.result_reason, "FRAME_ID_NOT_MONOTONIC")
         self.assertEqual(fsm._last_frame_id, 100)
+        self.assertEqual(fsm._last_capture, ts_100)
 
-        # Gap frame with higher frame_id=105 triggers FRAME_GAP_EXCEEDED without advancing _last_frame_id
+        # Forward gap frame (frame_id=105 > 100) triggers FRAME_GAP_EXCEEDED and advances BOTH markers (R2-11)
         clock[0] += 0.35
         fsm.process(self._obs(clock[0], 105, label_class="complete"), now_monotonic=clock[0])
         self.assertEqual(fsm.result_reason, "FRAME_GAP_EXCEEDED")
-        self.assertEqual(fsm._last_frame_id, 100)
+        self.assertEqual(fsm._last_frame_id, 105)
 
-        # Replaying old frame_id=100 is still rejected
-        clock[0] += 0.1
+        # Duplicate of forward gap frame_id=105 with newer timestamp MUST be rejected (R2-11)
+        clock[0] += 0.05
+        fsm.process(self._obs(clock[0], 105, label_class="complete"), now_monotonic=clock[0])
+        self.assertEqual(fsm.result_reason, "FRAME_ID_NOT_MONOTONIC")
+
+        # Replaying old frame_id=100 is also rejected
+        clock[0] += 0.05
         fsm.process(self._obs(clock[0], 100, label_class="complete"), now_monotonic=clock[0])
         self.assertEqual(fsm.result_reason, "FRAME_ID_NOT_MONOTONIC")
 
-        # Advancing past last accepted baseline (101 > 100) recovers cleanly
-        clock[0] += 0.1
-        fsm.process(self._obs(clock[0], 101, label_class="complete"), now_monotonic=clock[0])
-        self.assertEqual(fsm._last_frame_id, 101)
+        # Advancing past forward gap baseline (106 > 105, within 200ms of frame 105) recovers cleanly
+        clock[0] += 0.05
+        fsm.process(self._obs(clock[0], 106, label_class="complete"), now_monotonic=clock[0])
+        self.assertEqual(fsm._last_frame_id, 106)
         self.assertEqual(fsm.state, FSMState.VERIFY_INITIAL)
 
-    def test_BE55_state_transition_records_include_triggering_frame_id(self) -> None:
+    def test_BE55_and_R2_33_state_transition_records_include_triggering_frame_id(self) -> None:
         fsm, clock = self._make_fsm()
         fsm.process(FSMEvent(kind="new_cycle", cycle_id="CYC_FID_LOG"), now_monotonic=clock[0])
         clock[0] += 0.1
         fsm.process(self._obs(clock[0], 11, label_class="complete"), now_monotonic=clock[0])
         clock[0] += 0.1
         fsm.process(self._obs(clock[0], 12, label_class="complete"), now_monotonic=clock[0])
+        # Frame-triggered start_inspection records frame_id=42 and capture_monotonic_s (R2-33)
+        fsm.process(
+            FSMEvent(kind="start_inspection", capture_monotonic_s=clock[0], frame_id=42),
+            now_monotonic=clock[0],
+        )
         transitions = [r for r in fsm.transition_log() if r["record_type"] == "STATE_TRANSITION"]
         ready_rec = next(r for r in transitions if r["state_after"] == "READY")
         self.assertEqual(ready_rec["frame_id"], 12)
+        started_rec = next(r for r in transitions if r["reason"] == "INSPECTION_STARTED")
+        self.assertEqual(started_rec["frame_id"], 42)
+        self.assertEqual(started_rec["capture_monotonic_s"], clock[0])
+
+        # Manual start_inspection without frame_id preserves None
+        fsm2, clock2 = self._make_fsm()
+        fsm2.process(FSMEvent(kind="new_cycle", cycle_id="CYC_MANUAL"), now_monotonic=clock2[0])
+        for fid in (1, 2):
+            clock2[0] += 0.1
+            fsm2.process(self._obs(clock2[0], fid, label_class="complete"), now_monotonic=clock2[0])
+        fsm2.process(FSMEvent(kind="start_inspection"), now_monotonic=clock2[0])
+        t2 = [r for r in fsm2.transition_log() if r["record_type"] == "STATE_TRANSITION"]
+        started2 = next(r for r in t2 if r["reason"] == "INSPECTION_STARTED")
+        self.assertIsNone(started2["frame_id"])
+
+    def test_R2_12_audit_sink_failure_isolated_from_committed_transition_and_retried_fifo(self) -> None:
+        delivered: list[dict] = []
+        fail_sink = {"fail": True}
+
+        def flaky_audit(rec: dict) -> None:
+            if fail_sink["fail"]:
+                raise RuntimeError("audit disk full")
+            delivered.append(rec)
+
+        clock = [100.0]
+        fsm = InspectionFSM(
+            FSMConfig(initial_complete_ms=100, stable_state_ms=100, min_stable_frames=2),
+            clock=lambda: clock[0],
+            audit_sink=flaky_audit,
+        )
+        # Sink fails during new_cycle -> process() MUST NOT raise and MUST record both STATE_TRANSITION and EVENT
+        state_after = fsm.process(FSMEvent(kind="new_cycle", cycle_id="CYC_AUDIT"), now_monotonic=clock[0])
+        self.assertEqual(state_after, FSMState.VERIFY_INITIAL)
+        self.assertEqual(len(delivered), 0)
+        self.assertEqual(fsm.pending_audit_count, 2)
+        rec_types = [r["record_type"] for r in fsm.transition_log()]
+        self.assertEqual(rec_types, ["STATE_TRANSITION", "EVENT"])
+
+        # Once sink recovers, flush delivers queued records in exact FIFO sequence order
+        fail_sink["fail"] = False
+        flushed = fsm.flush_audit_sink()
+        self.assertEqual(flushed, 2)
+        self.assertEqual(fsm.pending_audit_count, 0)
+        self.assertEqual([r["record_type"] for r in delivered], ["STATE_TRANSITION", "EVENT"])
+        self.assertEqual([r["sequence"] for r in delivered], [1, 2])
 
 
 class StationRuntimeHardeningTests(unittest.TestCase):
@@ -640,8 +700,9 @@ class LiveCameraHardeningTests(unittest.TestCase):
 
         engine._track_dynamic_targets = track_and_toggle  # type: ignore[method-assign]
         ok = engine._process_frame(frame, time.monotonic())
-        self.assertTrue(ok)
-        # In-flight frame was computed with mirror=True -> published under mirror=True!
+        # R2-08: in-flight observation computed before a mid-frame mirror change is discarded at commit guard!
+        self.assertFalse(ok)
+        # Published state still reflects the prior committed mirror=True (never mixed coordinates!)
         self.assertTrue(engine.get_state()["mirror_horizontal"])
         self.assertTrue(engine._pending_tracker_reset)
 
@@ -1139,24 +1200,373 @@ class LiveCameraHardeningTests(unittest.TestCase):
         self.assertEqual(w_seq, seq)
         self.assertEqual(w_jpg, hud_jpg)
 
-        # wait_for_frame wakes promptly when another thread publishes a new frame
+        # wait_for_frame wakes promptly when another thread publishes a new frame (R2-46)
         engine._running = True
+        entered_wait = threading.Event()
         woke_result: dict[str, object] = {}
+        engine._wait_entered_hook = entered_wait.set
 
         def waiter():
-            jpg, new_seq = engine.wait_for_frame(last_seq=seq, timeout=2.0, kind="crop")
+            jpg, new_seq = engine.wait_for_frame(last_seq=cseq, timeout=2.0, kind="crop")
             woke_result["jpg"] = jpg
             woke_result["seq"] = new_seq
+            woke_result["woke_at"] = time.monotonic()
 
         t = threading.Thread(target=waiter)
         t.start()
-        time.sleep(0.05)
-        engine._process_frame(frame, time.monotonic())
-        t.join(timeout=2.0)
-        engine._running = False
+        try:
+            self.assertTrue(entered_wait.wait(timeout=1.0), "Waiter did not enter blocking Condition.wait")
+            pub_ts = time.monotonic()
+            engine._process_frame(frame, pub_ts)
+            t.join(timeout=1.0)
+        finally:
+            engine._wait_entered_hook = None
+            engine._running = False
         self.assertFalse(t.is_alive())
-        self.assertEqual(woke_result["seq"], seq + 1)
+        self.assertEqual(woke_result["seq"], cseq + 1)
         self.assertIsNotNone(woke_result["jpg"])
+        # Must wake well before the 2.0s timeout (proves Condition notification, not timeout expiry)
+        wake_elapsed = float(woke_result["woke_at"]) - pub_ts
+        self.assertLess(wake_elapsed, 0.8)
+
+    def test_R2_05_and_R2_21_overflow_never_evicts_and_discard_recovers(self) -> None:
+        delivered: list[str] = []
+        fail_sink = {"fail": True}
+
+        def sink(snap: dict, _prev: str | None) -> bool:
+            if fail_sink["fail"]:
+                return False
+            delivered.append(snap["transition_event_id"])
+            return True
+
+        engine = LiveCameraEngine(config_loader=lambda: {}, on_cycle_update=sink)
+        engine._max_pending_transitions = 2
+        engine.set_work_mode("debug")
+        frame = _make_yellow_tube_frame(width=640, height=360, with_white_label=True)
+
+        # Seed 2 failed unpersisted transitions at capacity
+        engine._pending_transitions.append(
+            {
+                "event_id": "ev_oldest_1",
+                "snapshot": {"cycle_id": "CYC_1", "transition_event_id": "ev_oldest_1", "outcome": "ALARM"},
+                "prev_fsm": "INSPECTING",
+                "needs_evidence": False,
+                "frame_bgr": None,
+                "evidence_jpeg": None,
+            }
+        )
+        engine._pending_transitions.append(
+            {
+                "event_id": "ev_second_2",
+                "snapshot": {"cycle_id": "CYC_2", "transition_event_id": "ev_second_2", "outcome": "PASS"},
+                "prev_fsm": "INSPECTING",
+                "needs_evidence": False,
+                "frame_bgr": None,
+                "evidence_jpeg": None,
+            }
+        )
+
+        # Next frame MUST NOT evict ev_oldest_1; must stop accepting new results and report FAULT
+        engine._process_frame(frame, time.monotonic())
+        self.assertEqual([item["event_id"] for item in engine._pending_transitions], ["ev_oldest_1", "ev_second_2"])
+        st = engine.get_state()
+        self.assertEqual(st["fsm_state"], "FAULT")
+        self.assertEqual(st["outcome"], "FAULT")
+        self.assertEqual(st["result_reason"], "PERSISTENCE_QUEUE_OVERFLOW")
+        self.assertFalse(st["view_valid"])
+
+        # R2-21: selective discard drops only CYC_2 and clears overflow fault
+        removed = engine.discard_pending_transitions({"CYC_2"})
+        self.assertEqual(removed, 1)
+        self.assertEqual([item["event_id"] for item in engine._pending_transitions], ["ev_oldest_1"])
+        self.assertFalse(engine._persistence_overflow_fault)
+
+        # When persistence recovers, remaining ev_oldest_1 flushes in FIFO order
+        fail_sink["fail"] = False
+        self.assertEqual(engine._flush_pending_transitions(), 1)
+        self.assertEqual(delivered, ["ev_oldest_1"])
+
+    def test_R2_06_debug_pass_never_carried_into_strict_mode_while_alarm_preserved(self) -> None:
+        engine = LiveCameraEngine(config_loader=lambda: {})
+        engine.set_work_mode("debug")
+        engine.fsm = InspectionFSM(config=FSMConfig(initial_complete_ms=100, stable_state_ms=100, min_stable_frames=2))
+        now = 100.0
+        engine.fsm.process(FSMEvent(kind="new_cycle", cycle_id="CYC_DBG"), now_monotonic=now)
+        for fid in (1, 2):
+            now += 0.1
+            engine.fsm.process(
+                FSMEvent(
+                    kind="observation",
+                    cycle_id="CYC_DBG",
+                    capture_monotonic_s=now,
+                    frame_id=fid,
+                    label_class="complete",
+                    view_valid=True,
+                    quality_ok=True,
+                    camera_healthy=True,
+                    camera_settings_locked=True,
+                    config_match=True,
+                    tube_present=True,
+                    label_window_present=True,
+                    label_roi_clear=True,
+                    hand_occluded=False,
+                ),
+                now_monotonic=now,
+            )
+        engine.fsm.process(FSMEvent(kind="start_inspection"), now_monotonic=now)
+        for fid in (3, 4):
+            now += 0.1
+            engine.fsm.process(
+                FSMEvent(
+                    kind="observation",
+                    cycle_id="CYC_DBG",
+                    capture_monotonic_s=now,
+                    frame_id=fid,
+                    label_class="crossed_out",
+                    view_valid=True,
+                    quality_ok=True,
+                    camera_healthy=True,
+                    camera_settings_locked=True,
+                    config_match=True,
+                    tube_present=True,
+                    label_window_present=True,
+                    label_roi_clear=True,
+                    hand_occluded=False,
+                ),
+                now_monotonic=now,
+            )
+        self.assertEqual(engine.fsm.state, FSMState.PASS)
+        engine._state["fsm_state"] = "PASS"
+        engine._state["outcome"] = "PASS"
+
+        # Switching to strict mode MUST reset debug PASS so tube in view cannot carry debug PASS into strict!
+        engine.set_work_mode("strict")
+        self.assertEqual(engine.fsm.state, FSMState.WAIT_PART)
+        self.assertNotEqual(engine.get_state()["outcome"], "PASS")
+        self.assertEqual(engine.get_state()["result_reason"], "STRICT_MODE_REVERIFY_REQUIRED")
+
+        # Switching to strict when an alarm is latched MUST preserve the alarm latch!
+        engine._alarm_latched = True
+        engine._latched_reason = "BARE_HAND_VIOLATION"
+        engine.work_mode = "debug"
+        engine.set_work_mode("strict")
+        self.assertTrue(engine._alarm_latched)
+        self.assertEqual(engine._latched_reason, "BARE_HAND_VIOLATION")
+
+    def test_R2_07_alarm_persistence_receives_stable_triggering_frame_jpeg_across_retries(self) -> None:
+        received: list[tuple[int | None, bytes | None]] = []
+
+        def sink(snap: dict, _prev: str | None, evidence_jpeg: bytes | None = None) -> bool:
+            received.append((snap.get("frame_id"), evidence_jpeg))
+            return len(received) >= 2  # Fail first attempt, succeed on retry
+
+        engine = LiveCameraEngine(config_loader=lambda: {}, on_cycle_update=sink)
+        engine.set_work_mode("strict")
+        frame_alarm = np.full((360, 640, 3), (20, 30, 220), dtype=np.uint8)  # Distinct red alarm frame
+        frame_later = np.full((360, 640, 3), (220, 40, 20), dtype=np.uint8)  # Distinct blue later frame
+
+        engine._track_dynamic_targets = lambda _f, work_mode=None: (  # type: ignore[method-assign]
+            (0.18, 0.44, 0.82, 0.56),
+            (0.42, 0.45, 0.58, 0.55),
+            None,
+            None,
+            (0.42, 0.44, 0.56, 0.58),
+            False,
+            True,
+            True,
+            [],
+        )
+
+        # Frame 1 (red): triggers ALARM; sink fails attempt 1
+        engine._process_frame(frame_alarm, time.monotonic())
+        self.assertEqual(len(received), 1)
+        fid1, jpg1 = received[0]
+        self.assertEqual(fid1, 1)
+        self.assertIsNotNone(jpg1)
+
+        # Frame 2 (blue): live camera HUD now shows blue frame, but retry MUST still pass Frame 1's exact JPEG!
+        engine._process_frame(frame_later, time.monotonic())
+        self.assertEqual(len(received), 2)
+        fid2, jpg2 = received[1]
+        self.assertEqual(fid2, 1)
+        self.assertEqual(jpg2, jpg1)
+        self.assertNotEqual(jpg2, engine.get_hud_jpeg())
+
+    def test_R2_08_mirror_change_invalidates_stale_contact_evidence_while_unchanged_preserves_it(self) -> None:
+        engine = LiveCameraEngine(config_loader=lambda: {})
+        engine.set_work_mode("debug")
+        engine.fsm = InspectionFSM(
+            config=FSMConfig(initial_complete_ms=100, stable_state_ms=100, min_stable_frames=2, hand_leave_stable_ms=0)
+        )
+        frame = _make_yellow_tube_frame(width=640, height=360, with_white_label=True)
+        ctrl = {"contact": False, "cls": "complete"}
+
+        engine._track_dynamic_targets = lambda _f, work_mode=None: (  # type: ignore[method-assign]
+            (0.18, 0.44, 0.82, 0.56),
+            (0.42, 0.45, 0.58, 0.55),
+            (0.44, 0.42, 0.56, 0.58) if ctrl["contact"] else (0.18, 0.42, 0.28, 0.62),
+            (0.72, 0.42, 0.82, 0.62),
+            None,
+            ctrl["contact"],
+            False,
+            True,
+            [],
+        )
+        engine._classify_live_label_roi = lambda *_a, **_kw: (  # type: ignore[method-assign]
+            ctrl["cls"],
+            0.95,
+            "yellow",
+            1.0,
+            HEURISTIC_MODEL_VERSION,
+            HEURISTIC_BACKEND_LABEL,
+        )
+
+        now_val = [2000.0]
+        with mock.patch("igbt_pokayoke.live_camera.time.monotonic", side_effect=lambda: now_val[0]):
+            for _ in range(3):
+                now_val[0] += 0.1
+                engine._process_frame(frame, now_val[0])
+            self.assertEqual(engine.fsm.state, FSMState.INSPECTING)
+
+            # Establish contact evidence
+            ctrl["contact"] = True
+            for _ in range(2):
+                now_val[0] += 0.1
+                engine._process_frame(frame, now_val[0])
+            self.assertTrue(engine.fsm._contact_seen)
+
+            # Without mirror change, contact evidence is preserved
+            ctrl["contact"] = False
+            ctrl["cls"] = "absent"
+            now_val[0] += 0.1
+            engine._process_frame(frame, now_val[0])
+            self.assertTrue(engine.fsm._contact_seen)
+
+            # Toggling mirror invalidates stale geometry-dependent contact evidence on next frame!
+            engine.set_mirror_horizontal(False)
+            now_val[0] += 0.1
+            engine._process_frame(frame, now_val[0])
+            self.assertFalse(engine.fsm._contact_seen)
+            self.assertEqual(engine.fsm.state, FSMState.INSPECTING)
+
+    def test_R2_09_capture_metadata_stays_synchronized_during_simulation_override(self) -> None:
+        engine = LiveCameraEngine(config_loader=lambda: {})
+        frame1 = _make_yellow_tube_frame(width=640, height=360, with_white_label=True)
+        frame2 = _make_yellow_tube_frame(width=640, height=360, with_white_label=False)
+
+        engine._process_frame(frame1, time.monotonic())
+        self.assertEqual(engine.get_state()["frame_id"], 1)
+
+        # Activate simulation override, then process frame 2
+        engine.pause_for_simulation(30.0)
+        engine._process_frame(frame2, time.monotonic())
+
+        # Displayed state stays frozen at frame 1, while atomic capture snapshot reflects frame 2!
+        self.assertEqual(engine.get_state()["frame_id"], 1)
+        cap_frame, _cap_crop, cap_state = engine.get_atomic_capture_snapshot(encode_jpeg=False)
+        self.assertIsNotNone(cap_frame)
+        self.assertEqual(cap_state["frame_id"], 2)
+
+    def test_R2_10_failed_read_invalidates_online_live_pass(self) -> None:
+        read_calls = {"n": 0}
+        failed_read_seen = threading.Event()
+        frame = _make_yellow_tube_frame(width=640, height=360, with_white_label=True)
+
+        class DropFeedCapture:
+            def __init__(self, *_a, **_kw) -> None:
+                pass
+
+            def isOpened(self) -> bool:
+                return True  # Reopen keeps succeeding even though read() fails!
+
+            def set(self, *_a, **_kw) -> bool:
+                return True
+
+            def read(self):
+                read_calls["n"] += 1
+                if read_calls["n"] == 1:
+                    return True, frame.copy()
+                failed_read_seen.set()
+                return False, None
+
+            def release(self) -> None:
+                return None
+
+        engine = LiveCameraEngine(config_loader=lambda: {})
+        orig_proc = engine._process_frame
+
+        def proc_and_mark_pass(f, ts, stop_event=None):
+            res = orig_proc(f, ts, stop_event=stop_event)
+            with engine._lock:
+                engine._state["fsm_state"] = "PASS"
+                engine._state["outcome"] = "PASS"
+                engine._state["view_valid"] = True
+            return res
+
+        engine._process_frame = proc_and_mark_pass  # type: ignore[method-assign]
+        with mock.patch("igbt_pokayoke.live_camera.cv2.VideoCapture", DropFeedCapture):
+            self.assertTrue(engine.start())
+            self.assertTrue(failed_read_seen.wait(timeout=2.0))
+            # Give loop a brief moment to execute _mark_camera_unavailable before stopping
+            deadline = time.monotonic() + 1.0
+            while engine.camera_online and time.monotonic() < deadline:
+                time.sleep(0.01)
+            st = engine.get_state()
+            self.assertFalse(engine.camera_online)
+            self.assertFalse(st["view_valid"])
+            self.assertNotEqual(st["outcome"], "PASS")
+            self.assertTrue(engine.stop(timeout=2.0))
+
+    def test_R2_24_prepare_and_commit_onnx_model_is_two_phase(self) -> None:
+        engine = LiveCameraEngine(config_loader=lambda: {})
+        sentinel = object()
+        engine._ort_session = sentinel
+        engine._onnx_model_version = "prev-v1"
+
+        fake_session = mock.MagicMock()
+        fake_input = mock.MagicMock()
+        fake_input.shape = [1, 3, 96, 96]
+        fake_session.get_inputs.return_value = [fake_input]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            onnx_file = Path(tmp) / "label_classifier.onnx"
+            payload = b"dummy-onnx-bytes"
+            onnx_file.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+
+            with mock.patch("onnxruntime.InferenceSession", return_value=fake_session):
+                prepared = engine.prepare_onnx_model(onnx_file, model_version="next-v2", expected_sha256=digest)
+                # Active session MUST remain untouched before commit!
+                self.assertIs(engine._ort_session, sentinel)
+                self.assertEqual(engine._onnx_model_version, "prev-v1")
+
+                info = engine.commit_prepared_onnx_model(prepared)
+                self.assertIs(engine._ort_session, fake_session)
+                self.assertEqual(engine._onnx_model_version, "next-v2")
+                self.assertEqual(info["sha256"], digest)
+
+    def test_R2_31_hud_failure_does_not_advance_crop_seq_or_serve_old_crop(self) -> None:
+        engine = LiveCameraEngine(config_loader=lambda: {})
+        frame = _make_yellow_tube_frame(width=640, height=360, with_white_label=True)
+
+        # Frame 1 succeeds -> both HUD and crop publish seq 1
+        engine._process_frame(frame, time.monotonic())
+        hud1, hseq1 = engine.get_hud_jpeg_with_seq()
+        crop1, cseq1 = engine.get_crop_jpeg_with_seq()
+        self.assertIsNotNone(hud1)
+        self.assertIsNotNone(crop1)
+        self.assertEqual(hseq1, 1)
+        self.assertEqual(cseq1, 1)
+
+        # Frame 2 HUD fails -> HUD seq advances with raw fallback, crop seq MUST NOT advance and stale crop cleared!
+        engine._draw_hud = mock.Mock(side_effect=RuntimeError("hud crash"))  # type: ignore[method-assign]
+        engine._process_frame(frame, time.monotonic())
+        hud2, hseq2 = engine.get_hud_jpeg_with_seq()
+        crop2, cseq2 = engine.get_crop_jpeg_with_seq()
+        self.assertIsNotNone(hud2)
+        self.assertEqual(hseq2, 2)
+        self.assertEqual(cseq2, 1)
+        self.assertIsNone(crop2)
 
 
 if __name__ == "__main__":

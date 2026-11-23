@@ -1,11 +1,14 @@
 """Fail-safe A/B/C observation FSM. No camera, model, or production I/O dependency."""
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 
 class FSMState(str, Enum):
@@ -100,6 +103,7 @@ class InspectionFSM:
         self.cycle_id: str | None = None
         self.initial_complete_confirmed = False
         self.transition_records: deque[dict] = deque(maxlen=self.config.max_log_records)
+        self._pending_audit_records: deque[dict] = deque()
         self._log_sequence = 0
         self._cycle_started: float | None = None
         self._inspection_started: float | None = None
@@ -132,7 +136,50 @@ class InspectionFSM:
         elapsed = self._c_absent_elapsed_ms()
         if elapsed <= 0.0:
             return 0
-        return max(0, min(self.config.c_absent_duration_ms, int(round(elapsed))))
+        limit = self.config.c_absent_duration_ms
+        if self.state == FSMState.PASS and self.result_reason == "C_REMOVED":
+            return limit
+        if elapsed + 1e-6 >= limit:
+            return limit
+        return max(0, min(limit - 1, int(round(elapsed))))
+
+    @property
+    def pending_audit_count(self) -> int:
+        return len(self._pending_audit_records)
+
+    def flush_audit_sink(self) -> int:
+        """Deliver queued audit records in FIFO order, retaining failed records for retry (R2-12)."""
+        if self._audit_sink is None:
+            self._pending_audit_records.clear()
+            return 0
+        delivered = 0
+        while self._pending_audit_records:
+            record = self._pending_audit_records[0]
+            try:
+                self._audit_sink(dict(record))
+            except Exception as exc:
+                logger.warning("FSM audit sink delivery failed (will retry seq %s): %s", record.get("sequence"), exc)
+                break
+            self._pending_audit_records.popleft()
+            delivered += 1
+        return delivered
+
+    def invalidate_geometry_evidence(
+        self,
+        reason: str = "CAMERA_GEOMETRY_CHANGED",
+        now_monotonic: float | None = None,
+    ) -> None:
+        """Invalidate geometry-dependent contact/stability/C evidence on active cycles (R2-08)."""
+        if self.state in self.TERMINAL or self.state == FSMState.WAIT_PART:
+            return
+        now = self._clock() if now_monotonic is None else float(now_monotonic)
+        self._clear_stability()
+        self._clear_c_timer()
+        self._contact_seen = False
+        self._hand_left_start = None
+        self._hand_left_confirmed = False
+        self._resume_state = self._phase_for_resume()
+        self._transition(FSMState.VIEW_INVALID, reason, "geometry_reset", now, None, None)
 
     def transition_log(self) -> list[dict]:
         return [dict(row) for row in self.transition_records]
@@ -146,7 +193,7 @@ class InspectionFSM:
         if event.kind == "new_cycle":
             reason = self._new_cycle(event, now)
         elif event.kind == "start_inspection":
-            reason = self._start_inspection(now)
+            reason = self._start_inspection(event, now)
         elif event.kind == "observation":
             reason = self._observation(event, now)
         elif event.kind == "fault":
@@ -180,11 +227,18 @@ class InspectionFSM:
         self._transition(FSMState.VERIFY_INITIAL, "NEW_CYCLE", event.kind, now, event.capture_monotonic_s, event.frame_id)
         return "NEW_CYCLE"
 
-    def _start_inspection(self, now: float) -> str:
+    def _start_inspection(self, event: FSMEvent, now: float) -> str:
         if self.state != FSMState.READY or not self.initial_complete_confirmed:
             return "INITIAL_COMPLETE_NOT_CONFIRMED"
         self._inspection_started = now
-        self._transition(FSMState.INSPECTING, "INSPECTION_STARTED", "start_inspection", now, None, None)
+        self._transition(
+            FSMState.INSPECTING,
+            "INSPECTION_STARTED",
+            event.kind,
+            now,
+            event.capture_monotonic_s,
+            event.frame_id,
+        )
         return "INSPECTION_STARTED"
 
     def _reset(self, event: FSMEvent, now: float) -> str:
@@ -443,6 +497,7 @@ class InspectionFSM:
                 return "FRAME_ID_NOT_MONOTONIC"
             if delta_ms > self.config.max_frame_gap_ms:
                 self._last_capture = capture
+                self._last_frame_id = event.frame_id
                 return "FRAME_GAP_EXCEEDED"
         self._last_capture = capture
         self._last_frame_id = event.frame_id
@@ -534,4 +589,5 @@ class InspectionFSM:
         }
         self.transition_records.append(record)
         if self._audit_sink is not None:
-            self._audit_sink(dict(record))
+            self._pending_audit_records.append(dict(record))
+            self.flush_audit_sink()

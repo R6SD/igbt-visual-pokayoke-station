@@ -17,7 +17,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -66,6 +66,101 @@ FSM_STATES = {"BOOT", "WAIT_PART", "VERIFY_INITIAL", "READY", "INSPECTING", "PRO
               "VERIFY_C_ABSENT", "VIEW_INVALID", "PASS", "ALARM", "FAULT", "REVIEW_REQUIRED"}
 
 _EVIDENCE_IO_LOCK = threading.RLock()
+_PURGE_CUTOFF_MONOTONIC_BY_DB: dict[Path, float] = {}
+_DELETED_CYCLES_BY_DB: dict[Path, set[str]] = {}
+_MAX_TRACKED_DELETED_CYCLES = 2048
+_LEGACY_SIM_OPERATION_EVENTS = {
+    "SCENARIO_A_PASS",
+    "SCENARIO_B_PASS",
+    "SCENARIO_C_PASS",
+    "SCENARIO_ALARM",
+    "SCENARIO_GLARE_INVALID",
+    "SCENARIO_RESET",
+}
+
+
+@contextmanager
+def _exclusive_evidence_file(path: Path, data: bytes):
+    """Create a new evidence file via 'xb'; remove it on write, close, or DB failure.
+
+    Pre-existing files are left untouched if exclusive open raises FileExistsError.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stream = path.open("xb")
+    try:
+        try:
+            stream.write(data)
+            stream.flush()
+        finally:
+            stream.close()
+        yield path
+    except Exception:
+        with suppress(OSError):
+            path.unlink(missing_ok=True)
+        raise
+
+
+def _parse_optional_input_size(raw: Any, default: int = 96) -> int:
+    if raw is None or isinstance(raw, bool):
+        return default
+    if isinstance(raw, int):
+        return raw if 32 <= raw <= 1024 else default
+    if isinstance(raw, str):
+        try:
+            parsed = int(raw.strip())
+        except ValueError:
+            return default
+        return parsed if 32 <= parsed <= 1024 else default
+    return default
+
+
+def _is_stale_live_transition(
+    db: sqlite3.Connection,
+    db_path: Path,
+    state_data: dict[str, Any],
+) -> bool:
+    """Return True if a queued live transition predates an all-scope purge or deleted cycle."""
+    cycle_id = state_data.get("cycle_id")
+    resolved_db = db_path.resolve()
+    if cycle_id and cycle_id in _DELETED_CYCLES_BY_DB.get(resolved_db, ()):
+        return True
+
+    row = db.execute(
+        "SELECT purge_generation, purged_at_utc FROM station_purge_state WHERE singleton_id=1"
+    ).fetchone()
+    if not row or not row["purged_at_utc"]:
+        return False
+
+    purged_gen = int(row["purge_generation"] or 0)
+    state_gen = state_data.get("purge_generation")
+    if isinstance(state_gen, int) and not isinstance(state_gen, bool) and state_gen < purged_gen:
+        return True
+
+    cutoff_mono = _PURGE_CUTOFF_MONOTONIC_BY_DB.get(resolved_db)
+    cap_mono = state_data.get("capture_monotonic_s")
+    has_mono = isinstance(cap_mono, (int, float)) and not isinstance(cap_mono, bool)
+
+    state_dt: datetime | None = None
+    purged_dt: datetime | None = None
+    raw_state_utc = state_data.get("updated_at_utc")
+    if isinstance(raw_state_utc, str) and raw_state_utc:
+        with suppress(ValueError):
+            state_dt = datetime.fromisoformat(raw_state_utc.replace("Z", "+00:00"))
+    with suppress(ValueError):
+        purged_dt = datetime.fromisoformat(str(row["purged_at_utc"]).replace("Z", "+00:00"))
+
+    if has_mono and cutoff_mono is not None:
+        if float(cap_mono) < cutoff_mono - 0.001:
+            return True
+        if float(cap_mono) <= cutoff_mono and (state_dt is None or purged_dt is None or state_dt <= purged_dt):
+            return True
+        if state_dt is not None and purged_dt is not None and state_dt < purged_dt:
+            return True
+        return False
+
+    if state_dt is not None and purged_dt is not None:
+        return state_dt <= purged_dt
+    return False
 
 
 def utc_now() -> str:
@@ -120,7 +215,11 @@ def _generate_live_cycle_id() -> str:
     return f"LIVE_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6].upper()}"
 
 
-def _on_live_cycle_update(state_data: dict, state_before: str | None) -> bool:
+def _on_live_cycle_update(
+    state_data: dict,
+    state_before: str | None,
+    evidence_jpeg: bytes | None = None,
+) -> bool:
     try:
         initialize_database()
         cycle_id = state_data.get("cycle_id")
@@ -129,110 +228,108 @@ def _on_live_cycle_update(state_data: dict, state_before: str | None) -> bool:
         transition_event_id = state_data.get("transition_event_id")
         if not isinstance(transition_event_id, str) or not transition_event_id.strip():
             transition_event_id = None
+        data_root, db_path, _ = get_data_paths()
 
         with _EVIDENCE_IO_LOCK:
-            created_evidence_file: Path | None = None
-            try:
-                with connect_db() as db:
-                    db.execute(
-                        "UPDATE station_state SET updated_at_utc=?, state_json=? WHERE singleton_id=1",
-                        (now, json.dumps(persisted_state, ensure_ascii=False)),
+            with connect_db() as db:
+                if _is_stale_live_transition(db, db_path, state_data):
+                    logger.info(
+                        "Dropping stale live transition for cycle %s queued before purge/deletion",
+                        cycle_id,
                     )
-                    if cycle_id:
-                        exists = db.execute("SELECT 1 FROM cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
-                        if not exists:
-                            db.execute(
-                                "INSERT INTO cycles(cycle_id,created_at_utc,updated_at_utc,initial_label,final_outcome,result_reason,pipe_color,operator_anon_id,model_version,config_version,fsm_state,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                                (
-                                    cycle_id,
-                                    now,
-                                    now,
-                                    state_data.get("label_status"),
-                                    state_data.get("outcome", "WAITING"),
-                                    state_data.get("result_reason"),
-                                    state_data.get("pipe_color"),
-                                    state_data.get("operator_anon_id"),
-                                    state_data.get("model_version"),
-                                    state_data.get("config_version"),
-                                    state_data.get("fsm_state", "WAIT_PART"),
-                                    "live",
-                                ),
-                            )
-                        else:
-                            db.execute(
-                                "UPDATE cycles SET updated_at_utc=?,final_outcome=?,result_reason=?,pipe_color=?,operator_anon_id=?,model_version=?,config_version=?,fsm_state=? WHERE cycle_id=?",
-                                (
-                                    now,
-                                    state_data.get("outcome", "WAITING"),
-                                    state_data.get("result_reason"),
-                                    state_data.get("pipe_color"),
-                                    state_data.get("operator_anon_id"),
-                                    state_data.get("model_version"),
-                                    state_data.get("config_version"),
-                                    state_data.get("fsm_state", "WAIT_PART"),
-                                    cycle_id,
-                                ),
-                            )
-                        ev_id = _event(
-                            db,
-                            cycle_id,
-                            state_data.get("result_reason") or "STATE_CHANGE",
-                            persisted_state,
-                            state_before,
-                            state_data.get("fsm_state"),
-                            state_data.get("outcome"),
-                            state_data.get("result_reason"),
-                            state_data.get("capture_monotonic_s"),
-                            state_data.get("frame_id"),
-                            event_id=transition_event_id,
+                    return True
+
+                db.execute(
+                    "UPDATE station_state SET updated_at_utc=?, state_json=? WHERE singleton_id=1",
+                    (now, json.dumps(persisted_state, ensure_ascii=False)),
+                )
+                if cycle_id:
+                    exists = db.execute("SELECT 1 FROM cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
+                    if not exists:
+                        db.execute(
+                            "INSERT INTO cycles(cycle_id,created_at_utc,updated_at_utc,initial_label,final_outcome,result_reason,pipe_color,operator_anon_id,model_version,config_version,fsm_state,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                cycle_id,
+                                now,
+                                now,
+                                state_data.get("label_status"),
+                                state_data.get("outcome", "WAITING"),
+                                state_data.get("result_reason"),
+                                state_data.get("pipe_color"),
+                                state_data.get("operator_anon_id"),
+                                state_data.get("model_version"),
+                                state_data.get("config_version"),
+                                state_data.get("fsm_state", "WAIT_PART"),
+                                "live",
+                            ),
                         )
-                        if state_data.get("outcome") == "ALARM":
-                            jpg = LIVE_CAMERA.get_hud_jpeg() or LIVE_CAMERA.get_raw_frame_jpeg()
-                            if jpg:
-                                sha = hashlib.sha256(jpg).hexdigest()
-                                dup_ev = db.execute(
-                                    "SELECT 1 FROM evidence WHERE cycle_id=? AND event_id=? LIMIT 1",
-                                    (cycle_id, ev_id),
-                                ).fetchone()
-                                if not dup_ev:
-                                    evidence_id = uuid.uuid4().hex
-                                    data_root, _, _ = get_data_paths()
-                                    relpath = Path("evidence") / cycle_id / f"{evidence_id}.jpg"
-                                    absolute = data_root / relpath
-                                    absolute.parent.mkdir(parents=True, exist_ok=True)
-                                    if not absolute.exists():
-                                        with absolute.open("xb") as stream:
-                                            stream.write(jpg)
-                                        created_evidence_file = absolute
-                                        db.execute(
-                                            "INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                                            (
-                                                evidence_id,
-                                                cycle_id,
-                                                ev_id,
-                                                now,
-                                                "anomaly",
-                                                relpath.as_posix(),
-                                                "image/jpeg",
-                                                sha,
-                                                state_data.get("frame_id") or 1,
-                                                state_data.get("capture_monotonic_s"),
-                                                json.dumps(
-                                                    {
-                                                        "pipe_color": state_data.get("pipe_color") or "unknown",
-                                                        "operation_event": state_data.get("result_reason") or "ALARM_AUTO_CAPTURE",
-                                                        "operator_anon_id": state_data.get("operator_anon_id") or "OP_STATION_01",
-                                                        "label_status": state_data.get("label_status"),
-                                                        "captured_at_utc": now,
-                                                    },
-                                                    ensure_ascii=False,
-                                                ),
+                    else:
+                        db.execute(
+                            "UPDATE cycles SET updated_at_utc=?,final_outcome=?,result_reason=?,pipe_color=?,operator_anon_id=?,model_version=?,config_version=?,fsm_state=? WHERE cycle_id=?",
+                            (
+                                now,
+                                state_data.get("outcome", "WAITING"),
+                                state_data.get("result_reason"),
+                                state_data.get("pipe_color"),
+                                state_data.get("operator_anon_id"),
+                                state_data.get("model_version"),
+                                state_data.get("config_version"),
+                                state_data.get("fsm_state", "WAIT_PART"),
+                                cycle_id,
+                            ),
+                        )
+                    ev_id = _event(
+                        db,
+                        cycle_id,
+                        state_data.get("result_reason") or "STATE_CHANGE",
+                        persisted_state,
+                        state_before,
+                        state_data.get("fsm_state"),
+                        state_data.get("outcome"),
+                        state_data.get("result_reason"),
+                        state_data.get("capture_monotonic_s"),
+                        state_data.get("frame_id"),
+                        event_id=transition_event_id,
+                    )
+                    if state_data.get("outcome") == "ALARM":
+                        jpg = evidence_jpeg if evidence_jpeg else (LIVE_CAMERA.get_hud_jpeg() or LIVE_CAMERA.get_raw_frame_jpeg())
+                        if jpg:
+                            sha = hashlib.sha256(jpg).hexdigest()
+                            dup_ev = db.execute(
+                                "SELECT 1 FROM evidence WHERE cycle_id=? AND event_id=? LIMIT 1",
+                                (cycle_id, ev_id),
+                            ).fetchone()
+                            if not dup_ev:
+                                evidence_id = uuid.uuid4().hex
+                                relpath = Path("evidence") / cycle_id / f"{evidence_id}.jpg"
+                                absolute = data_root / relpath
+                                with _exclusive_evidence_file(absolute, jpg):
+                                    db.execute(
+                                        "INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                        (
+                                            evidence_id,
+                                            cycle_id,
+                                            ev_id,
+                                            now,
+                                            "anomaly",
+                                            relpath.as_posix(),
+                                            "image/jpeg",
+                                            sha,
+                                            state_data.get("frame_id") or 1,
+                                            state_data.get("capture_monotonic_s"),
+                                            json.dumps(
+                                                {
+                                                    "pipe_color": state_data.get("pipe_color") or "unknown",
+                                                    "operation_event": state_data.get("result_reason") or "ALARM_AUTO_CAPTURE",
+                                                    "operator_anon_id": state_data.get("operator_anon_id") or "OP_STATION_01",
+                                                    "label_status": state_data.get("label_status"),
+                                                    "captured_at_utc": now,
+                                                },
+                                                ensure_ascii=False,
                                             ),
-                                        )
-            except Exception:
-                if created_evidence_file is not None:
-                    created_evidence_file.unlink(missing_ok=True)
-                raise
+                                        ),
+                                    )
+                                    db.commit()
         return True
     except Exception:
         logger.warning("Failed to persist live camera cycle update", exc_info=True)
@@ -288,48 +385,49 @@ def _autoload_latest_onnx_model() -> None:
         for _, onnx_path in candidates_with_mtime:
             version = onnx_path.parent.name
             metrics_file = onnx_path.parent / "metrics.json"
-            input_size = 96
-            expected_sha: str | None = None
+            if not metrics_file.is_file():
+                logger.warning("Skipping ONNX run %s: missing verification metrics.json", version)
+                continue
 
-            if metrics_file.is_file():
-                try:
-                    meta = json.loads(metrics_file.read_text(encoding="utf-8"))
-                    if not isinstance(meta, dict):
-                        logger.warning("Skipping ONNX run %s: metrics.json is not a JSON object", version)
-                        continue
-                    for parity_key in ("onnx_parity_ok", "onnx_parity_passed", "artifact_verified"):
-                        if parity_key in meta and meta[parity_key] is not True:
-                            logger.warning(
-                                "Skipping unverified ONNX run %s: %s=%r",
-                                version,
-                                parity_key,
-                                meta[parity_key],
-                            )
-                            raise ValueError("ONNX_PARITY_NOT_VERIFIED")
-                    raw_size = meta.get("input_size")
-                    if raw_size is not None:
-                        input_size = int(raw_size)
-                        if not 32 <= input_size <= 1024:
-                            raise ValueError(f"Invalid input_size: {input_size}")
-                    raw_sha = meta.get("onnx_sha256")
-                    if raw_sha is not None:
-                        if not isinstance(raw_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", raw_sha):
-                            raise ValueError("Invalid onnx_sha256 in metrics.json")
-                        expected_sha = raw_sha.lower()
-                except Exception as exc:
-                    logger.warning("Skipping ONNX run %s due to invalid/unverified metrics: %s", version, exc)
-                    continue
+            try:
+                meta = json.loads(metrics_file.read_text(encoding="utf-8"))
+                if not isinstance(meta, dict):
+                    raise ValueError("metrics.json is not a JSON object")
+                parity_values = [
+                    meta[key]
+                    for key in ("onnx_parity_ok", "onnx_parity_passed", "artifact_verified")
+                    if key in meta
+                ]
+                if not parity_values or not all(v is True for v in parity_values):
+                    raise ValueError("ONNX_PARITY_NOT_AFFIRMATIVELY_VERIFIED")
+                raw_sha = meta.get("onnx_sha256")
+                if not isinstance(raw_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", raw_sha):
+                    raise ValueError("MISSING_OR_INVALID_ONNX_SHA256")
+                expected_sha = raw_sha.lower()
+
+                raw_size = meta.get("input_size")
+                if raw_size is None:
+                    input_size = 96
+                elif isinstance(raw_size, bool) or not isinstance(raw_size, (int, str)):
+                    raise ValueError(f"Invalid input_size type: {type(raw_size).__name__}")
+                else:
+                    input_size = int(raw_size)
+                    if not 32 <= input_size <= 1024:
+                        raise ValueError(f"Invalid input_size: {input_size}")
+            except Exception as exc:
+                logger.warning("Skipping ONNX run %s due to invalid/unverified metrics: %s", version, exc)
+                continue
 
             try:
                 onnx_bytes = onnx_path.read_bytes()
                 actual_sha = hashlib.sha256(onnx_bytes).hexdigest().lower()
-                if expected_sha is not None and not hmac.compare_digest(actual_sha, expected_sha):
+                if not hmac.compare_digest(actual_sha, expected_sha):
                     logger.warning("Skipping ONNX run %s: SHA-256 mismatch against metrics.json", version)
                     continue
                 _load_onnx_into_camera(
                     onnx_path=onnx_path,
                     model_version=version,
-                    expected_sha256=expected_sha or actual_sha,
+                    expected_sha256=expected_sha,
                     input_size=input_size,
                     onnx_bytes=onnx_bytes,
                 )
@@ -448,10 +546,17 @@ def initialize_database() -> None:
             updated_at_utc TEXT NOT NULL,
             state_json TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS station_purge_state (
+            singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+            purge_generation INTEGER NOT NULL DEFAULT 0,
+            purged_at_utc TEXT,
+            purged_monotonic_s REAL
+        );
         """)
         cycle_cols = {row[1] for row in db.execute("PRAGMA table_info(cycles)").fetchall()}
         if "source" not in cycle_cols:
             db.execute("ALTER TABLE cycles ADD COLUMN source TEXT NOT NULL DEFAULT 'station'")
+            _backfill_legacy_cycle_sources(db)
         if not db.execute("SELECT 1 FROM configuration_history LIMIT 1").fetchone():
             config = default_config()
             db.execute("INSERT INTO configuration_history VALUES(?,?,?,?,?)",
@@ -459,6 +564,86 @@ def initialize_database() -> None:
         if not db.execute("SELECT 1 FROM station_state WHERE singleton_id=1").fetchone():
             initial = default_station_state()
             db.execute("INSERT INTO station_state VALUES(1,?,?)", (utc_now(), json.dumps(initial)))
+        if not db.execute("SELECT 1 FROM station_purge_state WHERE singleton_id=1").fetchone():
+            db.execute("INSERT INTO station_purge_state(singleton_id,purge_generation,purged_at_utc,purged_monotonic_s) VALUES(1,0,NULL,NULL)")
+
+
+def _backfill_legacy_cycle_sources(db: sqlite3.Connection) -> None:
+    """Classify pre-migration cycles using reliable simulation/live evidence; keep ambiguous rows as 'station'."""
+    cycle_rows = db.execute("SELECT cycle_id FROM cycles").fetchall()
+    for row in cycle_rows:
+        cycle_id = row["cycle_id"]
+        ev_rows = db.execute(
+            "SELECT event_type, payload_json FROM events WHERE cycle_id=?",
+            (cycle_id,),
+        ).fetchall()
+        evidence_rows = db.execute(
+            "SELECT metadata_json FROM evidence WHERE cycle_id=?",
+            (cycle_id,),
+        ).fetchall()
+
+        has_sim_evidence = False
+        has_live_marker = False
+        has_station_marker = False
+        all_events_are_sim_transitions = len(ev_rows) > 0
+
+        for ev_row in evidence_rows:
+            try:
+                meta = json.loads(ev_row["metadata_json"])
+            except (TypeError, json.JSONDecodeError):
+                has_station_marker = True
+                continue
+            if not isinstance(meta, dict):
+                has_station_marker = True
+                continue
+            op_event = meta.get("operation_event")
+            if isinstance(op_event, str) and op_event in _LEGACY_SIM_OPERATION_EVENTS:
+                has_sim_evidence = True
+            elif isinstance(op_event, str) and (
+                op_event in {"LIVE_CAMERA_MANUAL_CAPTURE", "ALARM_AUTO_CAPTURE"}
+                or op_event.startswith("DATASET_SAMPLE_")
+            ):
+                has_live_marker = True
+            else:
+                has_station_marker = True
+
+        for ev in ev_rows:
+            ev_type = str(ev["event_type"] or "")
+            try:
+                payload = json.loads(ev["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                all_events_are_sim_transitions = False
+                has_station_marker = True
+                continue
+            if not isinstance(payload, dict):
+                all_events_are_sim_transitions = False
+                has_station_marker = True
+                continue
+
+            if payload.get("record_type") == "STATE_TRANSITION":
+                continue
+
+            all_events_are_sim_transitions = False
+            if (
+                ev_type == "LIVE_CAPTURE"
+                or ev_type.startswith("SAMPLE_")
+                or payload.get("live_stream_url") == "/api/camera/stream"
+                or payload.get("state_source") == "live"
+            ):
+                has_live_marker = True
+            elif (
+                ev_type.startswith("EVIDENCE_")
+                and isinstance(payload.get("operation_event"), str)
+                and payload.get("operation_event") in _LEGACY_SIM_OPERATION_EVENTS
+            ):
+                has_sim_evidence = True
+            else:
+                has_station_marker = True
+
+        if (has_sim_evidence or all_events_are_sim_transitions) and not has_station_marker and not has_live_marker:
+            db.execute("UPDATE cycles SET source='simulated' WHERE cycle_id=?", (cycle_id,))
+        elif has_live_marker and not has_station_marker and not has_sim_evidence:
+            db.execute("UPDATE cycles SET source='live' WHERE cycle_id=?", (cycle_id,))
 
 
 def default_station_state() -> dict:
@@ -1064,61 +1249,53 @@ def capture_live_camera_frame():
         "label_status": live_state.get("label_status"),
         "captured_at_utc": now,
     }
-    with _EVIDENCE_IO_LOCK:
-        absolute.parent.mkdir(parents=True, exist_ok=True)
-        with absolute.open("xb") as stream:
-            stream.write(jpg)
-        try:
-            with connect_db() as db:
-                if not db.execute("SELECT 1 FROM cycles WHERE cycle_id=?", (cycle_id,)).fetchone():
-                    db.execute(
-                        "INSERT INTO cycles(cycle_id,created_at_utc,updated_at_utc,initial_label,final_outcome,result_reason,pipe_color,operator_anon_id,model_version,config_version,fsm_state,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            cycle_id,
-                            now,
-                            now,
-                            live_state.get("label_status"),
-                            live_state.get("outcome") or "WAITING",
-                            live_state.get("result_reason"),
-                            live_state.get("pipe_color"),
-                            live_state.get("operator_anon_id"),
-                            live_state.get("model_version"),
-                            live_state.get("config_version"),
-                            live_state.get("fsm_state") or "INSPECTING",
-                            "live",
-                        ),
-                    )
-                ev_id = _event(
-                    db,
+    with _EVIDENCE_IO_LOCK, _exclusive_evidence_file(absolute, jpg), connect_db() as db:
+        if not db.execute("SELECT 1 FROM cycles WHERE cycle_id=?", (cycle_id,)).fetchone():
+            db.execute(
+                "INSERT INTO cycles(cycle_id,created_at_utc,updated_at_utc,initial_label,final_outcome,result_reason,pipe_color,operator_anon_id,model_version,config_version,fsm_state,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
                     cycle_id,
-                    "LIVE_CAPTURE",
-                    metadata,
-                    state_before=live_state.get("fsm_state"),
-                    state_after=live_state.get("fsm_state"),
-                    outcome=live_state.get("outcome"),
-                    reason="手动抓拍实时相机画面",
-                    capture_monotonic_s=live_state.get("capture_monotonic_s"),
-                    frame_id=live_state.get("frame_id"),
-                )
-                db.execute(
-                    "INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        evidence_id,
-                        cycle_id,
-                        ev_id,
-                        now,
-                        "initial_label",
-                        relpath.as_posix(),
-                        "image/jpeg",
-                        sha,
-                        live_state.get("frame_id") or 1,
-                        live_state.get("capture_monotonic_s"),
-                        json.dumps(metadata, ensure_ascii=False),
-                    ),
-                )
-        except Exception:
-            absolute.unlink(missing_ok=True)
-            raise
+                    now,
+                    now,
+                    live_state.get("label_status"),
+                    live_state.get("outcome") or "WAITING",
+                    live_state.get("result_reason"),
+                    live_state.get("pipe_color"),
+                    live_state.get("operator_anon_id"),
+                    live_state.get("model_version"),
+                    live_state.get("config_version"),
+                    live_state.get("fsm_state") or "INSPECTING",
+                    "live",
+                ),
+            )
+        ev_id = _event(
+            db,
+            cycle_id,
+            "LIVE_CAPTURE",
+            metadata,
+            state_before=live_state.get("fsm_state"),
+            state_after=live_state.get("fsm_state"),
+            outcome=live_state.get("outcome"),
+            reason="手动抓拍实时相机画面",
+            capture_monotonic_s=live_state.get("capture_monotonic_s"),
+            frame_id=live_state.get("frame_id"),
+        )
+        db.execute(
+            "INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                evidence_id,
+                cycle_id,
+                ev_id,
+                now,
+                "initial_label",
+                relpath.as_posix(),
+                "image/jpeg",
+                sha,
+                live_state.get("frame_id") or 1,
+                live_state.get("capture_monotonic_s"),
+                json.dumps(metadata, ensure_ascii=False),
+            ),
+        )
     return {
         "evidence_id": evidence_id,
         "cycle_id": cycle_id,
@@ -1234,137 +1411,132 @@ def simulate_runtime_scenario(
     pipe_color = run["pipe_color"]
     data_root, _, _ = get_data_paths()
 
-    with _EVIDENCE_IO_LOCK:
-        created_file: Path | None = None
-        try:
-            with connect_db() as db:
-                initial_label = "absent" if scenario == "alarm" else "complete"
-                exists = db.execute("SELECT 1 FROM cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
-                if not exists:
-                    db.execute(
-                        "INSERT INTO cycles(cycle_id,created_at_utc,updated_at_utc,initial_label,final_outcome,result_reason,pipe_color,operator_anon_id,model_version,config_version,fsm_state,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            cycle_id,
-                            created_utc,
-                            updated_utc,
-                            initial_label,
-                            data["outcome"],
-                            data.get("result_reason"),
-                            pipe_color,
-                            data.get("operator_anon_id"),
-                            data.get("model_version"),
-                            data.get("config_version"),
-                            data.get("fsm_state", "WAIT_PART"),
-                            "simulated",
-                        ),
-                    )
-                else:
-                    db.execute(
-                        "UPDATE cycles SET updated_at_utc=?,final_outcome=?,result_reason=?,pipe_color=?,operator_anon_id=?,model_version=?,config_version=?,fsm_state=? WHERE cycle_id=?",
-                        (
-                            updated_utc,
-                            data["outcome"],
-                            data.get("result_reason"),
-                            pipe_color,
-                            data.get("operator_anon_id"),
-                            data.get("model_version"),
-                            data.get("config_version"),
-                            data.get("fsm_state", "WAIT_PART"),
-                            cycle_id,
-                        ),
-                    )
+    with _EVIDENCE_IO_LOCK, connect_db() as db:
+        initial_label = "absent" if scenario == "alarm" else "complete"
+        exists = db.execute("SELECT 1 FROM cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
+        if not exists:
+            db.execute(
+                "INSERT INTO cycles(cycle_id,created_at_utc,updated_at_utc,initial_label,final_outcome,result_reason,pipe_color,operator_anon_id,model_version,config_version,fsm_state,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    cycle_id,
+                    created_utc,
+                    updated_utc,
+                    initial_label,
+                    data["outcome"],
+                    data.get("result_reason"),
+                    pipe_color,
+                    data.get("operator_anon_id"),
+                    data.get("model_version"),
+                    data.get("config_version"),
+                    data.get("fsm_state", "WAIT_PART"),
+                    "simulated",
+                ),
+            )
+        else:
+            db.execute(
+                "UPDATE cycles SET updated_at_utc=?,final_outcome=?,result_reason=?,pipe_color=?,operator_anon_id=?,model_version=?,config_version=?,fsm_state=? WHERE cycle_id=?",
+                (
+                    updated_utc,
+                    data["outcome"],
+                    data.get("result_reason"),
+                    pipe_color,
+                    data.get("operator_anon_id"),
+                    data.get("model_version"),
+                    data.get("config_version"),
+                    data.get("fsm_state", "WAIT_PART"),
+                    cycle_id,
+                ),
+            )
 
-                state_transitions = _resolve_transition_frame_ids(transitions)
-                last_event_id: str | None = None
-                for idx, (tr, tr_frame_id) in enumerate(state_transitions):
-                    ev_time = (
-                        now_dt
-                        - timedelta(seconds=max(0.01, elapsed_s * (1.0 - (idx + 1) / max(1, len(state_transitions)))))
-                    ).isoformat(timespec="milliseconds")
-                    ev_id = uuid.uuid4().hex
-                    ev_type = str(tr.get("reason") or tr.get("event", {}).get("kind", "STATE_TRANSITION"))
-                    tr_payload = {**tr, "frame_id": tr_frame_id}
-                    db.execute(
-                        "INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            ev_id,
-                            cycle_id,
-                            ev_time,
-                            tr.get("capture_monotonic_s"),
-                            tr_frame_id,
-                            ev_type,
-                            tr.get("state_before"),
-                            tr.get("state_after"),
-                            tr.get("outcome"),
-                            tr.get("reason"),
-                            json.dumps(tr_payload, ensure_ascii=False),
-                        ),
-                    )
-                    last_event_id = ev_id
+        state_transitions = _resolve_transition_frame_ids(transitions)
+        last_event_id: str | None = None
+        for idx, (tr, tr_frame_id) in enumerate(state_transitions):
+            ev_time = (
+                now_dt
+                - timedelta(seconds=max(0.01, elapsed_s * (1.0 - (idx + 1) / max(1, len(state_transitions)))))
+            ).isoformat(timespec="milliseconds")
+            ev_id = uuid.uuid4().hex
+            ev_type = str(tr.get("reason") or tr.get("event", {}).get("kind", "STATE_TRANSITION"))
+            tr_payload = {**tr, "frame_id": tr_frame_id}
+            db.execute(
+                "INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    ev_id,
+                    cycle_id,
+                    ev_time,
+                    tr.get("capture_monotonic_s"),
+                    tr_frame_id,
+                    ev_type,
+                    tr.get("state_before"),
+                    tr.get("state_after"),
+                    tr.get("outcome"),
+                    tr.get("reason"),
+                    json.dumps(tr_payload, ensure_ascii=False),
+                ),
+            )
+            last_event_id = ev_id
 
-                existing_ev = db.execute(
-                    "SELECT evidence_id FROM evidence WHERE cycle_id=? AND sha256=? LIMIT 1",
-                    (cycle_id, sha),
-                ).fetchone()
-                if not existing_ev:
-                    evidence_id = uuid.uuid4().hex
-                    relpath = Path("evidence") / cycle_id / f"{evidence_id}.jpg"
-                    absolute = data_root / relpath
-                    absolute.parent.mkdir(parents=True, exist_ok=True)
-                    with absolute.open("xb") as stream:
-                        stream.write(body)
-                    created_file = absolute
-                    metadata = {
-                        "pipe_color": pipe_color,
-                        "operation_event": f"SCENARIO_{scenario.upper()}",
-                        "operator_anon_id": data.get("operator_anon_id"),
-                        "camera_metadata": {
-                            "camera_device_id": data.get("camera_device_id"),
-                            "resolution": f"{data.get('camera_width')}x{data.get('camera_height')}",
-                            "fps": data.get("fps"),
-                        },
-                        "label_status": data.get("label_status"),
-                        "captured_at_utc": updated_utc,
-                    }
-                    if last_event_id is None:
-                        last_event_id = _event(
-                            db,
-                            cycle_id,
-                            f"EVIDENCE_{kind}",
-                            metadata,
-                            state_before="WAIT_PART",
-                            state_after=data.get("fsm_state"),
-                            outcome=data.get("outcome"),
-                            reason=data.get("result_reason"),
-                            capture_monotonic_s=data.get("capture_monotonic_s"),
-                            frame_id=data.get("frame_id"),
-                        )
-                    db.execute(
-                        "INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            evidence_id,
-                            cycle_id,
-                            last_event_id,
-                            updated_utc,
-                            kind,
-                            relpath.as_posix(),
-                            "image/jpeg",
-                            sha,
-                            data.get("frame_id") or 1,
-                            data.get("capture_monotonic_s"),
-                            json.dumps(metadata, ensure_ascii=False),
-                        ),
+        existing_ev = db.execute(
+            "SELECT evidence_id FROM evidence WHERE cycle_id=? AND sha256=? LIMIT 1",
+            (cycle_id, sha),
+        ).fetchone()
+        if not existing_ev:
+            evidence_id = uuid.uuid4().hex
+            relpath = Path("evidence") / cycle_id / f"{evidence_id}.jpg"
+            absolute = data_root / relpath
+            with _exclusive_evidence_file(absolute, body):
+                metadata = {
+                    "pipe_color": pipe_color,
+                    "operation_event": f"SCENARIO_{scenario.upper()}",
+                    "operator_anon_id": data.get("operator_anon_id"),
+                    "camera_metadata": {
+                        "camera_device_id": data.get("camera_device_id"),
+                        "resolution": f"{data.get('camera_width')}x{data.get('camera_height')}",
+                        "fps": data.get("fps"),
+                    },
+                    "label_status": data.get("label_status"),
+                    "captured_at_utc": updated_utc,
+                }
+                if last_event_id is None:
+                    last_event_id = _event(
+                        db,
+                        cycle_id,
+                        f"EVIDENCE_{kind}",
+                        metadata,
+                        state_before="WAIT_PART",
+                        state_after=data.get("fsm_state"),
+                        outcome=data.get("outcome"),
+                        reason=data.get("result_reason"),
+                        capture_monotonic_s=data.get("capture_monotonic_s"),
+                        frame_id=data.get("frame_id"),
                     )
-
+                db.execute(
+                    "INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        evidence_id,
+                        cycle_id,
+                        last_event_id,
+                        updated_utc,
+                        kind,
+                        relpath.as_posix(),
+                        "image/jpeg",
+                        sha,
+                        data.get("frame_id") or 1,
+                        data.get("capture_monotonic_s"),
+                        json.dumps(metadata, ensure_ascii=False),
+                    ),
+                )
                 db.execute(
                     "UPDATE station_state SET updated_at_utc=?, state_json=? WHERE singleton_id=1",
                     (updated_utc, json.dumps(data, ensure_ascii=False)),
                 )
-                return _attach_latest_evidence(db, data)
-        except Exception:
-            if created_file is not None:
-                created_file.unlink(missing_ok=True)
-            raise
+                db.commit()
+        else:
+            db.execute(
+                "UPDATE station_state SET updated_at_utc=?, state_json=? WHERE singleton_id=1",
+                (updated_utc, json.dumps(data, ensure_ascii=False)),
+            )
+        return _attach_latest_evidence(db, data)
 
 
 @app.post("/api/runtime/snapshot")
@@ -1661,7 +1833,7 @@ def list_cycles(limit: int = 100):
 def purge_cycles(payload: PurgeCyclesRequest, x_admin_token: str | None = Header(default=None)):
     admin_or_station_token(x_admin_token, "IGBT_ADMIN_TOKEN")
     initialize_database()
-    data_root, _, evidence_root = get_data_paths()
+    data_root, db_path, evidence_root = get_data_paths()
 
     if payload.scope == "simulated_only":
         with _EVIDENCE_IO_LOCK:
@@ -1685,14 +1857,28 @@ def purge_cycles(payload: PurgeCyclesRequest, x_admin_token: str | None = Header
         vacuumed = False
     else:
         with _EVIDENCE_IO_LOCK:
+            discard_fn = getattr(LIVE_CAMERA, "discard_pending_transitions", None)
+            if callable(discard_fn):
+                discard_fn(None)
             # Capture the fixed set of files present before the transaction commits so files
             # created after the purge transaction cannot be deleted by cleanup.
             pre_purge_files = _snapshot_evidence_files(evidence_root)
+            purged_at_utc = utc_now()
+            purged_monotonic_s = time.monotonic()
             with connect_db() as db:
                 ev_rows = db.execute("SELECT file_relpath FROM evidence").fetchall()
                 deleted_evidence = db.execute("DELETE FROM evidence").rowcount
                 deleted_events = db.execute("DELETE FROM events").rowcount
                 deleted_cycles = db.execute("DELETE FROM cycles").rowcount
+                db.execute(
+                    "UPDATE station_purge_state "
+                    "SET purge_generation = purge_generation + 1, purged_at_utc = ?, purged_monotonic_s = ? "
+                    "WHERE singleton_id = 1",
+                    (purged_at_utc, purged_monotonic_s),
+                )
+            resolved_db = db_path.resolve()
+            _PURGE_CUTOFF_MONOTONIC_BY_DB[resolved_db] = purged_monotonic_s
+            _DELETED_CYCLES_BY_DB.pop(resolved_db, None)
             deleted_files = sum(
                 1 for r in ev_rows if _safe_unlink_evidence(data_root, evidence_root, r["file_relpath"])
             )
@@ -1719,9 +1905,12 @@ def delete_cycle(cycle_id: str, x_admin_token: str | None = Header(default=None)
     admin_or_station_token(x_admin_token, "IGBT_ADMIN_TOKEN")
     cycle_id = _safe_cycle_id(cycle_id)
     initialize_database()
-    data_root, _, evidence_root = get_data_paths()
+    data_root, db_path, evidence_root = get_data_paths()
 
     with _EVIDENCE_IO_LOCK:
+        discard_fn = getattr(LIVE_CAMERA, "discard_pending_transitions", None)
+        if callable(discard_fn):
+            discard_fn({cycle_id})
         with connect_db() as db:
             exists = db.execute("SELECT 1 FROM cycles WHERE cycle_id=?", (cycle_id,)).fetchone()
             if not exists:
@@ -1730,6 +1919,11 @@ def delete_cycle(cycle_id: str, x_admin_token: str | None = Header(default=None)
             deleted_evidence = db.execute("DELETE FROM evidence WHERE cycle_id=?", (cycle_id,)).rowcount
             deleted_events = db.execute("DELETE FROM events WHERE cycle_id=?", (cycle_id,)).rowcount
             deleted_cycles = db.execute("DELETE FROM cycles WHERE cycle_id=?", (cycle_id,)).rowcount
+
+        deleted_set = _DELETED_CYCLES_BY_DB.setdefault(db_path.resolve(), set())
+        if len(deleted_set) >= _MAX_TRACKED_DELETED_CYCLES:
+            deleted_set.clear()
+        deleted_set.add(cycle_id)
 
         deleted_files = sum(
             1 for r in ev_rows if _safe_unlink_evidence(data_root, evidence_root, r["file_relpath"])
@@ -1803,6 +1997,93 @@ def _validate_and_decode_evidence_image(body: bytes, mime: str) -> str:
     return suffix
 
 
+def _decode_and_persist_evidence(
+    *,
+    cycle_id: str,
+    kind: str,
+    body: bytes,
+    mime: str,
+    x_frame_id: int,
+    x_capture_monotonic_s: float | None,
+    x_pipe_color: str | None,
+    x_operation_event: str | None,
+    x_operator_anon_id: str | None,
+    camera_metadata: dict[str, Any],
+    x_label_status: str | None,
+    captured_utc_iso: str,
+) -> dict[str, Any]:
+    suffix = _validate_and_decode_evidence_image(body, mime)
+    evidence_id = uuid.uuid4().hex
+    data_root, _, _ = get_data_paths()
+    relpath = Path("evidence") / cycle_id / f"{evidence_id}{suffix}"
+    absolute = data_root / relpath
+    sha = hashlib.sha256(body).hexdigest()
+    metadata = {
+        "pipe_color": x_pipe_color,
+        "operation_event": x_operation_event,
+        "operator_anon_id": x_operator_anon_id,
+        "camera_metadata": camera_metadata,
+        "label_status": x_label_status,
+        "captured_at_utc": captured_utc_iso,
+    }
+    with _EVIDENCE_IO_LOCK:
+        try:
+            with _exclusive_evidence_file(absolute, body), connect_db() as db:
+                now = metadata["captured_at_utc"]
+                if not db.execute("SELECT 1 FROM cycles WHERE cycle_id=?", (cycle_id,)).fetchone():
+                    db.execute(
+                        "INSERT INTO cycles(cycle_id,created_at_utc,updated_at_utc,final_outcome,fsm_state,source) VALUES(?,?,?,?,?,?)",
+                        (cycle_id, now, now, "WAITING", "WAIT_PART", "station"),
+                    )
+                event_id = _event(
+                    db,
+                    cycle_id,
+                    f"EVIDENCE_{kind}",
+                    metadata,
+                    outcome="WAITING",
+                    reason=x_operation_event,
+                    capture_monotonic_s=x_capture_monotonic_s,
+                    frame_id=x_frame_id,
+                )
+                db.execute(
+                    "INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        evidence_id,
+                        cycle_id,
+                        event_id,
+                        now,
+                        kind,
+                        relpath.as_posix(),
+                        mime,
+                        sha,
+                        x_frame_id,
+                        x_capture_monotonic_s,
+                        json.dumps(metadata, ensure_ascii=False),
+                    ),
+                )
+                if kind == "initial_label" and x_label_status:
+                    db.execute(
+                        "UPDATE cycles SET initial_label=COALESCE(initial_label,?) WHERE cycle_id=?",
+                        (x_label_status, cycle_id),
+                    )
+                if x_pipe_color or x_operator_anon_id:
+                    db.execute(
+                        "UPDATE cycles SET updated_at_utc=?,pipe_color=COALESCE(?,pipe_color),operator_anon_id=COALESCE(?,operator_anon_id) WHERE cycle_id=?",
+                        (now, x_pipe_color, x_operator_anon_id, cycle_id),
+                    )
+        except FileExistsError as exc:
+            raise HTTPException(409, "EVIDENCE_NAME_COLLISION_RETRY") from exc
+
+    return {
+        "evidence_id": evidence_id,
+        "cycle_id": cycle_id,
+        "kind": kind,
+        "sha256": sha,
+        "frame_id": x_frame_id,
+        "capture_monotonic_s": x_capture_monotonic_s,
+    }
+
+
 @app.post("/api/cycles/{cycle_id}/evidence/{kind}")
 async def upload_evidence(cycle_id: str, kind: Literal["initial_label", "A", "B", "C", "anomaly"],
                           request: Request, x_frame_id: int = Header(ge=0),
@@ -1838,51 +2119,22 @@ async def upload_evidence(cycle_id: str, kind: Literal["initial_label", "A", "B"
     if not body or len(body) != expected_length or len(body) > MAX_EVIDENCE_BYTES:
         raise HTTPException(400, "INVALID_EVIDENCE_BODY")
     mime = request.headers.get("content-type", "").split(";")[0].lower()
-    suffix = _validate_and_decode_evidence_image(body, mime)
-
-    evidence_id = uuid.uuid4().hex
-    data_root, _, _ = get_data_paths()
-    relpath = Path("evidence") / cycle_id / f"{evidence_id}{suffix}"
-    absolute = data_root / relpath
-    sha = hashlib.sha256(body).hexdigest()
-    metadata = {
-        "pipe_color": x_pipe_color, "operation_event": x_operation_event,
-        "operator_anon_id": x_operator_anon_id,
-        "camera_metadata": camera_metadata,
-        "label_status": x_label_status, "captured_at_utc": captured.astimezone(timezone.utc).isoformat(timespec="milliseconds"),
-    }
-    with _EVIDENCE_IO_LOCK:
-        absolute.parent.mkdir(parents=True, exist_ok=True)
-        # Exclusive creation makes accidental overwrites impossible.
-        try:
-            with absolute.open("xb") as stream:
-                stream.write(body)
-        except FileExistsError as exc:
-            raise HTTPException(409, "EVIDENCE_NAME_COLLISION_RETRY") from exc
-        try:
-            with connect_db() as db:
-                now = metadata["captured_at_utc"]
-                if not db.execute("SELECT 1 FROM cycles WHERE cycle_id=?", (cycle_id,)).fetchone():
-                    db.execute("INSERT INTO cycles(cycle_id,created_at_utc,updated_at_utc,final_outcome,fsm_state,source) VALUES(?,?,?,?,?,?)",
-                               (cycle_id, now, now, "WAITING", "WAIT_PART", "station"))
-                event_id = _event(db, cycle_id, f"EVIDENCE_{kind}", metadata, outcome="WAITING",
-                                  reason=x_operation_event, capture_monotonic_s=x_capture_monotonic_s, frame_id=x_frame_id)
-                db.execute("INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
-                    evidence_id, cycle_id, event_id, now, kind, relpath.as_posix(), mime, sha,
-                    x_frame_id, x_capture_monotonic_s, json.dumps(metadata, ensure_ascii=False),
-                ))
-                if kind == "initial_label" and x_label_status:
-                    db.execute("UPDATE cycles SET initial_label=COALESCE(initial_label,?) WHERE cycle_id=?",
-                               (x_label_status, cycle_id))
-                if x_pipe_color or x_operator_anon_id:
-                    db.execute("UPDATE cycles SET updated_at_utc=?,pipe_color=COALESCE(?,pipe_color),operator_anon_id=COALESCE(?,operator_anon_id) WHERE cycle_id=?",
-                               (now, x_pipe_color, x_operator_anon_id, cycle_id))
-        except Exception:
-            # If metadata/database persistence fails, remove only this newly created file.
-            absolute.unlink(missing_ok=True)
-            raise
-    return {"evidence_id": evidence_id, "cycle_id": cycle_id, "kind": kind, "sha256": sha,
-            "frame_id": x_frame_id, "capture_monotonic_s": x_capture_monotonic_s}
+    captured_utc_iso = captured.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+    return await asyncio.to_thread(
+        _decode_and_persist_evidence,
+        cycle_id=cycle_id,
+        kind=kind,
+        body=body,
+        mime=mime,
+        x_frame_id=x_frame_id,
+        x_capture_monotonic_s=x_capture_monotonic_s,
+        x_pipe_color=x_pipe_color,
+        x_operation_event=x_operation_event,
+        x_operator_anon_id=x_operator_anon_id,
+        camera_metadata=camera_metadata,
+        x_label_status=x_label_status,
+        captured_utc_iso=captured_utc_iso,
+    )
 
 
 @app.get("/api/evidence")
@@ -2041,7 +2293,8 @@ async def dataset_upload_sample(
         raise HTTPException(415, "ONLY_VALID_JPEG_OR_PNG_BYTES_ACCEPTED")
 
     try:
-        return TRAINING_MANAGER.upload_sample_bytes(
+        return await asyncio.to_thread(
+            TRAINING_MANAGER.upload_sample_bytes,
             image_bytes=body,
             label=clean_label,
             pipe_color=clean_color,
@@ -2074,8 +2327,13 @@ def dataset_capture_live_sample(payload: DatasetCaptureRequest):
     )
 
     # Archive the exact same full-frame image and metadata atomically captured above.
+    # Because the dataset sample is already committed, report any evidence archive failure
+    # explicitly on the response instead of failing the request and inviting duplicate retries.
     jpg = _encode_bgr_jpeg(frame_bgr, quality=92)
-    if jpg:
+    if not jpg:
+        return {**sample, "evidence_archived": False, "evidence_error": "EVIDENCE_ENCODE_FAILED"}
+
+    try:
         cycle_id = _safe_cycle_id(live_state.get("cycle_id") or _generate_live_cycle_id())
         now = utc_now()
         evidence_id = uuid.uuid4().hex
@@ -2109,62 +2367,72 @@ def dataset_capture_live_sample(payload: DatasetCaptureRequest):
             "label_status": lbl_status,
             "captured_at_utc": now,
         }
-        with _EVIDENCE_IO_LOCK:
-            absolute.parent.mkdir(parents=True, exist_ok=True)
-            with absolute.open("xb") as stream:
-                stream.write(jpg)
-            try:
-                with connect_db() as db:
-                    if not db.execute("SELECT 1 FROM cycles WHERE cycle_id=?", (cycle_id,)).fetchone():
-                        db.execute(
-                            "INSERT INTO cycles(cycle_id,created_at_utc,updated_at_utc,initial_label,final_outcome,result_reason,pipe_color,operator_anon_id,model_version,config_version,fsm_state,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (
-                                cycle_id,
-                                now,
-                                now,
-                                lbl_status,
-                                live_state.get("outcome") or "WAITING",
-                                live_state.get("result_reason"),
-                                payload.pipe_color,
-                                "OP_STATION_01",
-                                live_state.get("model_version"),
-                                live_state.get("config_version"),
-                                live_state.get("fsm_state") or "INSPECTING",
-                                "live",
-                            ),
-                        )
-                    ev_id = _event(
-                        db,
+        with _EVIDENCE_IO_LOCK, _exclusive_evidence_file(absolute, jpg), connect_db() as db:
+            if not db.execute("SELECT 1 FROM cycles WHERE cycle_id=?", (cycle_id,)).fetchone():
+                db.execute(
+                    "INSERT INTO cycles(cycle_id,created_at_utc,updated_at_utc,initial_label,final_outcome,result_reason,pipe_color,operator_anon_id,model_version,config_version,fsm_state,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
                         cycle_id,
-                        f"SAMPLE_{payload.label.upper()}",
-                        meta,
-                        state_before=live_state.get("fsm_state"),
-                        state_after=live_state.get("fsm_state"),
-                        outcome=live_state.get("outcome"),
-                        reason=f"采集训练样本 ({payload.label})",
-                        capture_monotonic_s=live_state.get("capture_monotonic_s"),
-                        frame_id=live_state.get("frame_id"),
-                    )
-                    db.execute(
-                        "INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            evidence_id,
-                            cycle_id,
-                            ev_id,
-                            now,
-                            ev_kind,
-                            relpath.as_posix(),
-                            "image/jpeg",
-                            sha,
-                            live_state.get("frame_id") or 1,
-                            live_state.get("capture_monotonic_s"),
-                            json.dumps(meta, ensure_ascii=False),
-                        ),
-                    )
-            except Exception:
-                absolute.unlink(missing_ok=True)
-                raise
-    return sample
+                        now,
+                        now,
+                        lbl_status,
+                        live_state.get("outcome") or "WAITING",
+                        live_state.get("result_reason"),
+                        payload.pipe_color,
+                        "OP_STATION_01",
+                        live_state.get("model_version"),
+                        live_state.get("config_version"),
+                        live_state.get("fsm_state") or "INSPECTING",
+                        "live",
+                    ),
+                )
+            ev_id = _event(
+                db,
+                cycle_id,
+                f"SAMPLE_{payload.label.upper()}",
+                meta,
+                state_before=live_state.get("fsm_state"),
+                state_after=live_state.get("fsm_state"),
+                outcome=live_state.get("outcome"),
+                reason=f"采集训练样本 ({payload.label})",
+                capture_monotonic_s=live_state.get("capture_monotonic_s"),
+                frame_id=live_state.get("frame_id"),
+            )
+            db.execute(
+                "INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    evidence_id,
+                    cycle_id,
+                    ev_id,
+                    now,
+                    ev_kind,
+                    relpath.as_posix(),
+                    "image/jpeg",
+                    sha,
+                    live_state.get("frame_id") or 1,
+                    live_state.get("capture_monotonic_s"),
+                    json.dumps(meta, ensure_ascii=False),
+                ),
+            )
+        return {
+            **sample,
+            "evidence_archived": True,
+            "evidence_id": evidence_id,
+            "evidence_url": f"/api/evidence/{evidence_id}/file",
+            "evidence_error": None,
+        }
+    except Exception as exc:
+        logger.warning(
+            "Dataset sample %s committed, but full-frame evidence archiving failed: %s",
+            sample.get("sample_id"),
+            exc,
+            exc_info=True,
+        )
+        return {
+            **sample,
+            "evidence_archived": False,
+            "evidence_error": f"EVIDENCE_ARCHIVE_FAILED:{exc}",
+        }
 
 
 @app.post("/api/dataset/bootstrap")
@@ -2289,13 +2557,30 @@ def _on_training_completed(run_summary: dict) -> bool:
             logger.warning("Refusing to activate training run missing ONNX path or SHA-256")
             return False
 
-        _load_onnx_into_camera(
-            onnx_path=Path(onnx_path),
-            model_version=str(run_summary["model_version"]),
-            expected_sha256=onnx_sha,
-            input_size=int(run_summary.get("input_size") or 96),
-        )
+        model_version = str(run_summary["model_version"])
+        input_size = _parse_optional_input_size(run_summary.get("input_size"), default=96)
+        resolved_onnx = Path(onnx_path).resolve()
+        if not resolved_onnx.is_file():
+            raise FileNotFoundError(f"ONNX model not found: {resolved_onnx}")
+        raw_bytes = resolved_onnx.read_bytes()
+        actual_sha = hashlib.sha256(raw_bytes).hexdigest().lower()
+        if not hmac.compare_digest(actual_sha, onnx_sha):
+            raise ValueError("MODEL_SHA256_MISMATCH")
 
+        prepare_fn = getattr(LIVE_CAMERA, "prepare_onnx_model", None)
+        commit_fn = getattr(LIVE_CAMERA, "commit_prepared_onnx_model", None)
+        prepared: dict[str, Any] | None = None
+        if callable(prepare_fn) and callable(commit_fn):
+            # Phase 1: verify SHA-256 and construct ORT session WITHOUT mutating the active model.
+            prepared = prepare_fn(
+                resolved_onnx,
+                model_version=model_version,
+                sha256=actual_sha,
+                input_size=input_size,
+                expected_sha256=onnx_sha,
+            )
+
+        # Phase 2: persist registry metadata before installing the new session.
         initialize_database()
         model_id = uuid.uuid4().hex
         notes = (
@@ -2310,13 +2595,25 @@ def _on_training_completed(run_summary: dict) -> bool:
                 (
                     model_id,
                     run_summary["model_name"],
-                    run_summary["model_version"],
+                    model_version,
                     onnx_sha,
                     "reviewed",
                     notes,
                     utc_now(),
                     "trainer-pipeline",
                 ),
+            )
+
+        # Phase 3: atomically commit the verified session swap after registration succeeds.
+        if prepared is not None and callable(commit_fn):
+            commit_fn(prepared)
+        else:
+            _load_onnx_into_camera(
+                onnx_path=resolved_onnx,
+                model_version=model_version,
+                expected_sha256=onnx_sha,
+                input_size=input_size,
+                onnx_bytes=raw_bytes,
             )
         return True
     except Exception:
@@ -2372,11 +2669,9 @@ def activate_registered_model(model_id: str, x_admin_token: str | None = Header(
     if metrics_file is not None and metrics_file.is_file():
         try:
             meta = json.loads(metrics_file.read_text(encoding="utf-8"))
-            if isinstance(meta, dict) and meta.get("input_size"):
-                parsed_size = int(meta["input_size"])
-                if 32 <= parsed_size <= 1024:
-                    input_size = parsed_size
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            if isinstance(meta, dict):
+                input_size = _parse_optional_input_size(meta.get("input_size"), default=96)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
             logger.warning("Unable to read metrics.json for model %s: %s", version, exc)
 
     try:

@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import logging
 import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -231,6 +232,8 @@ class LiveCameraEngine:
         self.show_auxiliary_rois = False
         self.mirror_horizontal: bool = True
         self._applied_mirror_horizontal: bool = True
+        self._mirror_generation: int = 0
+        self._applied_mirror_generation: int = 0
         self._pending_tracker_reset: bool = False
         self.work_mode: str = "debug"  # "debug" (桌面调试模式) or "strict" (车间严格模式)
         self._work_mode_generation: int = 0
@@ -242,7 +245,10 @@ class LiveCameraEngine:
         self._last_tracked_crop: np.ndarray | None = None
         self._hud_jpeg: bytes | None = None
         self._crop_jpeg: bytes | None = None
+        self._hud_seq: int = 0
+        self._crop_seq: int = 0
         self._frame_seq: int = 0
+        self._wait_entered_hook: Callable[[], None] | None = None
         self._frame_id = 0
         self._fps_times: deque[float] = deque(maxlen=35)
 
@@ -263,12 +269,14 @@ class LiveCameraEngine:
         self._target_locked = False
         self._target_confidence = 0.0
 
-        # Cycle lifecycle, Alarm latch & durable transition retry queue
+        # Cycle lifecycle, Alarm latch & non-evicting durable transition retry queue (R2-05)
         self._alarm_latched = False
         self._latched_reason: str | None = None
         self._latched_cycle_id: str | None = None
         self._pass_target_lost_since: float | None = None
-        self._pending_transitions: deque[dict[str, Any]] = deque(maxlen=256)
+        self._max_pending_transitions: int = 256
+        self._pending_transitions: deque[dict[str, Any]] = deque()
+        self._persistence_overflow_fault: bool = False
 
         # ONNX Runtime neural network inference state
         self._ort_session: Any = None
@@ -356,7 +364,7 @@ class LiveCameraEngine:
         self._target_locked = False
         self._target_confidence = 0.0
 
-    def load_onnx_model(
+    def prepare_onnx_model(
         self,
         onnx_path: str | Path,
         model_version: str,
@@ -364,7 +372,7 @@ class LiveCameraEngine:
         input_size: int = 96,
         expected_sha256: str | None = None,
     ) -> dict[str, Any]:
-        """Hot-load a trained MobileNetV3-Small ONNX model with atomic SHA-256 verification."""
+        """Verify SHA-256 and construct an ORT session without modifying the currently active model (R2-24)."""
         import onnxruntime as ort
 
         path = Path(onnx_path).resolve()
@@ -390,21 +398,55 @@ class LiveCameraEngine:
         if len(shape) == 4 and isinstance(shape[2], int) and shape[2] >= 32:
             detected_size = int(shape[2])
 
+        return {
+            "session": session,
+            "model_version": model_version,
+            "onnx_path": str(path),
+            "input_size": detected_size,
+            "sha256": actual_sha256,
+        }
+
+    def commit_prepared_onnx_model(self, prepared: dict[str, Any]) -> dict[str, Any]:
+        """Atomically install a previously prepared ONNX model bundle into the live engine (R2-24)."""
+        session = prepared["session"]
+        model_version = str(prepared["model_version"])
+        detected_size = int(prepared["input_size"])
+        onnx_path = str(prepared["onnx_path"])
+        actual_sha256 = str(prepared["sha256"])
+
         with self._lock:
             self._ort_session = session
             self._onnx_input_size = detected_size
             self._onnx_model_version = model_version
-            self._onnx_model_path = str(path)
+            self._onnx_model_path = onnx_path
             self._onnx_sha256 = actual_sha256
             if not self.camera_online:
                 self._state["model_version"] = model_version
                 self._state["inference_backend"] = f"ONNX 神经网络 ({model_version})"
         return {
             "model_version": model_version,
-            "onnx_path": str(path),
+            "onnx_path": onnx_path,
             "input_size": detected_size,
             "sha256": actual_sha256,
         }
+
+    def load_onnx_model(
+        self,
+        onnx_path: str | Path,
+        model_version: str,
+        sha256: str | None = None,
+        input_size: int = 96,
+        expected_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        """Hot-load a trained MobileNetV3-Small ONNX model with atomic SHA-256 verification."""
+        prepared = self.prepare_onnx_model(
+            onnx_path=onnx_path,
+            model_version=model_version,
+            sha256=sha256,
+            input_size=input_size,
+            expected_sha256=expected_sha256,
+        )
+        return self.commit_prepared_onnx_model(prepared)
 
     def set_show_auxiliary_rois(self, show: bool) -> bool:
         with self._lock:
@@ -418,7 +460,8 @@ class LiveCameraEngine:
             changed = normalized != self.mirror_horizontal
             self.mirror_horizontal = normalized
             if changed:
-                # Defer background/tracker reset to the capture thread at a frame boundary (BE-01).
+                # Defer tracker reset to the capture thread at frame boundary and reject in-flight frames (BE-01, R2-08).
+                self._mirror_generation += 1
                 self._pending_tracker_reset = True
             if not self.camera_online:
                 self._state["mirror_horizontal"] = normalized
@@ -427,6 +470,7 @@ class LiveCameraEngine:
     def set_work_mode(self, mode: str) -> str:
         normalized = "strict" if mode == "strict" else "debug"
         with self._lock:
+            prev_mode = self.work_mode
             self.work_mode = normalized
             self._work_mode_generation += 1
             self._state["work_mode"] = normalized
@@ -435,6 +479,23 @@ class LiveCameraEngine:
                 self._latched_reason = None
                 self._state["alarm_latched"] = False
                 self._state["bare_hand_violation"] = False
+            elif prev_mode != "strict":
+                # Do not carry a debug-earned PASS or partial debug cycle into strict mode (R2-06);
+                # preserve any unacknowledged ALARM latch.
+                if not self._alarm_latched and self.fsm.state != FSMState.ALARM:
+                    self.fsm = InspectionFSM(
+                        config=FSMConfig(initial_complete_ms=350, stable_state_ms=400, min_stable_frames=5)
+                    )
+                    self.contact_tracker.reset()
+                    self._pass_target_lost_since = None
+                    self._cycle_generation += 1
+                    self._pending_tracker_reset = True
+                    self._state["fsm_state"] = "WAIT_PART"
+                    self._state["outcome"] = "WAITING"
+                    self._state["result_reason"] = "STRICT_MODE_REVERIFY_REQUIRED"
+                    self._state["cycle_id"] = None
+                    self._state["c_timer_ms"] = 0
+                    self._state["view_valid"] = False
             return normalized
 
     def get_custom_crop_bgr(self, box: list[float] | tuple[float, ...] | None) -> np.ndarray | None:
@@ -588,14 +649,14 @@ class LiveCameraEngine:
             return self._crop_jpeg
 
     def get_hud_jpeg_with_seq(self) -> tuple[bytes | None, int]:
-        """Non-blocking cache read returning (hud_jpeg_or_none, frame_seq) for BE-34."""
+        """Non-blocking cache read returning (hud_jpeg_or_none, hud_seq) for BE-34/R2-31."""
         with self._lock:
-            return self._hud_jpeg, self._frame_seq
+            return self._hud_jpeg, self._hud_seq
 
     def get_crop_jpeg_with_seq(self) -> tuple[bytes | None, int]:
-        """Non-blocking cache read returning (crop_jpeg_or_none, frame_seq) for BE-34."""
+        """Non-blocking cache read returning (crop_jpeg_or_none, crop_seq) for BE-34/R2-31."""
         with self._lock:
-            return self._crop_jpeg, self._frame_seq
+            return self._crop_jpeg, self._crop_seq
 
     def wait_for_frame(
         self,
@@ -603,17 +664,39 @@ class LiveCameraEngine:
         timeout: float = 0.5,
         kind: str = "hud",
     ) -> tuple[bytes | None, int]:
-        """Wait up to `timeout` seconds for a frame newer than `last_seq` (BE-34)."""
+        """Wait up to `timeout` seconds for a frame newer than `last_seq` (BE-34/R2-31)."""
         use_crop = kind == "crop"
         deadline = time.monotonic() + max(0.0, float(timeout))
         with self._frame_cond:
-            while self._frame_seq <= last_seq and self._running:
+            while (self._crop_seq if use_crop else self._hud_seq) <= last_seq and self._running:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
                     break
+                hook = self._wait_entered_hook
+                if hook is not None:
+                    hook()
                 self._frame_cond.wait(timeout=remaining)
-            data = self._crop_jpeg if use_crop else self._hud_jpeg
-            return data, self._frame_seq
+            if use_crop:
+                return self._crop_jpeg, self._crop_seq
+            return self._hud_jpeg, self._hud_seq
+
+    def discard_pending_transitions(self, cycle_ids: Iterable[str] | None = None) -> int:
+        """Drop queued unpersisted transitions matching `cycle_ids` (or all when `None`) for R2-21."""
+        target_ids = None if cycle_ids is None else {str(cid) for cid in cycle_ids}
+        with self._lock:
+            before = len(self._pending_transitions)
+            if target_ids is None:
+                self._pending_transitions.clear()
+            else:
+                self._pending_transitions = deque(
+                    item
+                    for item in self._pending_transitions
+                    if item["snapshot"].get("cycle_id") not in target_ids
+                )
+            removed = before - len(self._pending_transitions)
+            if len(self._pending_transitions) < self._max_pending_transitions:
+                self._persistence_overflow_fault = False
+            return removed
 
     def _active_rois_and_thresholds(self) -> tuple[ROISet, dict[str, Any], str, dict[str, Any]]:
         try:
@@ -1408,11 +1491,40 @@ class LiveCameraEngine:
         ok2, buf2 = cv2.imencode(".jpg", crop_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
         return (bytes(buf1) if ok1 else b""), (bytes(buf2) if ok2 else b""), label_crop
 
+    @staticmethod
+    def _invoke_cycle_callback(
+        callback: Callable[..., Any],
+        snapshot: dict[str, Any],
+        prev_fsm: str | None,
+        evidence_jpeg: bytes | None,
+    ) -> Any:
+        try:
+            sig = inspect.signature(callback)
+            params = list(sig.parameters.values())
+        except (TypeError, ValueError):
+            params = []
+        accepts_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            or (p.name == "evidence_jpeg" and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY))
+            for p in params
+        )
+        if accepts_kw:
+            return callback(snapshot, prev_fsm, evidence_jpeg=evidence_jpeg)
+        positional = [
+            p
+            for p in params
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+        if len(positional) >= 3 or any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params):
+            return callback(snapshot, prev_fsm, evidence_jpeg)
+        return callback(snapshot, prev_fsm)
+
     def _flush_pending_transitions(self) -> int:
-        """Deliver queued cycle transitions in FIFO order, retaining any failed item for retry (BE-11)."""
+        """Deliver queued cycle transitions in FIFO order, retaining failed items without eviction (BE-11, R2-05, R2-07)."""
         if self._on_cycle_update is None:
             with self._lock:
                 self._pending_transitions.clear()
+                self._persistence_overflow_fault = False
             return 0
         flushed = 0
         while True:
@@ -1420,19 +1532,61 @@ class LiveCameraEngine:
                 if not self._pending_transitions:
                     break
                 item = self._pending_transitions[0]
+                event_id = item["event_id"]
+                snapshot_copy = dict(item["snapshot"])
+                prev_fsm = item["prev_fsm"]
+                needs_evidence = bool(item.get("needs_evidence"))
+                evidence_jpeg: bytes | None = item.get("evidence_jpeg")
+                raw_bgr: np.ndarray | None = item.get("frame_bgr")
+
+            # Lazily freeze triggering-frame JPEG if HUD rendering had not attached it yet (R2-07).
+            if needs_evidence and evidence_jpeg is None and raw_bgr is not None:
+                ok_ev, buf_ev = cv2.imencode(".jpg", raw_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+                if ok_ev:
+                    evidence_jpeg = bytes(buf_ev)
+                    with self._lock:
+                        if self._pending_transitions and self._pending_transitions[0]["event_id"] == event_id:
+                            self._pending_transitions[0]["evidence_jpeg"] = evidence_jpeg
+                            self._pending_transitions[0]["frame_bgr"] = None
+
             try:
-                result = self._on_cycle_update(dict(item["snapshot"]), item["prev_fsm"])
+                result = self._invoke_cycle_callback(
+                    self._on_cycle_update,
+                    snapshot_copy,
+                    prev_fsm,
+                    evidence_jpeg,
+                )
             except Exception as exc:
-                logger.warning("Cycle update callback failed (will retry event %s): %s", item["event_id"], exc)
+                logger.warning("Cycle update callback failed (will retry event %s): %s", event_id, exc)
                 break
             if result is False:
-                logger.warning("Cycle update callback returned False (will retry event %s)", item["event_id"])
+                logger.warning("Cycle update callback returned False (will retry event %s)", event_id)
                 break
             with self._lock:
-                if self._pending_transitions and self._pending_transitions[0]["event_id"] == item["event_id"]:
+                if self._pending_transitions and self._pending_transitions[0]["event_id"] == event_id:
                     self._pending_transitions.popleft()
+                if len(self._pending_transitions) < self._max_pending_transitions:
+                    self._persistence_overflow_fault = False
             flushed += 1
         return flushed
+
+    def _mark_camera_unavailable(self, reason: str = "CAMERA_FEED_LOST") -> None:
+        """Invalidate online camera status and non-alarm live PASS when capture drops or exits (R2-10)."""
+        with self._frame_cond:
+            self.camera_online = False
+            if time.monotonic() >= self.simulation_override_until:
+                self._state["camera_status"] = "OFFLINE" if reason == "CAMERA_FEED_LOST" else "NOT_CONNECTED"
+                self._state["view_valid"] = False
+                self._state["view_valid_reasons"] = [reason]
+                self._state["quality_ok"] = False
+                if not self._alarm_latched and self._state.get("outcome") == "PASS":
+                    self._state["outcome"] = "VIEW_INVALID"
+                    self._state["fsm_state"] = "VIEW_INVALID"
+                    self._state["result_reason"] = reason
+                elif not self._alarm_latched and self._state.get("outcome") != "ALARM":
+                    self._state["result_reason"] = reason
+                self._state["updated_at_utc"] = _utc_now()
+            self._frame_cond.notify_all()
 
     def _process_frame(
         self,
@@ -1444,19 +1598,29 @@ class LiveCameraEngine:
         if stop_event is not None and stop_event.is_set():
             return False
 
-        # Frame-boundary snapshot of mirror, work_mode, and cycle generation (BE-01, BE-06, BE-49).
+        # Frame-boundary snapshot of mirror, work_mode, and cycle generation (BE-01, BE-06, BE-49, R2-08).
         with self._lock:
             mirror_now = self.mirror_horizontal
+            mirror_gen = self._mirror_generation
             work_mode_now = self.work_mode
             work_mode_gen = self._work_mode_generation
             frame_cycle_gen = self._cycle_generation
             show_aux_now = self.show_auxiliary_rois
-            need_tracker_reset = self._pending_tracker_reset or (mirror_now != self._applied_mirror_horizontal)
+            mirror_changed = (
+                mirror_now != self._applied_mirror_horizontal
+                or mirror_gen != self._applied_mirror_generation
+            )
+            need_tracker_reset = self._pending_tracker_reset or mirror_changed
             self._pending_tracker_reset = False
+            if mirror_changed:
+                # Invalidate geometry-dependent contact/stability/C evidence on mirror orientation change (R2-08).
+                self.contact_tracker.reset()
+                self.fsm.invalidate_geometry_evidence(reason="MIRROR_ORIENTATION_CHANGED", now_monotonic=capture_ts)
 
         if need_tracker_reset:
             self._reset_tracking_state()
             self._applied_mirror_horizontal = mirror_now
+            self._applied_mirror_generation = mirror_gen
 
         if mirror_now:
             frame = cv2.flip(frame, 1)
@@ -1531,6 +1695,7 @@ class LiveCameraEngine:
                 or self._cycle_generation != frame_cycle_gen
                 or self._work_mode_generation != work_mode_gen
                 or self.work_mode != work_mode_now
+                or self._mirror_generation != mirror_gen
             ):
                 return False
             tracked = self.contact_tracker.update(
@@ -1576,6 +1741,8 @@ class LiveCameraEngine:
 
         # Fresh monotonic time when the FSM actually consumes this frame (BE-09).
         fsm_now = time.monotonic()
+        queued_event_id: str | None = None
+        queued_needs_evidence = False
 
         with self._lock:
             if (
@@ -1583,8 +1750,9 @@ class LiveCameraEngine:
                 or self._cycle_generation != frame_cycle_gen
                 or self._work_mode_generation != work_mode_gen
                 or self.work_mode != work_mode_now
+                or self._mirror_generation != mirror_gen
             ):
-                # Discard stale in-flight observation computed before a cycle reset or work-mode switch (BE-06, BE-49).
+                # Discard stale in-flight observation computed before a cycle/mode/mirror change (BE-06, BE-49, R2-08).
                 return False
 
             self._raw_frame = frame
@@ -1595,144 +1763,183 @@ class LiveCameraEngine:
             self.fps = round(measured_fps, 1)
             self._inference_ms = infer_ms
 
+            frame_meta: dict[str, Any] = {
+                "camera_status": "ONLINE",
+                "camera_name": self.camera_name,
+                "camera_device_id": self.camera_device_id,
+                "backend": self.backend,
+                "camera_width": w,
+                "camera_height": h,
+                "camera_settings_locked": camera_settings_locked,
+                "fps": round(measured_fps, 1),
+                "label_status": label_status,
+                "label_confidence": label_conf,
+                "view_valid": view_valid,
+                "view_valid_reasons": list(reasons),
+                "quality_ok": quality_ok,
+                "laplacian_variance": round(quality.laplacian_variance, 1) if quality else None,
+                "brightness": round(quality.brightness_mean, 1) if quality else None,
+                "overexposed_fraction": round(quality.overexposed_fraction, 4) if quality else None,
+                "underexposed_fraction": round(quality.underexposed_fraction, 4) if quality else None,
+                "left_grip_active": left_active,
+                "right_grip_active": right_active,
+                "glove_compliant": glove_compliant,
+                "bare_hand_detected": bare_hand_detected,
+                "pipe_color": pipe_color,
+                "frame_id": self._frame_id,
+                "capture_monotonic_s": round(capture_ts, 3),
+                "model_version": pred_model_version,
+                "inference_backend": pred_backend_label,
+                "inference_ms": infer_ms,
+                "show_auxiliary_rois": show_aux_now,
+                "mirror_horizontal": mirror_now,
+                "work_mode": work_mode_now,
+                "tracked_objects": tracked_objects,
+                "tracked_label_box": list(label_box) if (target_locked and label_box is not None) else None,
+                "config_version": roi_ver,
+                "live_stream_url": "/api/camera/stream",
+                "live_crop_url": "/api/camera/stream_crop",
+                "updated_at_utc": _utc_now(),
+            }
+
             if fsm_now >= self.simulation_override_until:
                 prev_fsm = self._state.get("fsm_state", "WAIT_PART")
                 changed = False
 
-                # Rule A: Bare hand touches/holds the tube or label in strict mode -> IMMEDIATE LATCHED ALARM!
-                if bare_hand_touching_part and work_mode_now == "strict" and not self._alarm_latched:
-                    self._alarm_latched = True
-                    self._latched_reason = "BARE_HAND_VIOLATION"
-                    self._latched_cycle_id = self.fsm.cycle_id or generate_live_cycle_id()
-                    changed = True
-
-                if self._alarm_latched:
-                    active_fsm_state = "ALARM"
-                    active_outcome = "ALARM"
-                    active_reason = self._latched_reason or "BARE_HAND_VIOLATION"
-                    active_cycle_id = self._latched_cycle_id
-                elif not target_locked:
-                    # Rule B: Auto-flow on PASS — when tube leaves view for >= 0.5s after PASS, reset for next tube
-                    if self.fsm.state == FSMState.PASS:
-                        if self._pass_target_lost_since is None:
-                            self._pass_target_lost_since = fsm_now
-                        elif (fsm_now - self._pass_target_lost_since) >= 0.5:
-                            self.fsm = InspectionFSM(
-                                config=FSMConfig(initial_complete_ms=350, stable_state_ms=400, min_stable_frames=5)
-                            )
-                            self._cycle_generation += 1
-                            self._pass_target_lost_since = None
-                            changed = True
-                    elif self.fsm.state == FSMState.ALARM:
-                        # Latch any FSM alarm until manual reset
+                # Overflow gate: never silently evict unpersisted transitions; stop accepting new results and fault (R2-05).
+                if self._persistence_overflow_fault or (
+                    self._on_cycle_update is not None
+                    and len(self._pending_transitions) >= self._max_pending_transitions
+                ):
+                    self._persistence_overflow_fault = True
+                    active_fsm_state = "FAULT"
+                    active_outcome = "FAULT"
+                    active_reason = "PERSISTENCE_QUEUE_OVERFLOW"
+                    active_cycle_id = self.fsm.cycle_id
+                    view_valid = False
+                    if "PERSISTENCE_QUEUE_OVERFLOW" not in reasons:
+                        reasons.append("PERSISTENCE_QUEUE_OVERFLOW")
+                else:
+                    # Rule A: Bare hand touches/holds the tube or label in strict mode -> IMMEDIATE LATCHED ALARM!
+                    if bare_hand_touching_part and work_mode_now == "strict" and not self._alarm_latched:
                         self._alarm_latched = True
-                        self._latched_reason = self.fsm.result_reason or "LABEL_STILL_COMPLETE_AFTER_RELEASE"
-                        self._latched_cycle_id = self.fsm.cycle_id
+                        self._latched_reason = "BARE_HAND_VIOLATION"
+                        self._latched_cycle_id = self.fsm.cycle_id or generate_live_cycle_id()
                         changed = True
-                    elif self.fsm.state != FSMState.WAIT_PART:
-                        self.fsm = InspectionFSM(
-                            config=FSMConfig(initial_complete_ms=350, stable_state_ms=400, min_stable_frames=5)
-                        )
-                        self._cycle_generation += 1
 
                     if self._alarm_latched:
                         active_fsm_state = "ALARM"
                         active_outcome = "ALARM"
-                        active_reason = self._latched_reason
+                        active_reason = self._latched_reason or "BARE_HAND_VIOLATION"
                         active_cycle_id = self._latched_cycle_id
-                    elif self.fsm.state == FSMState.PASS:
-                        active_fsm_state = "PASS"
-                        active_outcome = "PASS"
-                        active_reason = self.fsm.result_reason
-                        active_cycle_id = self.fsm.cycle_id
+                    elif not target_locked:
+                        # Rule B: Auto-flow on PASS — when tube leaves view for >= 0.5s after PASS, reset for next tube
+                        if self.fsm.state == FSMState.PASS:
+                            if self._pass_target_lost_since is None:
+                                self._pass_target_lost_since = fsm_now
+                            elif (fsm_now - self._pass_target_lost_since) >= 0.5:
+                                self.fsm = InspectionFSM(
+                                    config=FSMConfig(initial_complete_ms=350, stable_state_ms=400, min_stable_frames=5)
+                                )
+                                self._cycle_generation += 1
+                                self._pass_target_lost_since = None
+                                changed = True
+                        elif self.fsm.state == FSMState.ALARM:
+                            # Latch any FSM alarm until manual reset
+                            self._alarm_latched = True
+                            self._latched_reason = self.fsm.result_reason or "LABEL_STILL_COMPLETE_AFTER_RELEASE"
+                            self._latched_cycle_id = self.fsm.cycle_id
+                            changed = True
+                        elif self.fsm.state != FSMState.WAIT_PART:
+                            self.fsm = InspectionFSM(
+                                config=FSMConfig(initial_complete_ms=350, stable_state_ms=400, min_stable_frames=5)
+                            )
+                            self._cycle_generation += 1
+
+                        if self._alarm_latched:
+                            active_fsm_state = "ALARM"
+                            active_outcome = "ALARM"
+                            active_reason = self._latched_reason
+                            active_cycle_id = self._latched_cycle_id
+                        elif self.fsm.state == FSMState.PASS:
+                            active_fsm_state = "PASS"
+                            active_outcome = "PASS"
+                            active_reason = self.fsm.result_reason
+                            active_cycle_id = self.fsm.cycle_id
+                        else:
+                            active_fsm_state = "WAIT_PART"
+                            active_outcome = "WAITING"
+                            active_reason = "BARE_HAND_WARNING_NO_GLOVE" if bare_hand_detected else "WAITING_FOR_PART"
+                            active_cycle_id = None
                     else:
-                        active_fsm_state = "WAIT_PART"
-                        active_outcome = "WAITING"
-                        active_reason = "BARE_HAND_WARNING_NO_GLOVE" if bare_hand_detected else "WAITING_FOR_PART"
-                        active_cycle_id = None
-                else:
-                    self._pass_target_lost_since = None
-                    if self.fsm.state == FSMState.WAIT_PART:
-                        cycle_id = generate_live_cycle_id()
+                        self._pass_target_lost_since = None
+                        if self.fsm.state == FSMState.WAIT_PART:
+                            cycle_id = generate_live_cycle_id()
+                            self.fsm.process(
+                                FSMEvent(
+                                    kind="new_cycle",
+                                    cycle_id=cycle_id,
+                                    capture_monotonic_s=capture_ts,
+                                    pipe_color=pipe_color or "yellow",
+                                    operator_anon_id="OP_STATION_01",
+                                ),
+                                now_monotonic=fsm_now,
+                            )
+                        # Send per-contact-candidate grip status rather than frame-wide grip flags (BE-08).
+                        cand_left_grip = False if tracked.hand_contact_candidate else left_active
+                        cand_right_grip = False if tracked.hand_contact_candidate else right_active
                         self.fsm.process(
                             FSMEvent(
-                                kind="new_cycle",
-                                cycle_id=cycle_id,
+                                kind="observation",
+                                cycle_id=self.fsm.cycle_id,
                                 capture_monotonic_s=capture_ts,
-                                pipe_color=pipe_color or "yellow",
+                                frame_id=self._frame_id,
+                                label_class=label_status,
+                                view_valid=view_valid,
+                                quality_ok=quality_ok,
+                                camera_healthy=True,
+                                camera_settings_locked=camera_settings_locked,
+                                config_match=config_match,
+                                tube_present=target_locked,
+                                label_window_present=target_locked,
+                                label_roi_clear=not tracked.hand_contact_candidate,
+                                hand_occluded=tracked.hand_contact_candidate,
+                                hand_contact_candidate=tracked.hand_contact_candidate,
+                                hand_detection_valid=glove_compliant,
+                                hand_in_contact_roi=tracked.hand_contact_candidate,
+                                hand_in_label_contact_roi=tracked.hand_contact_candidate,
+                                hand_in_left_grip_zone=cand_left_grip,
+                                hand_in_right_grip_zone=cand_right_grip,
+                                pipe_color=pipe_color,
                                 operator_anon_id="OP_STATION_01",
                             ),
                             now_monotonic=fsm_now,
                         )
-                    # Send per-contact-candidate grip status rather than frame-wide grip flags (BE-08).
-                    cand_left_grip = False if tracked.hand_contact_candidate else left_active
-                    cand_right_grip = False if tracked.hand_contact_candidate else right_active
-                    self.fsm.process(
-                        FSMEvent(
-                            kind="observation",
-                            cycle_id=self.fsm.cycle_id,
-                            capture_monotonic_s=capture_ts,
-                            frame_id=self._frame_id,
-                            label_class=label_status,
-                            view_valid=view_valid,
-                            quality_ok=quality_ok,
-                            camera_healthy=True,
-                            camera_settings_locked=camera_settings_locked,
-                            config_match=config_match,
-                            tube_present=target_locked,
-                            label_window_present=target_locked,
-                            label_roi_clear=not tracked.hand_contact_candidate,
-                            hand_occluded=tracked.hand_contact_candidate,
-                            hand_contact_candidate=tracked.hand_contact_candidate,
-                            hand_detection_valid=glove_compliant,
-                            hand_in_contact_roi=tracked.hand_contact_candidate,
-                            hand_in_label_contact_roi=tracked.hand_contact_candidate,
-                            hand_in_left_grip_zone=cand_left_grip,
-                            hand_in_right_grip_zone=cand_right_grip,
-                            pipe_color=pipe_color,
-                            operator_anon_id="OP_STATION_01",
-                        ),
-                        now_monotonic=fsm_now,
-                    )
-                    if self.fsm.state == FSMState.READY:
-                        self.fsm.process(
-                            FSMEvent(kind="start_inspection", capture_monotonic_s=fsm_now),
-                            now_monotonic=fsm_now,
-                        )
-                    if self.fsm.state == FSMState.ALARM:
-                        self._alarm_latched = True
-                        self._latched_reason = self.fsm.result_reason
-                        self._latched_cycle_id = self.fsm.cycle_id
+                        if self.fsm.state == FSMState.READY:
+                            self.fsm.process(
+                                FSMEvent(
+                                    kind="start_inspection",
+                                    capture_monotonic_s=capture_ts,
+                                    frame_id=self._frame_id,
+                                ),
+                                now_monotonic=fsm_now,
+                            )
+                        if self.fsm.state == FSMState.ALARM:
+                            self._alarm_latched = True
+                            self._latched_reason = self.fsm.result_reason
+                            self._latched_cycle_id = self.fsm.cycle_id
 
-                    active_fsm_state = self.fsm.state.value
-                    active_outcome = self.fsm.outcome
-                    active_reason = self.fsm.result_reason
-                    active_cycle_id = self.fsm.cycle_id
-                    changed = prev_fsm != active_fsm_state
+                        active_fsm_state = self.fsm.state.value
+                        active_outcome = self.fsm.outcome
+                        active_reason = self.fsm.result_reason
+                        active_cycle_id = self.fsm.cycle_id
+                        changed = prev_fsm != active_fsm_state
 
                 self._state.update(
                     {
-                        "camera_status": "ONLINE",
-                        "camera_name": self.camera_name,
-                        "camera_device_id": self.camera_device_id,
-                        "backend": self.backend,
-                        "camera_width": w,
-                        "camera_height": h,
-                        "camera_settings_locked": camera_settings_locked,
-                        "fps": round(measured_fps, 1),
-                        "label_status": label_status,
-                        "label_confidence": label_conf,
+                        **frame_meta,
                         "view_valid": view_valid,
                         "view_valid_reasons": reasons,
-                        "quality_ok": quality_ok,
-                        "laplacian_variance": round(quality.laplacian_variance, 1) if quality else None,
-                        "brightness": round(quality.brightness_mean, 1) if quality else None,
-                        "overexposed_fraction": round(quality.overexposed_fraction, 4) if quality else None,
-                        "underexposed_fraction": round(quality.underexposed_fraction, 4) if quality else None,
-                        "left_grip_active": left_active,
-                        "right_grip_active": right_active,
-                        "glove_compliant": glove_compliant,
-                        "bare_hand_detected": bare_hand_detected,
                         "bare_hand_violation": bool(bare_hand_touching_part or self._latched_reason == "BARE_HAND_VIOLATION"),
                         "alarm_latched": self._alarm_latched,
                         "label_contact_active": tracked.hand_contact_candidate,
@@ -1742,45 +1949,50 @@ class LiveCameraEngine:
                         "result_reason": active_reason,
                         "c_timer_ms": self.fsm.c_timer_ms,
                         "cycle_id": active_cycle_id,
-                        "pipe_color": pipe_color,
-                        "frame_id": self._frame_id,
-                        "capture_monotonic_s": round(capture_ts, 3),
-                        "model_version": pred_model_version,
-                        "inference_backend": pred_backend_label,
-                        "inference_ms": infer_ms,
-                        "show_auxiliary_rois": show_aux_now,
-                        "mirror_horizontal": mirror_now,
-                        "work_mode": work_mode_now,
-                        "tracked_objects": tracked_objects,
-                        "tracked_label_box": list(label_box) if (target_locked and label_box is not None) else None,
-                        "config_version": roi_ver,
-                        "live_stream_url": "/api/camera/stream",
-                        "live_crop_url": "/api/camera/stream_crop",
-                        "updated_at_utc": _utc_now(),
                     }
                 )
                 self._raw_frame_state = dict(self._state)
 
-                # Queue transition BEFORE HUD rendering so HUD errors or transient DB failures never lose transitions (BE-11).
-                if changed and self._on_cycle_update is not None:
-                    event_id = uuid.uuid4().hex
-                    queued_snapshot = dict(self._state)
-                    queued_snapshot["transition_event_id"] = event_id
-                    self._pending_transitions.append(
-                        {
-                            "event_id": event_id,
-                            "snapshot": queued_snapshot,
-                            "prev_fsm": prev_fsm,
-                            "frame_bgr": frame.copy(),
-                        }
-                    )
+                # Queue transition BEFORE HUD rendering with non-evicting overflow protection (BE-11, R2-05, R2-07).
+                if changed and self._on_cycle_update is not None and not self._persistence_overflow_fault:
+                    if len(self._pending_transitions) >= self._max_pending_transitions:
+                        self._persistence_overflow_fault = True
+                        self._state["fsm_state"] = "FAULT"
+                        self._state["outcome"] = "FAULT"
+                        self._state["result_reason"] = "PERSISTENCE_QUEUE_OVERFLOW"
+                        self._state["view_valid"] = False
+                        if "PERSISTENCE_QUEUE_OVERFLOW" not in self._state["view_valid_reasons"]:
+                            self._state["view_valid_reasons"] = [*self._state["view_valid_reasons"], "PERSISTENCE_QUEUE_OVERFLOW"]
+                        self._raw_frame_state = dict(self._state)
+                        logger.error(
+                            "Pending transition queue full (%d); refusing new transitions until persistence recovers",
+                            self._max_pending_transitions,
+                        )
+                    else:
+                        event_id = uuid.uuid4().hex
+                        queued_snapshot = dict(self._state)
+                        queued_snapshot["transition_event_id"] = event_id
+                        needs_evidence = queued_snapshot.get("outcome") == "ALARM"
+                        self._pending_transitions.append(
+                            {
+                                "event_id": event_id,
+                                "snapshot": queued_snapshot,
+                                "prev_fsm": prev_fsm,
+                                "needs_evidence": needs_evidence,
+                                "frame_bgr": frame.copy() if needs_evidence else None,
+                                "evidence_jpeg": None,
+                            }
+                        )
+                        queued_event_id = event_id
+                        queued_needs_evidence = needs_evidence
             else:
-                self._raw_frame_state = dict(self._state)
+                # Simulation override freezes displayed `_state`, but `_raw_frame_state` stays synced with `_raw_frame` (R2-09).
+                self._raw_frame_state = {**self._state, **frame_meta}
 
             hud_bare_violation = bool(bare_hand_touching_part or self._latched_reason == "BARE_HAND_VIOLATION")
             hud_alarm_latched = self._alarm_latched
 
-        # HUD rendering is isolated from transition persistence (BE-11).
+        # HUD rendering is isolated from transition persistence (BE-11, R2-07, R2-31).
         try:
             hud_bytes, crop_bytes, raw_crop = self._draw_hud(
                 frame,
@@ -1804,53 +2016,70 @@ class LiveCameraEngine:
                 self._hud_jpeg = hud_bytes
                 self._crop_jpeg = crop_bytes
                 self._last_tracked_crop = raw_crop
-                self._frame_seq += 1
+                self._hud_seq += 1
+                self._crop_seq += 1
+                self._frame_seq = self._hud_seq
+                if queued_event_id is not None and queued_needs_evidence and hud_bytes:
+                    for q_item in self._pending_transitions:
+                        if q_item["event_id"] == queued_event_id:
+                            q_item["evidence_jpeg"] = hud_bytes
+                            q_item["frame_bgr"] = None
+                            break
                 self._frame_cond.notify_all()
         except Exception as exc:
-            logger.warning("HUD rendering failed; retaining transition queue and raw frame: %s", exc)
+            logger.warning("HUD rendering failed; retaining transition queue and clearing stale crop: %s", exc)
             ok_fb, buf_fb = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            fb_bytes = bytes(buf_fb) if ok_fb else None
             with self._frame_cond:
-                if ok_fb:
-                    self._hud_jpeg = bytes(buf_fb)
-                self._frame_seq += 1
+                if fb_bytes:
+                    self._hud_jpeg = fb_bytes
+                    self._hud_seq += 1
+                    self._frame_seq = self._hud_seq
+                    if queued_event_id is not None and queued_needs_evidence:
+                        for q_item in self._pending_transitions:
+                            if q_item["event_id"] == queued_event_id:
+                                q_item["evidence_jpeg"] = fb_bytes
+                                q_item["frame_bgr"] = None
+                                break
+                # Do NOT advance _crop_seq or serve an old crop on HUD failure (R2-31).
+                self._crop_jpeg = None
                 self._frame_cond.notify_all()
 
         self._flush_pending_transitions()
         return True
 
     def _loop(self, stop_event: threading.Event) -> None:
-        while not stop_event.is_set():
-            cap = cv2.VideoCapture(self.device_index, cv2.CAP_DSHOW)
-            if not cap or not cap.isOpened():
-                with self._frame_cond:
-                    self.camera_online = False
-                    if time.monotonic() >= self.simulation_override_until:
-                        self._state["camera_status"] = "NOT_CONNECTED"
-                        self._state["view_valid"] = False
-                        self._state["view_valid_reasons"] = ["CAMERA_NOT_CONNECTED"]
-                        self._state["updated_at_utc"] = _utc_now()
-                    self._frame_cond.notify_all()
-                stop_event.wait(1.5)
-                continue
+        try:
+            while not stop_event.is_set():
+                cap = cv2.VideoCapture(self.device_index, cv2.CAP_DSHOW)
+                if not cap or not cap.isOpened():
+                    self._mark_camera_unavailable("CAMERA_NOT_CONNECTED")
+                    stop_event.wait(1.5)
+                    continue
 
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-            cap.set(cv2.CAP_PROP_FPS, 30)
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
 
-            try:
-                while not stop_event.is_set():
-                    ok, frame = cap.read()
-                    capture_ts = time.monotonic()
-                    if stop_event.is_set():
-                        break
-                    if not ok or frame is None or frame.size == 0:
-                        break
-                    self._process_frame(frame, capture_ts, stop_event=stop_event)
-                    stop_event.wait(0.001)
-            except Exception as exc:
-                logger.warning("Live camera capture loop error; reopening capture: %s", exc)
-            finally:
-                cap.release()
-            if not stop_event.is_set():
-                stop_event.wait(0.5)
+                try:
+                    while not stop_event.is_set():
+                        ok, frame = cap.read()
+                        capture_ts = time.monotonic()
+                        if stop_event.is_set():
+                            break
+                        if not ok or frame is None or frame.size == 0:
+                            # Mark camera & view unavailable immediately when cap.read() stops producing frames (R2-10).
+                            self._mark_camera_unavailable("CAMERA_FEED_LOST")
+                            break
+                        self._process_frame(frame, capture_ts, stop_event=stop_event)
+                        stop_event.wait(0.001)
+                except Exception as exc:
+                    logger.warning("Live camera capture loop error; reopening capture: %s", exc)
+                    self._mark_camera_unavailable("CAMERA_FEED_LOST")
+                finally:
+                    cap.release()
+                if not stop_event.is_set():
+                    stop_event.wait(0.5)
+        finally:
+            self._mark_camera_unavailable("CAMERA_NOT_CONNECTED")

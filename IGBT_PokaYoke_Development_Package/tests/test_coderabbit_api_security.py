@@ -2,18 +2,22 @@
 from __future__ import annotations
 
 import asyncio
+import collections
+import contextlib
 import hashlib
 import inspect
 import json
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import cv2
+import httpx
 import numpy as np
 from fastapi.testclient import TestClient
 
@@ -38,8 +42,12 @@ def _make_png_bytes(color_bgr: tuple[int, int, int] = (40, 160, 90), width: int 
 
 class CodeRabbitApiSecurityTests(unittest.TestCase):
     def setUp(self) -> None:
+        # R2-25: Register addCleanup immediately as each resource/state changes so
+        # partial setup failures still restore every acquired resource cleanly.
         self._temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self._env_backup = {
+        self.addCleanup(self._temp_dir.cleanup)
+
+        env_backup = {
             key: os.environ.get(key)
             for key in (
                 "IGBT_DATA_DIR",
@@ -49,6 +57,15 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
                 "IGBT_ENABLE_LIVE_CAMERA",
             )
         }
+
+        def _restore_env() -> None:
+            for key, value in env_backup.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.addCleanup(_restore_env)
         os.environ["IGBT_DATA_DIR"] = self._temp_dir.name
         os.environ["IGBT_ADMIN_TOKEN"] = "static-admin-secret-xyz"
         os.environ["IGBT_STATION_TOKEN"] = "static-station-secret-xyz"
@@ -56,8 +73,18 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
         os.environ["IGBT_ENABLE_LIVE_CAMERA"] = "0"
 
         ui_app._clear_engineer_sessions()
+        self.addCleanup(ui_app._clear_engineer_sessions)
+
+        def _clear_purge_caches() -> None:
+            with ui_app._EVIDENCE_IO_LOCK:
+                db_key = (Path(self._temp_dir.name) / "station.sqlite3").resolve()
+                ui_app._PURGE_CUTOFF_MONOTONIC_BY_DB.pop(db_key, None)
+                ui_app._DELETED_CYCLES_BY_DB.pop(db_key, None)
+
+        self.addCleanup(_clear_purge_caches)
+
         with ui_app.LIVE_CAMERA._lock:
-            self._cam_backup = {
+            cam_backup = {
                 "camera_online": ui_app.LIVE_CAMERA.camera_online,
                 "_running": ui_app.LIVE_CAMERA._running,
                 "simulation_override_until": ui_app.LIVE_CAMERA.simulation_override_until,
@@ -77,6 +104,32 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
                 "_ort_session": ui_app.LIVE_CAMERA._ort_session,
                 "_state": dict(ui_app.LIVE_CAMERA._state),
             }
+
+            def _restore_camera() -> None:
+                with ui_app.LIVE_CAMERA._lock:
+                    ui_app.LIVE_CAMERA.camera_online = cam_backup["camera_online"]
+                    ui_app.LIVE_CAMERA._running = cam_backup["_running"]
+                    ui_app.LIVE_CAMERA.simulation_override_until = cam_backup["simulation_override_until"]
+                    ui_app.LIVE_CAMERA.work_mode = cam_backup["work_mode"]
+                    ui_app.LIVE_CAMERA.mirror_horizontal = cam_backup["mirror_horizontal"]
+                    ui_app.LIVE_CAMERA._alarm_latched = cam_backup["_alarm_latched"]
+                    ui_app.LIVE_CAMERA._latched_reason = cam_backup["_latched_reason"]
+                    ui_app.LIVE_CAMERA._raw_frame = cam_backup["_raw_frame"]
+                    if hasattr(ui_app.LIVE_CAMERA, "_raw_frame_state"):
+                        ui_app.LIVE_CAMERA._raw_frame_state = cam_backup["_raw_frame_state"]
+                    if hasattr(ui_app.LIVE_CAMERA, "_raw_frame_label_box"):
+                        ui_app.LIVE_CAMERA._raw_frame_label_box = cam_backup["_raw_frame_label_box"]
+                    if hasattr(ui_app.LIVE_CAMERA, "_frame_seq"):
+                        ui_app.LIVE_CAMERA._frame_seq = cam_backup["_frame_seq"]
+                    ui_app.LIVE_CAMERA._hud_jpeg = cam_backup["_hud_jpeg"]
+                    ui_app.LIVE_CAMERA._crop_jpeg = cam_backup["_crop_jpeg"]
+                    ui_app.LIVE_CAMERA._tracked_label_box = cam_backup["_tracked_label_box"]
+                    ui_app.LIVE_CAMERA._last_tracked_crop = cam_backup["_last_tracked_crop"]
+                    ui_app.LIVE_CAMERA._onnx_model_version = cam_backup["_onnx_model_version"]
+                    ui_app.LIVE_CAMERA._ort_session = cam_backup["_ort_session"]
+                    ui_app.LIVE_CAMERA._state = dict(cam_backup["_state"])
+
+            self.addCleanup(_restore_camera)
             ui_app.LIVE_CAMERA.camera_online = False
             ui_app.LIVE_CAMERA._running = False
             ui_app.LIVE_CAMERA.simulation_override_until = 0.0
@@ -94,39 +147,7 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
 
         ui_app.initialize_database()
         self.client = TestClient(ui_app.app, base_url="http://127.0.0.1:8765")
-
-    def tearDown(self) -> None:
-        self.client.close()
-        ui_app._clear_engineer_sessions()
-        with ui_app.LIVE_CAMERA._lock:
-            ui_app.LIVE_CAMERA.camera_online = self._cam_backup["camera_online"]
-            ui_app.LIVE_CAMERA._running = self._cam_backup["_running"]
-            ui_app.LIVE_CAMERA.simulation_override_until = self._cam_backup["simulation_override_until"]
-            ui_app.LIVE_CAMERA.work_mode = self._cam_backup["work_mode"]
-            ui_app.LIVE_CAMERA.mirror_horizontal = self._cam_backup["mirror_horizontal"]
-            ui_app.LIVE_CAMERA._alarm_latched = self._cam_backup["_alarm_latched"]
-            ui_app.LIVE_CAMERA._latched_reason = self._cam_backup["_latched_reason"]
-            ui_app.LIVE_CAMERA._raw_frame = self._cam_backup["_raw_frame"]
-            if hasattr(ui_app.LIVE_CAMERA, "_raw_frame_state"):
-                ui_app.LIVE_CAMERA._raw_frame_state = self._cam_backup["_raw_frame_state"]
-            if hasattr(ui_app.LIVE_CAMERA, "_raw_frame_label_box"):
-                ui_app.LIVE_CAMERA._raw_frame_label_box = self._cam_backup["_raw_frame_label_box"]
-            if hasattr(ui_app.LIVE_CAMERA, "_frame_seq"):
-                ui_app.LIVE_CAMERA._frame_seq = self._cam_backup["_frame_seq"]
-            ui_app.LIVE_CAMERA._hud_jpeg = self._cam_backup["_hud_jpeg"]
-            ui_app.LIVE_CAMERA._crop_jpeg = self._cam_backup["_crop_jpeg"]
-            ui_app.LIVE_CAMERA._tracked_label_box = self._cam_backup["_tracked_label_box"]
-            ui_app.LIVE_CAMERA._last_tracked_crop = self._cam_backup["_last_tracked_crop"]
-            ui_app.LIVE_CAMERA._onnx_model_version = self._cam_backup["_onnx_model_version"]
-            ui_app.LIVE_CAMERA._ort_session = self._cam_backup["_ort_session"]
-            ui_app.LIVE_CAMERA._state = dict(self._cam_backup["_state"])
-
-        for key, value in self._env_backup.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-        self._temp_dir.cleanup()
+        self.addCleanup(self.client.close)
 
     def _mint_via_api(self, passcode: str = "static-admin-secret-xyz") -> str:
         res = self.client.post("/api/auth/verify", json={"passcode": passcode})
@@ -206,6 +227,36 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
         (bad_json_dir / "metrics.json").write_text("{not-valid-json", encoding="utf-8")
         os.utime(bad_json_onnx, (now - 100, now - 100))
 
+        # 6. R2-19: Missing metrics.json entirely (must NOT self-verify using own digest)
+        no_meta_dir = runs_root / "mnetv3_v6_no_metrics"
+        no_meta_dir.mkdir(parents=True)
+        no_meta_onnx = no_meta_dir / "label_classifier.onnx"
+        no_meta_onnx.write_bytes(b"NO_METRICS_FILE")
+        os.utime(no_meta_onnx, (now - 80, now - 80))
+
+        # 7. R2-19: metrics.json present but missing affirmative parity key
+        no_parity_dir = runs_root / "mnetv3_v7_missing_parity"
+        no_parity_dir.mkdir(parents=True)
+        no_parity_bytes = b"MISSING_PARITY_FLAG"
+        no_parity_onnx = no_parity_dir / "label_classifier.onnx"
+        no_parity_onnx.write_bytes(no_parity_bytes)
+        (no_parity_dir / "metrics.json").write_text(
+            json.dumps({"input_size": 96, "onnx_sha256": hashlib.sha256(no_parity_bytes).hexdigest()}),
+            encoding="utf-8",
+        )
+        os.utime(no_parity_onnx, (now - 60, now - 60))
+
+        # 8. R2-19: metrics.json has onnx_parity_ok=True but missing recorded onnx_sha256
+        no_sha_dir = runs_root / "mnetv3_v8_missing_sha"
+        no_sha_dir.mkdir(parents=True)
+        no_sha_onnx = no_sha_dir / "label_classifier.onnx"
+        no_sha_onnx.write_bytes(b"MISSING_SHA_RECORD")
+        (no_sha_dir / "metrics.json").write_text(
+            json.dumps({"input_size": 96, "onnx_parity_ok": True}),
+            encoding="utf-8",
+        )
+        os.utime(no_sha_onnx, (now - 40, now - 40))
+
         attempted: list[str] = []
 
         def fake_load(onnx_path, *, model_version, sha256=None, input_size=96, expected_sha256=None):
@@ -217,7 +268,7 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
         with mock.patch.object(ui_app.LIVE_CAMERA, "load_onnx_model", side_effect=fake_load):
             ui_app._autoload_latest_onnx_model()
 
-        # Only v2 (which passed metrics/sha checks then failed load) and v1 (loaded!) should be attempted
+        # Only v2 (which passed affirmative parity + sha checks then failed load) and v1 (loaded!) should be attempted
         self.assertEqual(attempted, ["mnetv3_v2_corrupt_onnx", "mnetv3_v1_good"])
 
     # ------------------------------------------------------------------
@@ -391,23 +442,35 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
         self.assertEqual(res3.json()["outcome"], "PASS")
 
     # ------------------------------------------------------------------
-    # BE-34: Async disconnect-aware bounded MJPEG video generators
+    # BE-34 / R2-26: Async disconnect-aware bounded MJPEG video generators
     # ------------------------------------------------------------------
     def test_be34_mjpeg_streams_are_async_disconnect_aware_and_bounded(self) -> None:
         self.assertTrue(inspect.iscoroutinefunction(ui_app.camera_mjpeg_stream))
         self.assertTrue(inspect.iscoroutinefunction(ui_app.camera_crop_mjpeg_stream))
 
-        # 1. With no frame cached and camera offline, both endpoints exit cleanly within bounded time
+        async def _consume_http_stream_with_deadline(path: str, deadline_s: float = 1.5) -> tuple[int, bytes]:
+            transport = httpx.ASGITransport(app=ui_app.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8765") as ac:
+                async def _read_all() -> tuple[int, bytes]:
+                    async with ac.stream("GET", path) as resp:
+                        chunks: list[bytes] = []
+                        async for chunk in resp.aiter_bytes():
+                            chunks.append(chunk)
+                        return resp.status_code, b"".join(chunks)
+
+                return await asyncio.wait_for(_read_all(), timeout=deadline_s)
+
+        # 1. With no frame cached and camera offline, both endpoints exit cleanly before independent deadline
         t0 = time.monotonic()
         with mock.patch.object(ui_app, "STREAM_OFFLINE_NO_FRAME_TIMEOUT_S", 0.08):
-            r1 = self.client.get("/api/camera/stream")
-            r2 = self.client.get("/api/camera/stream_crop")
+            s1, _ = asyncio.run(_consume_http_stream_with_deadline("/api/camera/stream", deadline_s=1.5))
+            s2, _ = asyncio.run(_consume_http_stream_with_deadline("/api/camera/stream_crop", deadline_s=1.5))
         elapsed = time.monotonic() - t0
-        self.assertEqual(r1.status_code, 200)
-        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(s1, 200)
+        self.assertEqual(s2, 200)
         self.assertLess(elapsed, 1.5)
 
-        # 2. Disconnect exits immediately even while camera is marked active with no frame cached
+        # 2. Disconnect exits immediately under independent deadline even while camera is marked active
         class _FakeDisconnectRequest:
             def __init__(self) -> None:
                 self.checks = 0
@@ -420,41 +483,50 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
             req = _FakeDisconnectRequest()
             gen = ui_app._mjpeg_stream_generator(req, lambda: None, 0.01, "hud")
             chunks: list[bytes] = []
-            async for chunk in gen:
-                chunks.append(chunk)
+            try:
+                async for chunk in gen:
+                    chunks.append(chunk)
+            finally:
+                await gen.aclose()
             return chunks
 
         with ui_app.LIVE_CAMERA._lock:
             ui_app.LIVE_CAMERA.camera_online = True
         t1 = time.monotonic()
-        chunks = asyncio.run(_consume_until_disconnect())
+        chunks = asyncio.run(asyncio.wait_for(_consume_until_disconnect(), timeout=1.0))
         self.assertEqual(chunks, [])
         self.assertLess(time.monotonic() - t1, 0.5)
 
-        # 3. Cached frame yields valid multipart JPEG frame
+        # 3. Cached frame yields valid multipart JPEG frame within independent deadline
         sample_jpg = _make_jpeg_bytes()
         with ui_app.LIVE_CAMERA._lock:
             ui_app.LIVE_CAMERA.camera_online = False
             ui_app.LIVE_CAMERA._running = False
             ui_app.LIVE_CAMERA._hud_jpeg = sample_jpg
-        r3 = self.client.get("/api/camera/stream")
-        self.assertEqual(r3.status_code, 200)
-        self.assertIn(b"Content-Type: image/jpeg", r3.content)
-        self.assertIn(sample_jpg, r3.content)
+        s3, body3 = asyncio.run(_consume_http_stream_with_deadline("/api/camera/stream", deadline_s=1.5))
+        self.assertEqual(s3, 200)
+        self.assertIn(b"Content-Type: image/jpeg", body3)
+        self.assertIn(sample_jpg, body3)
 
     # ------------------------------------------------------------------
-    # BE-35: Atomic capture pairs image + crop + metadata from ONE frame
+    # BE-35 / R2-37: Atomic capture pairs image + crop + metadata from ONE frame
     # ------------------------------------------------------------------
     def test_be35_atomic_capture_uses_single_frame_for_image_crop_and_metadata(self) -> None:
-        frame1 = np.full((180, 320, 3), (20, 210, 30), dtype=np.uint8)  # distinct green
-        frame2 = np.full((180, 320, 3), (20, 25, 220), dtype=np.uint8)  # distinct red
+        # Frame 101: green background with a distinctive bright BLUE marker ONLY in top-left box (0.05..0.45)
+        frame1 = np.full((180, 320, 3), (20, 210, 30), dtype=np.uint8)
+        frame1[9:81, 16:144] = (235, 30, 20)  # bright blue marker exclusively inside Frame 101's tracked box
+        # Frame 202: red background with a completely different tracked box (0.55..0.95)
+        frame2 = np.full((180, 320, 3), (20, 25, 220), dtype=np.uint8)
+
+        frame1_box = (0.05, 0.05, 0.45, 0.45)
+        frame2_box = (0.55, 0.55, 0.95, 0.95)
 
         def reset_to_frame1() -> None:
             with ui_app.LIVE_CAMERA._lock:
                 ui_app.LIVE_CAMERA._raw_frame = frame1.copy()
-                ui_app.LIVE_CAMERA._tracked_label_box = (0.2, 0.2, 0.8, 0.8)
+                ui_app.LIVE_CAMERA._tracked_label_box = frame1_box
                 if hasattr(ui_app.LIVE_CAMERA, "_raw_frame_label_box"):
-                    ui_app.LIVE_CAMERA._raw_frame_label_box = (0.2, 0.2, 0.8, 0.8)
+                    ui_app.LIVE_CAMERA._raw_frame_label_box = frame1_box
                 ui_app.LIVE_CAMERA._state["frame_id"] = 101
                 ui_app.LIVE_CAMERA._state["capture_monotonic_s"] = 111.5
                 ui_app.LIVE_CAMERA._state["cycle_id"] = "LIVE_ATOMIC_101"
@@ -464,9 +536,12 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
         orig_encode = ui_app._encode_bgr_jpeg
 
         def racing_encode(frame_bgr: np.ndarray, quality: int = 92) -> bytes | None:
-            # Simulate camera thread publishing Frame #2 right while JPEG encodes outside lock
+            # Simulate camera thread publishing Frame #2 AND a different tracked box right while JPEG encodes
             with ui_app.LIVE_CAMERA._lock:
                 ui_app.LIVE_CAMERA._raw_frame = frame2.copy()
+                ui_app.LIVE_CAMERA._tracked_label_box = frame2_box
+                if hasattr(ui_app.LIVE_CAMERA, "_raw_frame_label_box"):
+                    ui_app.LIVE_CAMERA._raw_frame_label_box = frame2_box
                 ui_app.LIVE_CAMERA._state["frame_id"] = 202
                 ui_app.LIVE_CAMERA._state["capture_monotonic_s"] = 222.5
                 ui_app.LIVE_CAMERA._state["cycle_id"] = "LIVE_ATOMIC_202"
@@ -486,25 +561,46 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
         img_bytes = self.client.get(cap_body["url"]).content
         decoded = cv2.imdecode(np.frombuffer(img_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
         self.assertIsNotNone(decoded)
-        # Green channel dominates red channel -> archived image is Frame #1 matching frame_id 101!
-        self.assertGreater(float(np.mean(decoded[:, :, 1])), 180.0)
-        self.assertLess(float(np.mean(decoded[:, :, 2])), 60.0)
+        # Bottom-right region of archived full-frame is green (Frame 101), not red (Frame 202)
+        self.assertGreater(float(np.mean(decoded[100:170, 180:300, 1])), 180.0)
+        self.assertLess(float(np.mean(decoded[100:170, 180:300, 2])), 60.0)
 
-        # B. /api/dataset/capture
+        # B. /api/dataset/capture (R2-37 tracked-crop case: box omitted -> MUST use Frame 101's tracked box with blue marker!)
         reset_to_frame1()
         with mock.patch.object(ui_app, "_encode_bgr_jpeg", side_effect=racing_encode):
-            ds_res = self.client.post(
+            ds_tracked = self.client.post(
                 "/api/dataset/capture",
-                json={"label": "complete", "pipe_color": "yellow", "box": [0.1, 0.1, 0.6, 0.6]},
+                json={"label": "complete", "pipe_color": "yellow"},
             )
-        self.assertEqual(ds_res.status_code, 200, ds_res.text)
-        ev_list = self.client.get("/api/evidence?limit=5").json()
-        latest_ds_ev = next(e for e in ev_list if e["metadata"].get("sample_id") == ds_res.json()["sample_id"])
-        self.assertEqual(latest_ds_ev["frame_id"], 101)
-        self.assertEqual(latest_ds_ev["capture_monotonic_s"], 111.5)
-        ds_crop_bytes = self.client.get(ds_res.json()["image_url"]).content
-        ds_crop = cv2.imdecode(np.frombuffer(ds_crop_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-        self.assertGreater(float(np.mean(ds_crop[:, :, 1])), 180.0)
+        self.assertEqual(ds_tracked.status_code, 200, ds_tracked.text)
+        self.assertEqual(ds_tracked.json()["box_xyxy"], "0.0500,0.0500,0.4500,0.4500")
+        ev_list = self.client.get("/api/evidence?limit=10").json()
+        tracked_ev = next(e for e in ev_list if e["metadata"].get("sample_id") == ds_tracked.json()["sample_id"])
+        self.assertEqual(tracked_ev["frame_id"], 101)
+        self.assertEqual(tracked_ev["capture_monotonic_s"], 111.5)
+        tracked_crop_bytes = self.client.get(ds_tracked.json()["image_url"]).content
+        tracked_crop = cv2.imdecode(np.frombuffer(tracked_crop_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        self.assertIsNotNone(tracked_crop)
+        # Blue channel dominates ONLY in Frame 101's tracked box (0.05..0.45)
+        self.assertGreater(float(np.mean(tracked_crop[:, :, 0])), 190.0)
+        self.assertLess(float(np.mean(tracked_crop[:, :, 1])), 70.0)
+        self.assertLess(float(np.mean(tracked_crop[:, :, 2])), 60.0)
+
+        # C. /api/dataset/capture explicit-box control (bottom-right of Frame 101 -> green, NOT Frame 202 red or blue marker)
+        reset_to_frame1()
+        with mock.patch.object(ui_app, "_encode_bgr_jpeg", side_effect=racing_encode):
+            ds_explicit = self.client.post(
+                "/api/dataset/capture",
+                json={"label": "complete", "pipe_color": "yellow", "box": [0.55, 0.55, 0.95, 0.95]},
+            )
+        self.assertEqual(ds_explicit.status_code, 200, ds_explicit.text)
+        self.assertEqual(ds_explicit.json()["box_xyxy"], "0.5500,0.5500,0.9500,0.9500")
+        explicit_crop_bytes = self.client.get(ds_explicit.json()["image_url"]).content
+        explicit_crop = cv2.imdecode(np.frombuffer(explicit_crop_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        self.assertIsNotNone(explicit_crop)
+        self.assertGreater(float(np.mean(explicit_crop[:, :, 1])), 180.0)
+        self.assertLess(float(np.mean(explicit_crop[:, :, 0])), 60.0)
+        self.assertLess(float(np.mean(explicit_crop[:, :, 2])), 60.0)
 
     # ------------------------------------------------------------------
     # BE-36: Live alarm reset through simulation endpoint requires auth
@@ -591,11 +687,11 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
         self.assertNotIn(sim_cycle_id, remaining)
         self.assertEqual(self.client.get(f"/api/evidence/{real_ev_id}/file").status_code, 200)
 
-        # 4. Schema migration check on legacy DB lacking cycles.source column
+        # 4. R2-20 & R2-38: Schema migration & backfill on legacy DB lacking cycles.source column
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as legacy_dir:
             legacy_db = Path(legacy_dir) / "station.sqlite3"
-            with sqlite3.connect(legacy_db) as conn:
-                conn.execute(
+            with contextlib.closing(sqlite3.connect(legacy_db)) as conn, conn:
+                conn.executescript(
                     """
                     CREATE TABLE cycles (
                         cycle_id TEXT PRIMARY KEY,
@@ -609,24 +705,100 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
                         model_version TEXT,
                         config_version TEXT,
                         fsm_state TEXT NOT NULL DEFAULT 'WAIT_PART'
-                    )
+                    );
+                    CREATE TABLE events (
+                        event_id TEXT PRIMARY KEY,
+                        cycle_id TEXT,
+                        created_at_utc TEXT NOT NULL,
+                        capture_monotonic_s REAL,
+                        frame_id INTEGER,
+                        event_type TEXT NOT NULL,
+                        state_before TEXT,
+                        state_after TEXT,
+                        outcome TEXT,
+                        reason TEXT,
+                        payload_json TEXT NOT NULL
+                    );
+                    CREATE TABLE evidence (
+                        evidence_id TEXT PRIMARY KEY,
+                        cycle_id TEXT NOT NULL,
+                        event_id TEXT NOT NULL,
+                        created_at_utc TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        file_relpath TEXT NOT NULL UNIQUE,
+                        mime_type TEXT NOT NULL,
+                        sha256 TEXT NOT NULL,
+                        frame_id INTEGER,
+                        capture_monotonic_s REAL,
+                        metadata_json TEXT NOT NULL
+                    );
                     """
                 )
+                ts = "2026-01-01T00:00:00.000Z"
+                # (a) Ambiguous legacy row with no events/evidence -> must stay 'station'
                 conn.execute(
-                    "INSERT INTO cycles(cycle_id,created_at_utc,updated_at_utc,final_outcome,fsm_state) VALUES('CYC_LEGACY_01','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','PASS','PASS')"
+                    "INSERT INTO cycles(cycle_id,created_at_utc,updated_at_utc,final_outcome,fsm_state) VALUES('CYC_LEGACY_AMBIG',?,?,'PASS','PASS')",
+                    (ts, ts),
+                )
+                # (b) Legacy A-pass simulation identified by SCENARIO_A_PASS evidence metadata -> 'simulated'
+                conn.execute(
+                    "INSERT INTO cycles(cycle_id,created_at_utc,updated_at_utc,final_outcome,fsm_state) VALUES('CYC_A_LEGACY',?,?,'PASS','PASS')",
+                    (ts, ts),
+                )
+                conn.execute(
+                    "INSERT INTO events VALUES('ev_sim_a','CYC_A_LEGACY',?,1000.5,5,'A_CROSSED_OUT','INSPECTING','PASS','PASS','A_CROSSED_OUT',?)",
+                    (ts, json.dumps({"record_type": "STATE_TRANSITION", "reason": "A_CROSSED_OUT"})),
+                )
+                conn.execute(
+                    "INSERT INTO evidence VALUES('img_sim_a','CYC_A_LEGACY','ev_sim_a',?,'A','evidence/CYC_A_LEGACY/a.jpg','image/jpeg','0',5,1000.5,?)",
+                    (ts, json.dumps({"operation_event": "SCENARIO_A_PASS"})),
+                )
+                # (c) Legacy C-pass simulation with STATE_TRANSITION-only events (evidence already removed) -> 'simulated'
+                conn.execute(
+                    "INSERT INTO cycles(cycle_id,created_at_utc,updated_at_utc,final_outcome,fsm_state) VALUES('CYC_C_LEGACY',?,?,'PASS','PASS')",
+                    (ts, ts),
+                )
+                conn.execute(
+                    "INSERT INTO events VALUES('ev_sim_c','CYC_C_LEGACY',?,1001.2,12,'C_REMOVED','VERIFY_C_ABSENT','PASS','PASS','C_REMOVED',?)",
+                    (ts, json.dumps({"record_type": "STATE_TRANSITION", "reason": "C_REMOVED"})),
+                )
+                # (d) Legacy real station cycle with CYC_ prefix and RuntimeSnapshot event -> must stay 'station'
+                conn.execute(
+                    "INSERT INTO cycles(cycle_id,created_at_utc,updated_at_utc,final_outcome,fsm_state) VALUES('CYC_STATION_LEGACY',?,?,'PASS','PASS')",
+                    (ts, ts),
+                )
+                conn.execute(
+                    "INSERT INTO events VALUES('ev_st','CYC_STATION_LEGACY',?,50.0,3,'STATE_CHANGE','INSPECTING','PASS','PASS','A_CROSSED_OUT',?)",
+                    (ts, json.dumps({"mode": "shadow", "camera_status": "ONLINE", "outcome": "PASS"})),
+                )
+                # (e) Legacy live cycle -> 'live'
+                conn.execute(
+                    "INSERT INTO cycles(cycle_id,created_at_utc,updated_at_utc,final_outcome,fsm_state) VALUES('LIVE_LEGACY_01',?,?,'PASS','PASS')",
+                    (ts, ts),
+                )
+                conn.execute(
+                    "INSERT INTO events VALUES('ev_live','LIVE_LEGACY_01',?,10.0,1,'LIVE_CAPTURE','INSPECTING','INSPECTING','WAITING','manual',?)",
+                    (ts, json.dumps({"operation_event": "LIVE_CAMERA_MANUAL_CAPTURE"})),
                 )
             old_dir = os.environ["IGBT_DATA_DIR"]
             os.environ["IGBT_DATA_DIR"] = legacy_dir
             try:
                 ui_app.initialize_database()
                 with ui_app.connect_db() as db:
-                    row = db.execute("SELECT source FROM cycles WHERE cycle_id='CYC_LEGACY_01'").fetchone()
-                    self.assertEqual(row["source"], "station")
+                    sources = {
+                        r["cycle_id"]: r["source"]
+                        for r in db.execute("SELECT cycle_id, source FROM cycles").fetchall()
+                    }
+                self.assertEqual(sources["CYC_A_LEGACY"], "simulated")
+                self.assertEqual(sources["CYC_C_LEGACY"], "simulated")
+                self.assertEqual(sources["CYC_STATION_LEGACY"], "station")
+                self.assertEqual(sources["CYC_LEGACY_AMBIG"], "station")
+                self.assertEqual(sources["LIVE_LEGACY_01"], "live")
             finally:
                 os.environ["IGBT_DATA_DIR"] = old_dir
 
     # ------------------------------------------------------------------
-    # BE-38: Purge all does not delete files created after purge transaction
+    # BE-38 / R2-39: Purge all does not delete files created after purge transaction
     # ------------------------------------------------------------------
     def test_be38_purge_all_preserves_files_created_after_transaction(self) -> None:
         self.assertEqual(self.client.post("/api/runtime/simulate/a_pass").status_code, 200)
@@ -637,10 +809,15 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
 
         post_tx_file = evidence_root / "NEW_AFTER_TX" / "fresh_capture.jpg"
         orig_unlink = ui_app._safe_unlink_evidence
+        created_once = False
+        targeted_relpaths: list[str] = []
 
         def unlink_then_simulate_concurrent_new_file(data_root, ev_root, relpath):
+            nonlocal created_once
+            targeted_relpaths.append(str(relpath))
             result = orig_unlink(data_root, ev_root, relpath)
-            if not post_tx_file.exists():
+            if not created_once:
+                created_once = True
                 post_tx_file.parent.mkdir(parents=True, exist_ok=True)
                 post_tx_file.write_bytes(_make_jpeg_bytes())
             return result
@@ -653,6 +830,8 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
                 json={"scope": "all", "confirm": True},
             )
         self.assertEqual(purge.status_code, 200)
+        self.assertTrue(created_once)
+        self.assertFalse(any("fresh_capture.jpg" in p for p in targeted_relpaths))
         self.assertFalse(orphan_file.exists())
         self.assertTrue(post_tx_file.is_file(), "Post-transaction evidence file must NEVER be swept")
 
@@ -808,11 +987,15 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
         self.assertEqual(up.status_code, 200)
         sample_id = up.json()["sample_id"]
 
-        # Unauthenticated PATCH / DELETE / clear must fail with 401
+        # Unauthenticated PATCH / DELETE / clear must fail with 401 and leave stored sample unchanged (R2-40)
         self.assertEqual(
             self.client.patch(f"/api/dataset/sample/{sample_id}", json={"label": "covered"}).status_code,
             401,
         )
+        samples_after_denied = self.client.get("/api/dataset/samples").json()
+        denied_sample = next(s for s in samples_after_denied if s["sample_id"] == sample_id)
+        self.assertEqual(denied_sample["label"], "complete")
+
         self.assertEqual(self.client.delete(f"/api/dataset/sample/{sample_id}").status_code, 401)
         self.assertEqual(self.client.post("/api/dataset/clear").status_code, 401)
 
@@ -953,6 +1136,14 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
         final_frame_id = res.json()["frame_id"]
 
         events = self.client.get(f"/api/cycles/{cycle_id}/events").json()
+        # R2-41: Assert each expected transition occurs exactly once before collapsing by event_type
+        type_counts = collections.Counter(ev["event_type"] for ev in events)
+        for expected_type in ("NEW_CYCLE", "INITIAL_COMPLETE_CONFIRMED", "INSPECTION_STARTED", "A_CROSSED_OUT"):
+            self.assertEqual(
+                type_counts[expected_type],
+                1,
+                f"Expected exactly 1 {expected_type} transition, got {type_counts[expected_type]}",
+            )
         by_type = {ev["event_type"]: ev for ev in events}
 
         # Non-frame transitions must leave frame_id unset (None)
@@ -1076,7 +1267,155 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
         self.assertEqual(r_omit.status_code, 200, r_omit.text)
         self.assertEqual(r_omit.json()["box_xyxy"], "0.3000,0.3000,0.7000,0.7000")
 
-    def test_on_training_completed_refuses_failed_parity_and_returns_bool(self) -> None:
+    # ------------------------------------------------------------------
+    # R2-21: Queued live transitions cannot recreate purged/deleted cycles
+    # ------------------------------------------------------------------
+    def test_r2_21_purge_cutoff_blocks_stale_live_retries_and_allows_new_cycles(self) -> None:
+        old_mono = time.monotonic() - 2.0
+        old_utc = "2026-11-23T09:00:00.000+00:00"
+        stale_state = {
+            **ui_app.default_station_state(),
+            "camera_status": "ONLINE",
+            "view_valid": True,
+            "quality_ok": True,
+            "label_status": "crossed_out",
+            "fsm_state": "PASS",
+            "outcome": "PASS",
+            "result_reason": "A_CROSSED_OUT",
+            "cycle_id": "LIVE_STALE_PRE_PURGE",
+            "frame_id": 10,
+            "capture_monotonic_s": old_mono,
+            "updated_at_utc": old_utc,
+        }
+        self.assertTrue(ui_app._on_live_cycle_update(stale_state, "INSPECTING"))
+        self.assertEqual([c["cycle_id"] for c in self.client.get("/api/cycles").json()], ["LIVE_STALE_PRE_PURGE"])
+
+        # All-scope purge invokes discard_pending_transitions(None) and records purge cutoff
+        token = self._mint_via_api()
+        with mock.patch.object(
+            ui_app.LIVE_CAMERA,
+            "discard_pending_transitions",
+            wraps=getattr(ui_app.LIVE_CAMERA, "discard_pending_transitions", None),
+        ) as mock_discard:
+            purge = self.client.post(
+                "/api/cycles/purge",
+                headers={"X-Admin-Token": token},
+                json={"scope": "all", "confirm": True},
+            )
+        self.assertEqual(purge.status_code, 200)
+        if hasattr(ui_app.LIVE_CAMERA, "discard_pending_transitions"):
+            mock_discard.assert_called_with(None)
+        self.assertEqual(self.client.get("/api/cycles").json(), [])
+
+        # Retrying the pre-purge transition returns True (dropped) and MUST NOT recreate the cycle
+        self.assertTrue(ui_app._on_live_cycle_update(stale_state, "INSPECTING"))
+        self.assertEqual(self.client.get("/api/cycles").json(), [])
+
+        # Genuinely new cycle created after purge IS accepted and persisted
+        fresh_state = {
+            **ui_app.default_station_state(),
+            "camera_status": "ONLINE",
+            "view_valid": True,
+            "quality_ok": True,
+            "label_status": "covered",
+            "fsm_state": "PASS",
+            "outcome": "PASS",
+            "result_reason": "B_COVERED",
+            "cycle_id": "LIVE_FRESH_POST_PURGE",
+            "frame_id": 11,
+            "capture_monotonic_s": time.monotonic() + 0.05,
+            "updated_at_utc": ui_app.utc_now(),
+        }
+        self.assertTrue(ui_app._on_live_cycle_update(fresh_state, "INSPECTING"))
+        self.assertEqual([c["cycle_id"] for c in self.client.get("/api/cycles").json()], ["LIVE_FRESH_POST_PURGE"])
+
+        # Single-cycle DELETE also prevents an in-flight retry for that cycle from resurrecting it
+        del_res = self.client.delete("/api/cycles/LIVE_FRESH_POST_PURGE", headers={"X-Admin-Token": token})
+        self.assertEqual(del_res.status_code, 200)
+        self.assertTrue(ui_app._on_live_cycle_update(fresh_state, "INSPECTING"))
+        self.assertEqual(self.client.get("/api/cycles").json(), [])
+
+    # ------------------------------------------------------------------
+    # R2-22: Blocking evidence decode/persistence runs off the event loop
+    # ------------------------------------------------------------------
+    def test_r2_22_upload_evidence_runs_decode_and_persistence_in_worker_thread(self) -> None:
+        jpg = _make_jpeg_bytes()
+        worker_threads: list[int] = []
+        orig_persist = ui_app._decode_and_persist_evidence
+
+        def spy_persist(**kwargs):
+            worker_threads.append(threading.get_ident())
+            return orig_persist(**kwargs)
+
+        async def _call_async() -> tuple[int, int]:
+            loop_tid = threading.get_ident()
+            transport = httpx.ASGITransport(app=ui_app.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:8765") as ac:
+                resp = await ac.post(
+                    "/api/cycles/CYC_OFFLOOP_01/evidence/initial_label",
+                    content=jpg,
+                    headers={
+                        "Content-Type": "image/jpeg",
+                        "Content-Length": str(len(jpg)),
+                        "X-Station-Token": "static-station-secret-xyz",
+                        "X-Frame-Id": "1",
+                        "X-Camera-Metadata": '{"camera":"basler"}',
+                        "X-Captured-At-Utc": "2026-11-23T10:00:00.000Z",
+                    },
+                )
+            return loop_tid, resp.status_code
+
+        with mock.patch.object(ui_app, "_decode_and_persist_evidence", side_effect=spy_persist):
+            loop_tid, status = asyncio.run(_call_async())
+        self.assertEqual(status, 200)
+        self.assertEqual(len(worker_threads), 1)
+        self.assertNotEqual(worker_threads[0], loop_tid, "Blocking evidence I/O must run off the asyncio event loop")
+
+    # ------------------------------------------------------------------
+    # R2-23: Evidence failure after dataset commit returns committed sample
+    # ------------------------------------------------------------------
+    def test_r2_23_dataset_capture_returns_committed_sample_when_evidence_fails(self) -> None:
+        frame = np.full((180, 320, 3), (80, 140, 200), dtype=np.uint8)
+        with ui_app.LIVE_CAMERA._lock:
+            ui_app.LIVE_CAMERA._raw_frame = frame
+            ui_app.LIVE_CAMERA._tracked_label_box = (0.2, 0.2, 0.6, 0.6)
+            if hasattr(ui_app.LIVE_CAMERA, "_raw_frame_label_box"):
+                ui_app.LIVE_CAMERA._raw_frame_label_box = (0.2, 0.2, 0.6, 0.6)
+            ui_app.LIVE_CAMERA._state["frame_id"] = 21
+            ui_app.LIVE_CAMERA._state["capture_monotonic_s"] = 75.0
+            if hasattr(ui_app.LIVE_CAMERA, "_raw_frame_state"):
+                ui_app.LIVE_CAMERA._raw_frame_state = dict(ui_app.LIVE_CAMERA._state)
+
+        real_connect_db = ui_app.connect_db
+        call_count = 0
+
+        def fail_on_evidence_tx():
+            nonlocal call_count
+            call_count += 1
+            # First call is initialize_database(); fail the second call (evidence transaction after capture_sample commits).
+            if call_count >= 2:
+                raise sqlite3.OperationalError("database is locked")
+            return real_connect_db()
+
+        with mock.patch.object(ui_app, "connect_db", side_effect=fail_on_evidence_tx):
+            res = self.client.post(
+                "/api/dataset/capture",
+                json={"label": "complete", "pipe_color": "yellow", "box": [0.1, 0.1, 0.5, 0.5]},
+            )
+        self.assertEqual(res.status_code, 200, res.text)
+        body = res.json()
+        self.assertTrue(body["sample_id"])
+        self.assertFalse(body["evidence_archived"])
+        self.assertIn("EVIDENCE_ARCHIVE_FAILED", body["evidence_error"])
+        # Exactly one training sample exists and no partial evidence file was left behind
+        self.assertEqual(len(self.client.get("/api/dataset/samples").json()), 1)
+        evidence_files = list((Path(self._temp_dir.name) / "evidence").rglob("*.jpg"))
+        self.assertEqual(evidence_files, [])
+
+    # ------------------------------------------------------------------
+    # R2-24: Registration failure leaves previous active model unchanged
+    # ------------------------------------------------------------------
+    def test_on_training_completed_refuses_failed_parity_and_preserves_active_on_db_failure(self) -> None:
         onnx_file = Path(self._temp_dir.name) / "runs" / "label_classifier" / "mnet_cb" / "label_classifier.onnx"
         onnx_file.parent.mkdir(parents=True, exist_ok=True)
         raw = b"DUMMY_ONNX_MODEL"
@@ -1100,13 +1439,125 @@ class CodeRabbitApiSecurityTests(unittest.TestCase):
         self.assertFalse(ui_app._on_training_completed(base_summary))
         self.assertEqual(self.client.get("/api/models").json(), [])
 
-        # When parity ok and load succeeds -> registers model and returns True
+        # R2-24: If DB registration fails AFTER prepare_onnx_model succeeds, active model stays untouched
+        with ui_app.LIVE_CAMERA._lock:
+            ui_app.LIVE_CAMERA._onnx_model_version = "prev-active-v0"
+            ui_app.LIVE_CAMERA._state["model_version"] = "prev-active-v0"
+
         good_summary = {**base_summary, "onnx_parity_ok": True, "onnx_max_abs_diff": 1e-5}
-        with mock.patch.object(ui_app.LIVE_CAMERA, "load_onnx_model", return_value={"model_version": "mnet_cb"}):
+        fake_prepared = {"model_version": "mnet_cb", "sha256": sha, "input_size": 96, "session": object()}
+
+        def fake_commit(prepared):
+            with ui_app.LIVE_CAMERA._lock:
+                ui_app.LIVE_CAMERA._onnx_model_version = prepared["model_version"]
+                ui_app.LIVE_CAMERA._state["model_version"] = prepared["model_version"]
+            return {"model_version": prepared["model_version"]}
+
+        with (
+            mock.patch.object(ui_app.LIVE_CAMERA, "prepare_onnx_model", return_value=fake_prepared) as m_prep,
+            mock.patch.object(ui_app.LIVE_CAMERA, "commit_prepared_onnx_model", side_effect=fake_commit) as m_commit,
+            mock.patch.object(ui_app, "connect_db", side_effect=sqlite3.OperationalError("disk full")),
+        ):
+            self.assertFalse(ui_app._on_training_completed(good_summary))
+        m_prep.assert_called_once()
+        m_commit.assert_not_called()
+        self.assertEqual(ui_app.LIVE_CAMERA._onnx_model_version, "prev-active-v0")
+        self.assertEqual(ui_app.LIVE_CAMERA._state["model_version"], "prev-active-v0")
+        self.assertEqual(self.client.get("/api/models").json(), [])
+
+        # When both prepare and DB registration succeed -> commits session swap and returns True
+        with (
+            mock.patch.object(ui_app.LIVE_CAMERA, "prepare_onnx_model", return_value=fake_prepared),
+            mock.patch.object(ui_app.LIVE_CAMERA, "commit_prepared_onnx_model", side_effect=fake_commit),
+        ):
             self.assertTrue(ui_app._on_training_completed(good_summary))
         models = self.client.get("/api/models").json()
         self.assertEqual(len(models), 1)
         self.assertEqual(models[0]["model_version"], "mnet_cb")
+        self.assertEqual(ui_app.LIVE_CAMERA._onnx_model_version, "mnet_cb")
+
+    # ------------------------------------------------------------------
+    # R2-35: Partial evidence files removed on write/close failure; pre-existing untouched
+    # ------------------------------------------------------------------
+    def test_r2_35_exclusive_evidence_file_cleans_partial_write_and_preserves_existing(self) -> None:
+        ev_dir = Path(self._temp_dir.name) / "evidence" / "R235"
+        existing = ev_dir / "existing.jpg"
+        existing.parent.mkdir(parents=True, exist_ok=True)
+        existing.write_bytes(b"ORIGINAL_DATA")
+
+        # 1. Pre-existing file raises FileExistsError and remains untouched
+        with self.assertRaises(FileExistsError):
+            with ui_app._exclusive_evidence_file(existing, b"OVERWRITE_ATTEMPT"):
+                pass
+        self.assertEqual(existing.read_bytes(), b"ORIGINAL_DATA")
+
+        # 2. Write failure after exclusive open removes partial file
+        partial = ev_dir / "partial_write.jpg"
+        real_open = Path.open
+
+        class _FailingWriteStream:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def write(self, data):
+                self._inner.write(data[:4])
+                raise OSError("simulated disk full during write")
+
+            def flush(self):
+                self._inner.flush()
+
+            def close(self):
+                self._inner.close()
+
+        def failing_open(self_path, mode="r", *args, **kwargs):
+            handle = real_open(self_path, mode, *args, **kwargs)
+            if self_path == partial and mode == "xb":
+                return _FailingWriteStream(handle)
+            return handle
+
+        with mock.patch.object(Path, "open", failing_open):
+            with self.assertRaises(OSError):
+                with ui_app._exclusive_evidence_file(partial, b"PARTIAL_JPEG_DATA"):
+                    pass
+        self.assertFalse(partial.exists(), "Partial evidence file must be removed on write failure")
+
+    # ------------------------------------------------------------------
+    # R2-36: Non-scalar input_size in optional metrics.json keeps default 96
+    # ------------------------------------------------------------------
+    def test_r2_36_model_activate_handles_non_scalar_metrics_input_size(self) -> None:
+        token = self._mint_via_api()
+        runs_root = Path(self._temp_dir.name) / "runs" / "label_classifier"
+        good_bytes = b"ONNX_R236_BYTES"
+        good_sha = hashlib.sha256(good_bytes).hexdigest()
+        run_dir = runs_root / "mnetv3_r236"
+        run_dir.mkdir(parents=True)
+        (run_dir / "label_classifier.onnx").write_bytes(good_bytes)
+        (run_dir / "metrics.json").write_text(json.dumps({"input_size": [96]}), encoding="utf-8")
+
+        reg = self.client.post(
+            "/api/models",
+            headers={"X-Admin-Token": token},
+            json={
+                "model_name": "mobilenetv3-small-igbt-roi",
+                "model_version": "mnetv3_r236",
+                "sha256": good_sha,
+                "license_status": "reviewed",
+                "notes": "non-scalar input_size test",
+            },
+        )
+        self.assertEqual(reg.status_code, 200)
+        model_id = reg.json()["model_id"]
+
+        seen_sizes: list[int] = []
+
+        def fake_load(onnx_path, *, model_version, sha256=None, input_size=96, expected_sha256=None):
+            seen_sizes.append(input_size)
+            return {"model_version": model_version, "sha256": sha256, "input_size": input_size}
+
+        with mock.patch.object(ui_app.LIVE_CAMERA, "load_onnx_model", side_effect=fake_load):
+            act = self.client.post(f"/api/models/{model_id}/activate", headers={"X-Admin-Token": token})
+        self.assertEqual(act.status_code, 200, act.text)
+        self.assertEqual(seen_sizes, [96])
 
 
 if __name__ == "__main__":

@@ -73,6 +73,7 @@ interface ConfirmDialogState {
   confirmLabel: string
   tone: "warn" | "danger"
   requireCheckLabel?: string
+  requiresInventory?: boolean
   onConfirm: () => Promise<void>
 }
 
@@ -247,6 +248,13 @@ class ApiError extends Error {
   }
 }
 
+class RequestTimeoutError extends Error {
+  constructor(message = "请求超时，本机工位服务无响应") {
+    super(message)
+    this.name = "RequestTimeoutError"
+  }
+}
+
 const POLL_TIMEOUT_MS = 4000
 const MIN_ROI_SPAN = 0.005
 
@@ -307,6 +315,7 @@ async function api<T = any>(
   let controller: AbortController | null = null
   let timeoutId: number | null = null
   let onExternalAbort: (() => void) | null = null
+  let timedOut = false
   const externalSignal = options.signal
 
   if (timeoutMs && timeoutMs > 0) {
@@ -319,7 +328,10 @@ async function api<T = any>(
         externalSignal.addEventListener("abort", onExternalAbort, { once: true })
       }
     }
-    timeoutId = window.setTimeout(() => controller?.abort(), timeoutMs)
+    timeoutId = window.setTimeout(() => {
+      timedOut = true
+      controller?.abort()
+    }, timeoutMs)
   }
 
   try {
@@ -332,12 +344,22 @@ async function api<T = any>(
       let reason = `HTTP ${response.status}`
       try {
         reason = (await response.json()).detail || reason
-      } catch {
-        /* 非 JSON 响应 */
+      } catch (parseErr) {
+        if (timedOut && !externalSignal?.aborted) {
+          throw new RequestTimeoutError()
+        }
+        if (externalSignal?.aborted || isAbortError(parseErr)) {
+          throw parseErr
+        }
       }
       throw new ApiError(String(reason), response.status)
     }
     return (await response.json()) as T
+  } catch (err) {
+    if (timedOut && !externalSignal?.aborted) {
+      throw new RequestTimeoutError()
+    }
+    throw err
   } finally {
     if (timeoutId !== null) window.clearTimeout(timeoutId)
     if (externalSignal && onExternalAbort) {
@@ -428,11 +450,16 @@ function App() {
   const adminTokenRef = useRef<string>(adminToken)
   const selectedCycleRef = useRef<string>(selectedCycleId)
   const refreshSeqRef = useRef(0)
+  const manualRefreshSeqRef = useRef<number | null>(null)
   const scheduledInFlightRef = useRef(false)
   const refreshAbortRef = useRef<AbortController | null>(null)
   const eventsReqSeqRef = useRef(0)
   const eventsAbortRef = useRef<AbortController | null>(null)
-  const eventsExplicitInFlightRef = useRef(false)
+  const eventsInFlightRef = useRef<{ cycleId: string; explicit: boolean } | null>(null)
+  const storageReqSeqRef = useRef(0)
+  const storageAbortRef = useRef<AbortController | null>(null)
+  const hasInventoryRef = useRef(false)
+  const confirmDialogRef = useRef<ConfirmDialogState | null>(confirmDialog)
 
   useEffect(() => {
     roleRef.current = role
@@ -443,6 +470,16 @@ function App() {
   useEffect(() => {
     selectedCycleRef.current = selectedCycleId
   }, [selectedCycleId])
+  useEffect(() => {
+    confirmDialogRef.current = confirmDialog
+  }, [confirmDialog])
+  useEffect(() => {
+    hasInventoryRef.current = Boolean(
+      storageOverview?.business_db && storageOverview.business_db.tables && !storageError
+    )
+  }, [storageOverview, storageError])
+
+  const isBusinessInventoryAvailable = useCallback(() => hasInventoryRef.current, [])
 
   // 登录成功后将键盘焦点移入工程师工作区首步导航控件
   useEffect(() => {
@@ -477,6 +514,7 @@ function App() {
       }
       refreshAbortRef.current?.abort()
       eventsAbortRef.current?.abort()
+      storageAbortRef.current?.abort()
     }
   }, [])
 
@@ -484,7 +522,7 @@ function App() {
     selectedCycleRef.current = ""
     setSelectedCycleId("")
     eventsReqSeqRef.current += 1
-    eventsExplicitInFlightRef.current = false
+    eventsInFlightRef.current = null
     eventsAbortRef.current?.abort()
     eventsAbortRef.current = null
     setCycleTimeline({ cycleId: "", events: [], loading: false, error: "" })
@@ -493,11 +531,16 @@ function App() {
   const lockEngineerSession = useCallback(
     (reason?: string) => {
       clearStoredSession()
+      storageReqSeqRef.current += 1
+      storageAbortRef.current?.abort()
+      storageAbortRef.current = null
+      hasInventoryRef.current = false
       setEngineerSession(null)
       setStep("monitor")
       setActiveSnapshot(null)
       setConfirmDialog(null)
       setStorageOverview(null)
+      setStorageLoading(false)
       setStorageError("")
       setTrainingError("")
       clearSelectedCycle()
@@ -556,23 +599,26 @@ function App() {
       if (!id) {
         if (!selectedCycleRef.current) {
           eventsReqSeqRef.current += 1
+          eventsInFlightRef.current = null
           eventsAbortRef.current?.abort()
           eventsAbortRef.current = null
           setCycleTimeline({ cycleId: "", events: [], loading: false, error: "" })
         }
         return
       }
-      if (opts.silent && eventsExplicitInFlightRef.current) {
-        return
+      if (opts.silent && eventsInFlightRef.current) {
+        if (eventsInFlightRef.current.explicit || eventsInFlightRef.current.cycleId === id) {
+          return
+        }
       }
 
       const reqSeq = ++eventsReqSeqRef.current
       eventsAbortRef.current?.abort()
       const controller = new AbortController()
       eventsAbortRef.current = controller
+      eventsInFlightRef.current = { cycleId: id, explicit: !opts.silent }
 
       if (!opts.silent) {
-        eventsExplicitInFlightRef.current = true
         setCycleTimeline((prev) => ({
           cycleId: id,
           events: prev.cycleId === id ? prev.events : [],
@@ -610,8 +656,8 @@ function App() {
         if (eventsAbortRef.current === controller) {
           eventsAbortRef.current = null
         }
-        if (reqSeq === eventsReqSeqRef.current && !opts.silent) {
-          eventsExplicitInFlightRef.current = false
+        if (reqSeq === eventsReqSeqRef.current) {
+          eventsInFlightRef.current = null
         }
       }
     },
@@ -629,115 +675,131 @@ function App() {
 
   const refresh = useCallback(
     async (forceEngineerFetch = false, scheduled = false) => {
-      if (scheduled && scheduledInFlightRef.current) return
-      if (scheduled) {
-        scheduledInFlightRef.current = true
-      } else {
+      if (scheduled && (scheduledInFlightRef.current || manualRefreshSeqRef.current !== null)) return
+      if (!scheduled) {
         refreshAbortRef.current?.abort()
-        setRefreshing(true)
       }
 
       const seq = ++refreshSeqRef.current
+      if (scheduled) {
+        scheduledInFlightRef.current = true
+      } else {
+        manualRefreshSeqRef.current = seq
+        if (refreshTimerRef.current !== null) {
+          window.clearTimeout(refreshTimerRef.current)
+          refreshTimerRef.current = null
+        }
+        setRefreshing(true)
+      }
+
       const controller = new AbortController()
       refreshAbortRef.current = controller
       const isEngineer = forceEngineerFetch || roleRef.current === "engineer"
+      const isCurrent = () => seq === refreshSeqRef.current && !controller.signal.aborted
 
       try {
         const signalOpt: RequestInit = { signal: controller.signal }
+
+        const statePromise = api<Data>("/api/state", signalOpt, "", POLL_TIMEOUT_MS).then(
+          (s) => {
+            if (!isCurrent()) return undefined
+            setState(s)
+            setConnected(true)
+            setError("")
+            return s
+          },
+          (err) => {
+            if (!isCurrent() || isAbortError(err)) return undefined
+            setConnected(false)
+            setError(err instanceof Error ? err.message : "无法连接本地工作站服务")
+            setState({
+              camera_status: "FAULT",
+              view_valid: false,
+              label_status: "unknown",
+              fsm_state: "FAULT",
+              outcome: "FAULT",
+              c_timer_ms: 0,
+              mirror_horizontal: true,
+              view_valid_reasons: ["API_UNAVAILABLE"],
+              result_reason: "API_UNAVAILABLE_FAIL_CLOSED",
+            })
+            return undefined
+          }
+        )
+
+        const cyclesPromise = api<Data[]>("/api/cycles?limit=30", signalOpt, "", POLL_TIMEOUT_MS).then(
+          (c) => {
+            if (!isCurrent()) return undefined
+            setCycles(c)
+            return c
+          },
+          () => undefined
+        )
+
+        const evidencePromise = api<Data[]>("/api/evidence?limit=40", signalOpt, "", POLL_TIMEOUT_MS).then(
+          (e) => {
+            if (isCurrent()) setEvidence(e)
+          },
+          () => {}
+        )
+
+        const tasks: Promise<unknown>[] = [statePromise, cyclesPromise, evidencePromise]
+
         if (isEngineer) {
-          const [stateRes, cyclesRes, evidenceRes, cfgRes, historyRes, modelsRes, dsRes, trRes] =
-            await Promise.allSettled([
-              api<Data>("/api/state", signalOpt, "", POLL_TIMEOUT_MS),
-              api<Data[]>("/api/cycles?limit=30", signalOpt, "", POLL_TIMEOUT_MS),
-              api<Data[]>("/api/evidence?limit=40", signalOpt, "", POLL_TIMEOUT_MS),
-              api<Data>("/api/config", signalOpt, "", POLL_TIMEOUT_MS),
-              api<Data[]>("/api/config/history?limit=20", signalOpt, "", POLL_TIMEOUT_MS),
-              api<Data[]>("/api/models?limit=30", signalOpt, "", POLL_TIMEOUT_MS),
-              api<Data>("/api/dataset/summary", signalOpt, "", POLL_TIMEOUT_MS),
-              api<Data>("/api/training/status", signalOpt, "", POLL_TIMEOUT_MS),
-            ])
-
-          if (seq !== refreshSeqRef.current || controller.signal.aborted) return
-
-          if (stateRes.status === "fulfilled") {
-            setState(stateRes.value)
-            setConnected(true)
-            setError("")
-          } else if (!isAbortError(stateRes.reason)) {
-            setConnected(false)
-            setError(stateRes.reason instanceof Error ? stateRes.reason.message : "无法连接本地工作站服务")
-            setState({
-              camera_status: "FAULT",
-              view_valid: false,
-              label_status: "unknown",
-              fsm_state: "FAULT",
-              outcome: "FAULT",
-              c_timer_ms: 0,
-              mirror_horizontal: true,
-              view_valid_reasons: ["API_UNAVAILABLE"],
-              result_reason: "API_UNAVAILABLE_FAIL_CLOSED",
+          tasks.push(
+            api<Data>("/api/config", signalOpt, "", POLL_TIMEOUT_MS).then(
+              (cfg) => {
+                if (isCurrent()) setConfig(cfg)
+              },
+              () => {}
+            ),
+            api<Data[]>("/api/config/history?limit=20", signalOpt, "", POLL_TIMEOUT_MS).then(
+              (h) => {
+                if (isCurrent()) setHistory(h)
+              },
+              () => {}
+            ),
+            api<Data[]>("/api/models?limit=30", signalOpt, "", POLL_TIMEOUT_MS).then(
+              (m) => {
+                if (isCurrent()) setModels(m)
+              },
+              () => {}
+            ),
+            api<Data>("/api/dataset/summary", signalOpt, "", POLL_TIMEOUT_MS).then(
+              (ds) => {
+                if (isCurrent()) setDatasetSummary(ds)
+              },
+              () => {}
+            ),
+            api<Data>("/api/training/status", signalOpt, "", POLL_TIMEOUT_MS).then(
+              (tr) => {
+                if (!isCurrent()) return
+                setTrainingStatus(tr)
+                setTrainingError("")
+              },
+              (err) => {
+                if (!isCurrent() || isAbortError(err)) return
+                setTrainingError(err instanceof Error ? err.message : "无法获取训练任务状态")
+              }
+            ),
+            Promise.all([statePromise, cyclesPromise]).then(([latestState, latestCycles]) => {
+              if (!isCurrent()) return
+              const explicitId = selectedCycleRef.current
+              const fallbackId = latestState?.cycle_id || latestCycles?.[0]?.cycle_id
+              const targetCycleId = explicitId || fallbackId
+              if (targetCycleId) {
+                void loadCycleEvents(String(targetCycleId), {
+                  silent: true,
+                  onlyIfNoExplicitSelection: !explicitId,
+                })
+              } else if (!explicitId) {
+                void loadCycleEvents("")
+              }
             })
-          }
-
-          if (cyclesRes.status === "fulfilled") setCycles(cyclesRes.value)
-          if (evidenceRes.status === "fulfilled") setEvidence(evidenceRes.value)
-          if (cfgRes.status === "fulfilled") setConfig(cfgRes.value)
-          if (historyRes.status === "fulfilled") setHistory(historyRes.value)
-          if (modelsRes.status === "fulfilled") setModels(modelsRes.value)
-          if (dsRes.status === "fulfilled") setDatasetSummary(dsRes.value)
-
-          if (trRes.status === "fulfilled") {
-            setTrainingStatus(trRes.value)
-            setTrainingError("")
-          } else if (!isAbortError(trRes.reason)) {
-            setTrainingError(trRes.reason instanceof Error ? trRes.reason.message : "无法获取训练任务状态")
-          }
-
-          const explicitId = selectedCycleRef.current
-          const fallbackId =
-            (stateRes.status === "fulfilled" ? stateRes.value?.cycle_id : undefined) ||
-            (cyclesRes.status === "fulfilled" ? cyclesRes.value?.[0]?.cycle_id : undefined)
-          const targetCycleId = explicitId || fallbackId
-          if (targetCycleId) {
-            void loadCycleEvents(String(targetCycleId), {
-              silent: true,
-              onlyIfNoExplicitSelection: !explicitId,
-            })
-          } else if (!explicitId) {
-            void loadCycleEvents("")
-          }
-        } else {
-          const [stateRes, cyclesRes, evidenceRes] = await Promise.allSettled([
-            api<Data>("/api/state", signalOpt, "", POLL_TIMEOUT_MS),
-            api<Data[]>("/api/cycles?limit=30", signalOpt, "", POLL_TIMEOUT_MS),
-            api<Data[]>("/api/evidence?limit=40", signalOpt, "", POLL_TIMEOUT_MS),
-          ])
-
-          if (seq !== refreshSeqRef.current || controller.signal.aborted) return
-
-          if (stateRes.status === "fulfilled") {
-            setState(stateRes.value)
-            setConnected(true)
-            setError("")
-          } else if (!isAbortError(stateRes.reason)) {
-            setConnected(false)
-            setError(stateRes.reason instanceof Error ? stateRes.reason.message : "无法连接本地工作站服务")
-            setState({
-              camera_status: "FAULT",
-              view_valid: false,
-              label_status: "unknown",
-              fsm_state: "FAULT",
-              outcome: "FAULT",
-              c_timer_ms: 0,
-              mirror_horizontal: true,
-              view_valid_reasons: ["API_UNAVAILABLE"],
-              result_reason: "API_UNAVAILABLE_FAIL_CLOSED",
-            })
-          }
-
-          if (cyclesRes.status === "fulfilled") setCycles(cyclesRes.value)
-          if (evidenceRes.status === "fulfilled") setEvidence(evidenceRes.value)
+          )
         }
+
+        await Promise.allSettled(tasks)
       } finally {
         if (scheduled) {
           scheduledInFlightRef.current = false
@@ -745,12 +807,15 @@ function App() {
         if (refreshAbortRef.current === controller) {
           refreshAbortRef.current = null
         }
-        if (!scheduled) {
+        if (!scheduled && manualRefreshSeqRef.current === seq) {
+          manualRefreshSeqRef.current = null
           if (refreshTimerRef.current !== null) {
             window.clearTimeout(refreshTimerRef.current)
           }
           refreshTimerRef.current = window.setTimeout(() => {
-            setRefreshing(false)
+            if (manualRefreshSeqRef.current === null) {
+              setRefreshing(false)
+            }
             refreshTimerRef.current = null
           }, 220)
         }
@@ -761,19 +826,66 @@ function App() {
 
   const loadStorageOverview = useCallback(async () => {
     if (roleRef.current !== "engineer") return
+    const sessionToken = adminTokenRef.current
+    if (!sessionToken) return
+
+    const reqSeq = ++storageReqSeqRef.current
+    storageAbortRef.current?.abort()
+    const controller = new AbortController()
+    storageAbortRef.current = controller
+
     setStorageLoading(true)
     setStorageError("")
+
+    const isLatestForSession = () =>
+      reqSeq === storageReqSeqRef.current &&
+      roleRef.current === "engineer" &&
+      adminTokenRef.current === sessionToken &&
+      !controller.signal.aborted
+
+    const invalidateInventoryDialog = () => {
+      hasInventoryRef.current = false
+      if (confirmDialogRef.current?.requiresInventory) {
+        setConfirmDialog((cur) => (cur?.requiresInventory ? null : cur))
+        flash("存储统计已失效，已自动关闭全量销毁确认弹窗，请重新刷新存储统计后再操作")
+      }
+    }
+
     try {
-      const ov = await api<Data>("/api/storage/overview", {}, adminTokenRef.current, POLL_TIMEOUT_MS)
-      setStorageOverview(ov)
-      setStorageError("")
+      const ov = await api<Data>(
+        "/api/storage/overview",
+        { signal: controller.signal },
+        sessionToken,
+        POLL_TIMEOUT_MS
+      )
+      if (!isLatestForSession()) return
+      if (ov?.business_db && ov.business_db.tables) {
+        hasInventoryRef.current = true
+        setStorageOverview(ov)
+        setStorageError("")
+      } else {
+        setStorageOverview(null)
+        setStorageError("存储统计返回结构不完整")
+        invalidateInventoryDialog()
+      }
     } catch (err) {
+      if (!isLatestForSession() || isAbortError(err)) return
       setStorageOverview(null)
       setStorageError(err instanceof Error ? err.message : "存储统计获取失败")
+      invalidateInventoryDialog()
     } finally {
-      setStorageLoading(false)
+      if (storageAbortRef.current === controller) {
+        storageAbortRef.current = null
+      }
+      if (
+        reqSeq === storageReqSeqRef.current &&
+        roleRef.current === "engineer" &&
+        adminTokenRef.current === sessionToken
+      ) {
+        setStorageLoading(false)
+      }
     }
-  }, [])
+  }, [flash])
 
   const handleAuthenticated = useCallback(
     ({ adminToken: verifiedToken, expiresInSeconds }: EngineerAuthResult) => {
@@ -1215,6 +1327,7 @@ function App() {
                 storageOverview={storageOverview}
                 storageLoading={storageLoading}
                 storageError={storageError}
+                isInventoryAvailable={isBusinessInventoryAvailable}
                 cycles={cycles}
                 evidence={evidence}
                 events={displayedEvents}
@@ -3425,6 +3538,7 @@ function RecordsSettingsStep({
   storageOverview,
   storageLoading,
   storageError,
+  isInventoryAvailable,
   cycles,
   evidence,
   events,
@@ -3464,6 +3578,7 @@ function RecordsSettingsStep({
   storageOverview: Data | null
   storageLoading: boolean
   storageError: string
+  isInventoryAvailable: () => boolean
   cycles: Data[]
   evidence: Data[]
   events: Data[]
@@ -3662,6 +3777,7 @@ function RecordsSettingsStep({
             storageOverview={storageOverview}
             storageLoading={storageLoading}
             storageError={storageError}
+            isInventoryAvailable={isInventoryAvailable}
             token={token}
             flash={flash}
             onConfirm={onConfirm}
@@ -3938,6 +4054,7 @@ function StorageManagerSubView({
   storageOverview,
   storageLoading,
   storageError,
+  isInventoryAvailable,
   token,
   flash,
   onConfirm,
@@ -3953,6 +4070,7 @@ function StorageManagerSubView({
   storageOverview: Data | null
   storageLoading: boolean
   storageError: string
+  isInventoryAvailable: () => boolean
   token: string
   flash: (s: string) => void
   onConfirm: (dialog: ConfirmDialogState) => void
@@ -4102,7 +4220,12 @@ function StorageManagerSubView({
       confirmLabel: "确认永久销毁并 VACUUM",
       tone: "danger",
       requireCheckLabel: "我已知晓全部业务检测周期与证据快照将永久删除且不可恢复",
+      requiresInventory: true,
       onConfirm: async () => {
+        if (!isInventoryAvailable()) {
+          flash("当前存储统计已失效，已中止全量销毁，请重新刷新存储统计核对后再操作")
+          return
+        }
         try {
           const res = await api<Data>(
             "/api/cycles/purge",

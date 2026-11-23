@@ -92,8 +92,9 @@ export const C_LIMIT_MS = 1200
 export function formatCTimerSeconds(ms: number, digits: 1 | 2 = 1): string {
   const clamped = Math.max(0, Number.isFinite(ms) ? ms : 0)
   const factor = digits === 2 ? 100 : 10
-  const maxSteps = Math.floor((C_LIMIT_MS / 1000) * factor)
-  const flooredSteps = Math.floor((clamped / 1000) * factor)
+  const stepMs = 1000 / factor
+  const maxSteps = Math.floor(C_LIMIT_MS / stepMs)
+  const flooredSteps = Math.floor(clamped / stepMs)
   const safeSteps = clamped < C_LIMIT_MS ? Math.min(maxSteps - 1, flooredSteps) : flooredSteps
   return (Math.max(0, safeSteps) / factor).toFixed(digits)
 }

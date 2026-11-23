@@ -1,8 +1,11 @@
 """Comprehensive unit and integration tests for Wave 3 CodeRabbit training/dataset hardening (BE-20..BE-29, BE-53)."""
 from __future__ import annotations
 
+import csv
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -10,6 +13,7 @@ from unittest import mock
 import cv2
 import numpy as np
 
+from igbt_pokayoke import training_manager as tm_mod
 from igbt_pokayoke.training_manager import (
     ALL_LABELS,
     CLASSES,
@@ -65,11 +69,25 @@ class Wave3TrainingDataHardeningTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.data_root = Path(self._tmp.name)
-        self.tm = TrainingManager(data_root_getter=lambda: self.data_root)
+        self._managers: list[TrainingManager] = []
+        self.tm = self._make_manager(self.data_root)
+
+    def _make_manager(self, root: Path) -> TrainingManager:
+        mgr = TrainingManager(data_root_getter=lambda r=root: r)
+        self._managers.append(mgr)
+        return mgr
 
     def tearDown(self) -> None:
-        if self.tm._thread is not None and self.tm._thread.is_alive():
-            self.tm._thread.join(timeout=15.0)
+        still_alive: list[str] = []
+        for idx, mgr in enumerate(self._managers):
+            worker = mgr._thread
+            if worker is not None and worker.is_alive():
+                worker.join(timeout=30.0)
+                if worker.is_alive():
+                    still_alive.append(f"manager[{idx}]:{worker.name}")
+        if still_alive:
+            # Do not delete temp files while any worker thread could still be reading/writing them (R2-42)
+            raise AssertionError(f"Training worker thread(s) did not exit before teardown: {', '.join(still_alive)}")
         self._tmp.cleanup()
 
     # ------------------------------------------------------------------
@@ -277,13 +295,14 @@ class Wave3TrainingDataHardeningTests(unittest.TestCase):
         self.assertFalse(s1_path.exists())
         self.assertFalse(coco_path.exists())
 
-        # ENOENT (file vanished between read and unlink) cleanly removes manifest row without error
+        # ENOENT (file vanished between read and unlink) cleanly removes manifest row without error (R2-43)
         s4 = self.tm.capture_sample(_make_dummy_crop(304), "absent", physical_tube_id="TUBE_D2")
         s4_path = self.tm.get_sample_image_path(s4["sample_id"])
         assert s4_path is not None
 
         def enoent_unlink(path_obj: Path, *args, **kwargs):
             if path_obj.resolve() == s4_path.resolve():
+                real_unlink(path_obj)
                 raise FileNotFoundError("Already removed externally")
             return real_unlink(path_obj, *args, **kwargs)
 
@@ -292,6 +311,8 @@ class Wave3TrainingDataHardeningTests(unittest.TestCase):
         self.assertEqual(del_enoent["deleted"], s4["sample_id"])
         self.assertFalse(del_enoent["deleted_file"])
         self.assertEqual(del_enoent["remaining_samples"], 0)
+        self.assertFalse(s4_path.exists())
+        self.assertEqual(self.tm.list_samples(), [])
 
     # ------------------------------------------------------------------
     # BE-24 & BE-53: Bootstrap source-lineage isolation + COCO export
@@ -310,7 +331,7 @@ class Wave3TrainingDataHardeningTests(unittest.TestCase):
 
         # Compare generated pixels against a no-live-crop baseline to prove TUBE_G02..G04 have zero live crop leakage
         baseline_root = self.data_root / "baseline_compare"
-        baseline_tm = TrainingManager(data_root_getter=lambda: baseline_root)
+        baseline_tm = self._make_manager(baseline_root)
         baseline_tm.bootstrap_standard_dataset(live_crop_bgr=None)
 
         live_rows = self.tm._read_manifest_rows()
@@ -333,7 +354,7 @@ class Wave3TrainingDataHardeningTests(unittest.TestCase):
                     f"Group {lr['physical_tube_id']} ({lr['label']}) leaked pixels from single live_crop_bgr!",
                 )
 
-        # BE-53: All 52 bootstrap samples must appear in annotations_coco.json with 224x144 dims and valid crop bboxes
+        # BE-53 / R2-44: All 52 bootstrap samples must appear in annotations_coco.json with positive crop bboxes
         coco_path = self.data_root / "dataset" / "annotations_coco.json"
         self.assertTrue(coco_path.is_file())
         coco = json.loads(coco_path.read_text(encoding="utf-8"))
@@ -344,6 +365,8 @@ class Wave3TrainingDataHardeningTests(unittest.TestCase):
             self.assertEqual(im["width"], SAVED_IMAGE_WIDTH)
             self.assertEqual(im["height"], SAVED_IMAGE_HEIGHT)
             bx, by, bw, bh = an["bbox"]
+            self.assertGreater(bw, 0.0)
+            self.assertGreater(bh, 0.0)
             self.assertGreaterEqual(bx, 0.0)
             self.assertGreaterEqual(by, 0.0)
             self.assertLessEqual(bx + bw, SAVED_IMAGE_WIDTH + 0.1)
@@ -352,7 +375,7 @@ class Wave3TrainingDataHardeningTests(unittest.TestCase):
 
         # Duplicate crops passed via live_crops are deduplicated so identical images never span multiple groups
         dup_root = self.data_root / "dup_crops_test"
-        dup_tm = TrainingManager(data_root_getter=lambda: dup_root)
+        dup_tm = self._make_manager(dup_root)
         dup_summary = dup_tm.bootstrap_standard_dataset(live_crops=[live_crop, live_crop.copy(), live_crop.copy()])
         self.assertEqual(dup_summary["live_crop_groups"], ["TUBE_G01"])
 
@@ -388,7 +411,7 @@ class Wave3TrainingDataHardeningTests(unittest.TestCase):
 
         # Salvageable asymmetric layout: TUBE_A covers all 4 classes, TUBE_B & TUBE_C hold partial classes
         asym_root = self.data_root / "asym_test"
-        asym_tm = TrainingManager(data_root_getter=lambda: asym_root)
+        asym_tm = self._make_manager(asym_root)
         for i in range(3):
             for cls in CLASSES:
                 asym_tm.capture_sample(_make_dummy_crop(500 + i * 10 + CLASSES.index(cls)), cls, physical_tube_id="TUBE_A")
@@ -404,35 +427,62 @@ class Wave3TrainingDataHardeningTests(unittest.TestCase):
         self.assertEqual({r["label"] for r in split["train_rows"]}, set(CLASSES))
 
     # ------------------------------------------------------------------
-    # BE-25: Immutable run-scoped snapshot survives concurrent relabel/delete/clear
+    # BE-25 / R2-45: Synchronized immutable run-scoped snapshot survives concurrent relabel/delete/clear
     # ------------------------------------------------------------------
     def test_be25_training_survives_concurrent_relabel_delete_and_clear(self) -> None:
+        from PIL import Image
+
         _populate_real_tubes(self.tm, ["TUBE_S1", "TUBE_S2", "TUBE_S3"], samples_per_class=2)
         samples_before = self.tm.list_samples()
         self.assertEqual(len(samples_before), 24)
+        original_paths = [self.tm.get_sample_image_path(s["sample_id"]) for s in samples_before]
+        self.assertTrue(all(p is not None and p.is_file() for p in original_paths))
 
-        self.tm.start_training(
-            epochs=2,
-            input_size=64,
-            batch_size=8,
-            resume_from_latest=False,
-            use_augmentation=False,
-            on_complete=None,
-        )
+        worker_paused = threading.Event()
+        release_worker = threading.Event()
+        real_open = Image.open
+        opened_in_worker = False
 
-        # Mutate dataset aggressively while training runs in background
-        self.tm.update_sample_annotation(samples_before[0]["sample_id"], new_label="absent")
-        self.tm.delete_sample(samples_before[1]["sample_id"])
-        self.tm.clear_dataset()
-        self.assertEqual(self.tm.get_dataset_summary()["total_samples"], 0)
+        def synchronized_open(fp, *args, **kwargs):
+            nonlocal opened_in_worker
+            if threading.current_thread().name == "MobileNetV3Trainer" and not opened_in_worker:
+                opened_in_worker = True
+                worker_paused.set()
+                release_worker.wait(timeout=30.0)
+            return real_open(fp, *args, **kwargs)
 
-        status = _wait_for_training(self.tm)
-        self.assertEqual(status["state"], "COMPLETED", f"Training failed after concurrent clear: {status}")
+        with mock.patch.object(Image, "open", side_effect=synchronized_open):
+            try:
+                self.tm.start_training(
+                    epochs=2,
+                    input_size=64,
+                    batch_size=8,
+                    resume_from_latest=False,
+                    use_augmentation=False,
+                    on_complete=None,
+                )
+                # Wait until worker is guaranteed paused right before consuming its first run input
+                self.assertTrue(worker_paused.wait(timeout=30.0), "Worker did not reach input read barrier")
+
+                # Mutate and completely wipe the live dataset BEFORE the worker opens any image
+                self.tm.update_sample_annotation(samples_before[0]["sample_id"], new_label="absent")
+                self.tm.delete_sample(samples_before[1]["sample_id"])
+                self.tm.clear_dataset()
+                self.assertEqual(self.tm.get_dataset_summary()["total_samples"], 0)
+                for p in original_paths:
+                    assert p is not None
+                    self.assertFalse(p.exists())
+            finally:
+                release_worker.set()
+
+            status = _wait_for_training(self.tm)
+
+        self.assertEqual(status["state"], "COMPLETED", f"Training failed after synchronized clear: {status}")
         latest = status["latest_run"]
         self.assertIsNotNone(latest)
+        self.assertEqual(latest["train_samples"] + latest["val_samples"] + latest["test_samples"], 24)
         self.assertTrue(latest["onnx_parity_ok"])
         self.assertTrue(Path(latest["onnx_path"]).is_file())
-        # Temporary input snapshot directory must be cleaned up after completion
         run_dir = Path(latest["onnx_path"]).parent
         self.assertFalse((run_dir / "_input_snapshot").exists())
 
@@ -463,12 +513,23 @@ class Wave3TrainingDataHardeningTests(unittest.TestCase):
         self.assertEqual(ckpt1["seen_groups"], ["TUBE_A", "TUBE_B"])
 
         # Modify checkpoint provenance to pretend Run 1 trained on [TUBE_C, TUBE_D] (which default split would pick as holdouts!)
+        cd_rows = [r for r in self.tm._read_manifest_rows() if r["physical_tube_id"] in {"TUBE_C", "TUBE_D"}]
+        cd_sids = sorted(r["sample_id"] for r in cd_rows)
+        cd_digests = sorted(self.tm._row_image_digest(r) for r in cd_rows)
         ckpt1["train_groups"] = ["TUBE_C", "TUBE_D"]
         ckpt1["seen_groups"] = ["TUBE_C", "TUBE_D"]
+        ckpt1["train_sample_ids"] = cd_sids
+        ckpt1["seen_sample_ids"] = cd_sids
+        ckpt1["train_image_digests"] = cd_digests
+        ckpt1["seen_image_digests"] = cd_digests
         torch.save(ckpt1, run1_dir / "label_classifier.pth")
         meta1 = json.loads((run1_dir / "metrics.json").read_text(encoding="utf-8"))
         meta1["train_groups"] = ["TUBE_C", "TUBE_D"]
         meta1["seen_groups"] = ["TUBE_C", "TUBE_D"]
+        meta1["train_sample_ids"] = cd_sids
+        meta1["seen_sample_ids"] = cd_sids
+        meta1["train_image_digests"] = cd_digests
+        meta1["seen_image_digests"] = cd_digests
         (run1_dir / "metrics.json").write_text(json.dumps(meta1), encoding="utf-8")
 
         # Run 2 (resume_from_latest=True): MUST NOT place TUBE_C or TUBE_D into val/test -> automatically picks TUBE_A/TUBE_B
@@ -499,7 +560,7 @@ class Wave3TrainingDataHardeningTests(unittest.TestCase):
 
         # Legacy checkpoint lacking train_groups/seen_groups provenance must be rejected on warm-start
         legacy_root = self.data_root / "legacy_ckpt_test"
-        legacy_tm = TrainingManager(data_root_getter=lambda: legacy_root)
+        legacy_tm = self._make_manager(legacy_root)
         _populate_real_tubes(legacy_tm, ["TUBE_L1", "TUBE_L2", "TUBE_L3"], samples_per_class=2)
         legacy_run_dir = legacy_root / "runs" / "label_classifier" / "mnetv3_legacy_no_prov"
         legacy_run_dir.mkdir(parents=True, exist_ok=True)
@@ -648,6 +709,259 @@ class Wave3TrainingDataHardeningTests(unittest.TestCase):
         self.assertFalse(st_none["activated"])
         self.assertEqual(st_none["activation_status"], "exported_only")
         self.assertNotIn("已热加载", st_none["message"])
+
+    # ------------------------------------------------------------------
+    # R2-13: Preserve crop-space boxes when rebuilding COCO from manifest
+    # ------------------------------------------------------------------
+    def test_r2_13_rebuild_coco_preserves_subcrop_boxes_and_legacy_fallback(self) -> None:
+        s_sub = self.tm.capture_sample(
+            crop_bgr=_make_dummy_crop(601),
+            label="crossed_out",
+            physical_tube_id="TUBE_R13",
+            box_xyxy=[0.30, 0.35, 0.50, 0.65],
+            crop_bounds_xyxy=[0.20, 0.20, 0.60, 0.80],
+        )
+        s_legacy = self.tm.capture_sample(
+            crop_bgr=_make_dummy_crop(602),
+            label="complete",
+            physical_tube_id="TUBE_R13",
+            box_xyxy=[0.10, 0.15, 0.50, 0.55],
+        )
+        self.assertEqual(s_sub["crop_box_xyxy"], "0.2500,0.2500,0.7500,0.7500")
+
+        # Strip crop_box_xyxy from s_legacy in manifest CSV to simulate a pre-R2-13 legacy row
+        manifest_path = self.data_root / "dataset" / "samples_manifest.csv"
+        with manifest_path.open("r", newline="", encoding="utf-8-sig") as rf:
+            rows = list(csv.DictReader(rf))
+        for row in rows:
+            if row["sample_id"] == s_legacy["sample_id"]:
+                row["crop_box_xyxy"] = ""
+        self.tm._write_all_manifest_rows(rows)
+
+        coco_path = self.data_root / "dataset" / "annotations_coco.json"
+        coco_path.unlink()
+
+        rebuilt = self.tm.rebuild_coco_from_manifest()
+        self.assertEqual(rebuilt["rebuilt_annotations"], 2)
+        coco = json.loads(coco_path.read_text(encoding="utf-8"))
+        img_by_sid = {im["sample_id"]: im for im in coco["images"]}
+        ann_by_img_id = {an["image_id"]: an for an in coco["annotations"]}
+
+        sub_ann = ann_by_img_id[img_by_sid[s_sub["sample_id"]]["id"]]
+        self.assertEqual(sub_ann["bbox"], [56.0, 36.0, 112.0, 72.0])
+        self.assertEqual(sub_ann["area"], 8064.0)
+
+        legacy_ann = ann_by_img_id[img_by_sid[s_legacy["sample_id"]]["id"]]
+        self.assertEqual(legacy_ann["bbox"], [0.0, 0.0, 224.0, 144.0])
+
+    # ------------------------------------------------------------------
+    # R2-14: Invalid UTF-8 or COCO write failure returns committed sample with coco_synced=False
+    # ------------------------------------------------------------------
+    def test_r2_14_invalid_utf8_and_coco_write_failure_preserve_committed_sample(self) -> None:
+        coco_path = self.data_root / "dataset" / "annotations_coco.json"
+        coco_path.parent.mkdir(parents=True, exist_ok=True)
+        bad_utf8 = b"\xff\xfe\x80\x81not-utf8"
+        coco_path.write_bytes(bad_utf8)
+
+        # Must NOT raise UnicodeDecodeError/ValueError after committing sample; preserve invalid file untouched
+        committed = self.tm.upload_sample_bytes(
+            image_bytes=_encode_jpg(_make_dummy_crop(610)),
+            label="complete",
+            physical_tube_id="TUBE_R14",
+        )
+        self.assertFalse(committed["coco_synced"])
+        self.assertEqual(coco_path.read_bytes(), bad_utf8)
+        self.assertEqual(len(self.tm.list_samples()), 1)
+
+        # Restore valid COCO via rebuild, then simulate OSError during atomic write
+        self.tm.rebuild_coco_from_manifest()
+        valid_before = coco_path.read_text(encoding="utf-8")
+        with mock.patch.object(tm_mod, "_write_json_atomic", side_effect=OSError("COCO read-only")):
+            committed2 = self.tm.upload_sample_bytes(
+                image_bytes=_encode_jpg(_make_dummy_crop(611)),
+                label="crossed_out",
+                physical_tube_id="TUBE_R14",
+            )
+        self.assertFalse(committed2["coco_synced"])
+        self.assertEqual(coco_path.read_text(encoding="utf-8"), valid_before)
+        self.assertEqual(len(self.tm.list_samples()), 2)
+
+        # Subsequent healthy write succeeds with coco_synced=True
+        committed3 = self.tm.upload_sample_bytes(
+            image_bytes=_encode_jpg(_make_dummy_crop(612)),
+            label="covered",
+            physical_tube_id="TUBE_R14",
+        )
+        self.assertTrue(committed3["coco_synced"])
+
+    # ------------------------------------------------------------------
+    # R2-15: Keep live-source lineage stable across repeated bootstrap calls & split
+    # ------------------------------------------------------------------
+    def test_r2_15_bootstrap_source_lineage_stable_across_calls_and_split(self) -> None:
+        src_a = _make_dummy_crop(701, (240, 20, 240))
+        src_b = _make_dummy_crop(702, (20, 240, 20))
+        src_c = _make_dummy_crop(703, (240, 240, 20))
+        src_d = _make_dummy_crop(704, (20, 120, 240))
+
+        # Call 1 assigns A -> TUBE_G01; Call 2 passes [B, C, A, D] -> A MUST stay pinned to TUBE_G01!
+        s1 = self.tm.bootstrap_standard_dataset(live_crops=[src_a])
+        self.assertEqual(s1["live_crop_groups"], ["TUBE_G01"])
+        s2 = self.tm.bootstrap_standard_dataset(live_crops=[src_b, src_c, src_a, src_d])
+        self.assertEqual(set(s2["live_crop_groups"]), {"TUBE_G01", "TUBE_G02", "TUBE_G03", "TUBE_G04"})
+
+        rows = self.tm._read_manifest_rows()
+        groups_by_source: dict[str, set[str]] = {}
+        for r in rows:
+            dig = (r.get("source_digest") or "").strip()
+            if dig:
+                groups_by_source.setdefault(dig, set()).add(r["physical_tube_id"])
+        self.assertEqual(len(groups_by_source), 4)
+        for dig, grps in groups_by_source.items():
+            self.assertEqual(len(grps), 1, f"Source {dig} leaked across multiple groups: {grps}")
+
+        # Defense-in-depth in _select_group_split: if two groups share a source_digest, keep both in train!
+        synthetic_rows = [
+            {"sample_id": f"S_{g}_{c}", "label": c, "physical_tube_id": g, "source_digest": src}
+            for g, src in [
+                ("TUBE_G01", "src_shared"),
+                ("TUBE_G02", "src_b"),
+                ("TUBE_G03", "src_shared"),
+                ("TUBE_G04", "src_d"),
+            ]
+            for c in CLASSES
+        ]
+        split = self.tm._select_group_split(synthetic_rows)
+        self.assertEqual(set(split["train_groups"]), {"TUBE_G01", "TUBE_G03"})
+        self.assertEqual(set(split["val_groups"]) | set(split["test_groups"]), {"TUBE_G02", "TUBE_G04"})
+
+    # ------------------------------------------------------------------
+    # R2-16 & R2-34: Include train-only ungrouped labels in coverage & O(1) per-pair scaling
+    # ------------------------------------------------------------------
+    def test_r2_16_and_r2_34_ungrouped_train_coverage_and_fast_large_group_split(self) -> None:
+        # R2-16: TUBE_A has complete/crossed_out/covered; TUBE_B & TUBE_C have complete; UNGROUPED supplies absent
+        for i in range(3):
+            self.tm.capture_sample(_make_dummy_crop(710 + i), "complete", physical_tube_id="TUBE_A")
+            self.tm.capture_sample(_make_dummy_crop(720 + i), "crossed_out", physical_tube_id="TUBE_A")
+            self.tm.capture_sample(_make_dummy_crop(730 + i), "covered", physical_tube_id="TUBE_A")
+            self.tm.capture_sample(_make_dummy_crop(740 + i), "absent", physical_tube_id=None)
+        self.tm.capture_sample(_make_dummy_crop(750), "complete", physical_tube_id="TUBE_B")
+        self.tm.capture_sample(_make_dummy_crop(751), "complete", physical_tube_id="TUBE_C")
+
+        summary = self.tm.get_dataset_summary()
+        self.assertEqual(summary["independent_tube_groups"], 3)
+        self.assertEqual(summary["ungrouped_samples"], 3)
+        self.assertTrue(summary["ready_to_train"], summary["readiness_reason"])
+
+        split = self.tm._select_group_split(self.tm._read_manifest_rows())
+        self.assertEqual(split["train_groups"], ["TUBE_A"])
+        self.assertEqual(set(split["val_groups"]) | set(split["test_groups"]), {"TUBE_B", "TUBE_C"})
+        self.assertEqual({r["label"] for r in split["train_rows"]}, set(CLASSES))
+
+        # R2-34: 300 partial-class groups (no full-class holdouts) must resolve cleanly and quickly
+        large_rows = []
+        for g_idx in range(300):
+            tk = f"TUBE_{g_idx:04d}"
+            # Each group has 2 of the 4 classes so fallback pair search must run across many pairs
+            c1 = CLASSES[g_idx % len(CLASSES)]
+            c2 = CLASSES[(g_idx + 1) % len(CLASSES)]
+            large_rows.append({"sample_id": f"L_{g_idx}_1", "label": c1, "physical_tube_id": tk, "source_digest": ""})
+            large_rows.append({"sample_id": f"L_{g_idx}_2", "label": c2, "physical_tube_id": tk, "source_digest": ""})
+
+        t0 = time.perf_counter()
+        large_split = self.tm._select_group_split(large_rows)
+        elapsed = time.perf_counter() - t0
+        self.assertEqual({r["label"] for r in large_split["train_rows"]}, set(CLASSES))
+        self.assertLess(elapsed, 1.5, f"300-group split took too long: {elapsed:.3f}s")
+
+    # ------------------------------------------------------------------
+    # R2-17: Exclude previously trained samples even after their tube ID changes
+    # ------------------------------------------------------------------
+    def test_r2_17_warm_start_excludes_reassigned_previously_trained_samples(self) -> None:
+        _populate_real_tubes(self.tm, ["TUBE_W1", "TUBE_W2", "TUBE_W3"], samples_per_class=2)
+        ungrouped_ids: list[str] = []
+        for idx, cls in enumerate(CLASSES):
+            s = self.tm.capture_sample(_make_dummy_crop(800 + idx), cls, physical_tube_id=None)
+            ungrouped_ids.append(s["sample_id"])
+
+        # Run 1 trains on TUBE_W1 + all 4 UNGROUPED samples (holdouts: TUBE_W2, TUBE_W3)
+        self.tm.start_training(epochs=2, input_size=64, batch_size=8, resume_from_latest=False, use_augmentation=False)
+        st1 = _wait_for_training(self.tm)
+        self.assertEqual(st1["state"], "COMPLETED", st1)
+        run1 = st1["latest_run"]
+        self.assertEqual(run1["train_groups"], ["TUBE_W1"])
+        for uid in ungrouped_ids:
+            self.assertIn(uid, run1["seen_sample_ids"])
+
+        # Engineer later reassigns those previously trained ungrouped samples into a brand-new tube ID
+        for uid in ungrouped_ids:
+            self.tm.update_sample_annotation(uid, physical_tube_id="TUBE_Z_REASSIGNED")
+
+        # Run 2 (warm-start): TUBE_Z_REASSIGNED sorts last and has all 4 classes,
+        # yet MUST NOT be placed into val or test because the checkpoint already trained on its samples!
+        self.tm.start_training(epochs=2, input_size=64, batch_size=8, resume_from_latest=True, use_augmentation=False)
+        st2 = _wait_for_training(self.tm)
+        self.assertEqual(st2["state"], "COMPLETED", st2)
+        run2 = st2["latest_run"]
+        self.assertEqual(run2["resumed_from"], run1["model_version"])
+        self.assertNotIn("TUBE_Z_REASSIGNED", run2["val_groups"])
+        self.assertNotIn("TUBE_Z_REASSIGNED", run2["test_groups"])
+        self.assertIn("TUBE_Z_REASSIGNED", run2["train_groups"])
+        self.assertEqual(set(run2["val_groups"]) | set(run2["test_groups"]), {"TUBE_W2", "TUBE_W3"})
+
+        # Delete TUBE_W3 so only 1 truly unseen tube (TUBE_W2) remains -> warm-start must reject cleanly!
+        w3_ids = [s["sample_id"] for s in self.tm.list_samples() if s["physical_tube_id"] == "TUBE_W3"]
+        self.tm.batch_delete_samples(sample_ids=w3_ids)
+        self.tm.start_training(epochs=2, input_size=64, batch_size=8, resume_from_latest=True, use_augmentation=False)
+        st3 = _wait_for_training(self.tm)
+        self.assertEqual(st3["state"], "FAILED")
+        self.assertIn("增量微调", str(st3["error"]))
+
+    # ------------------------------------------------------------------
+    # R2-18: Preserve successful activation when final metrics.json rewrite fails
+    # ------------------------------------------------------------------
+    def test_r2_18_activation_preserved_when_final_metrics_rewrite_fails(self) -> None:
+        _populate_real_tubes(self.tm, ["TUBE_M1", "TUBE_M2", "TUBE_M3"], samples_per_class=2)
+        real_write_json = tm_mod._write_json_atomic
+        write_calls = {"count": 0}
+
+        def flaky_metrics_write(path: Path, payload: dict) -> None:
+            if path.name == "metrics.json":
+                write_calls["count"] += 1
+                # First write (pre-callback pending record) succeeds; subsequent post-activation rewrites fail
+                if write_calls["count"] >= 2:
+                    raise OSError("Simulated metrics disk lock")
+            real_write_json(path, payload)
+
+        with mock.patch.object(tm_mod, "_write_json_atomic", side_effect=flaky_metrics_write):
+            self.tm.start_training(
+                epochs=2,
+                input_size=64,
+                batch_size=8,
+                resume_from_latest=False,
+                use_augmentation=False,
+                on_complete=lambda _: True,
+            )
+            st = _wait_for_training(self.tm)
+
+        # Confirmed activation MUST remain COMPLETED & activated=True, NOT FAILED / activated=False!
+        self.assertEqual(st["state"], "COMPLETED", st)
+        self.assertTrue(st["exported"])
+        self.assertTrue(st["activated"])
+        self.assertEqual(st["activation_status"], "activated")
+        self.assertFalse(st["metrics_persisted"])
+        self.assertIn("Simulated metrics disk lock", str(st["metrics_write_error"]))
+        # Automatic retry ran 3 times (1 initial pre-callback write + 3 post-activation retries = 4 calls)
+        self.assertEqual(write_calls["count"], 4)
+
+        # Once disk lock clears, explicit retry persists activated=True cleanly to metrics.json
+        self.assertTrue(self.tm.retry_persist_latest_metrics())
+        st_after = self.tm.get_training_status()
+        self.assertTrue(st_after["metrics_persisted"])
+        self.assertIsNone(st_after["metrics_write_error"])
+        metrics_path = Path(st_after["latest_run"]["onnx_path"]).parent / "metrics.json"
+        persisted_meta = json.loads(metrics_path.read_text(encoding="utf-8"))
+        self.assertTrue(persisted_meta["activated"])
+        self.assertEqual(persisted_meta["activation_status"], "activated")
 
 
 if __name__ == "__main__":
