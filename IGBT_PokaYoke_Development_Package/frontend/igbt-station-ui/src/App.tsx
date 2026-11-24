@@ -1,11 +1,9 @@
-/* eslint-disable @typescript-eslint/no-explicit-any -- 机器视觉 API 响应已定义在后端 SQLite 模式中 */
-import { Fragment, useCallback, useEffect, useRef, useState } from "react"
+/* eslint-disable @typescript-eslint/no-explicit-any -- 机器视觉 API 响应已定义在后端模式中 */
+import { useCallback, useEffect, useRef, useState } from "react"
 import { AlertDialog, Dialog } from "radix-ui"
 import {
   AlertTriangle,
   Camera,
-  CheckCircle2,
-  ChevronRight,
   ClipboardList,
   Copy,
   Cpu,
@@ -16,7 +14,6 @@ import {
   Globe,
   HardDrive,
   ImagePlus,
-  Layers,
   Lock,
   LogOut,
   Moon,
@@ -27,6 +24,7 @@ import {
   ShieldAlert,
   Sliders,
   Sparkles,
+  Square,
   Sun,
   Trash2,
   Upload,
@@ -48,7 +46,6 @@ import {
   type Data,
   cameraText,
   dateTimeOf,
-  deriveOutcome,
   fmt,
   formatCTimerSeconds,
   human,
@@ -64,7 +61,18 @@ type EngineerStep = "monitor" | "collect" | "train" | "records_settings"
 type RecordsSettingsTab = "records" | "storage" | "settings"
 type CycleFilter = "ALL" | "PASS" | "ALARM" | "VIEW_INVALID"
 type SampleLabel = "complete" | "crossed_out" | "covered" | "absent" | "unknown_challenge"
+type AutoCaptureLabel = "complete" | "crossed_out" | "covered" | "absent"
 type SampleFilter = "" | SampleLabel
+
+interface AutoCaptureState {
+  enabled: boolean
+  every_n_frames: number
+  label: AutoCaptureLabel
+  pipe_color: string
+  physical_tube_id: string
+  max_samples: number
+  captured_count: number
+}
 
 interface ConfirmDialogState {
   title: string
@@ -86,6 +94,33 @@ interface StoredEngineerSession {
 
 const ENGINEER_SESSION_KEY = "igbt_engineer_session_v1"
 const IDLE_LOCK_MS = 30 * 60 * 1000
+const DEFAULT_CAMERA_WIDTH = 1280
+const DEFAULT_CAMERA_HEIGHT = 720
+
+function parseAutoCapture(raw: unknown): AutoCaptureState | null {
+  if (!raw || typeof raw !== "object") return null
+  const src =
+    "auto_capture" in (raw as Record<string, unknown>) &&
+    typeof (raw as Record<string, unknown>).auto_capture === "object" &&
+    (raw as Record<string, unknown>).auto_capture !== null
+      ? ((raw as Record<string, unknown>).auto_capture as Record<string, unknown>)
+      : (raw as Record<string, unknown>)
+  if (typeof src.enabled !== "boolean" && src.captured_count === undefined && src.every_n_frames === undefined) {
+    return null
+  }
+  const rawLabel = String(src.label || "complete")
+  const validLabel: AutoCaptureLabel =
+    rawLabel === "crossed_out" || rawLabel === "covered" || rawLabel === "absent" ? rawLabel : "complete"
+  return {
+    enabled: Boolean(src.enabled),
+    every_n_frames: Math.max(1, Number(src.every_n_frames) || 10),
+    label: validLabel,
+    pipe_color: String(src.pipe_color || "yellow"),
+    physical_tube_id: String(src.physical_tube_id || "UNGROUPED"),
+    max_samples: Math.max(1, Number(src.max_samples) || 200),
+    captured_count: Math.max(0, Number(src.captured_count) || 0),
+  }
+}
 
 function readStoredSession(): StoredEngineerSession | null {
   try {
@@ -131,7 +166,7 @@ function saveStoredSession(token: string, expiresInSeconds: number): StoredEngin
   try {
     window.sessionStorage.setItem(ENGINEER_SESSION_KEY, JSON.stringify(session))
   } catch {
-    /* 忽略浏览器隐私模式 sessionStorage 异常 */
+    /* 忽略隐私模式 sessionStorage 异常 */
   }
   return session
 }
@@ -144,7 +179,7 @@ function touchStoredSession(now: number): void {
     parsed.lastActiveAt = now
     window.sessionStorage.setItem(ENGINEER_SESSION_KEY, JSON.stringify(parsed))
   } catch {
-    /* 忽略 sessionStorage 写入异常 */
+    /* 忽略 sessionStorage 异常 */
   }
 }
 
@@ -152,22 +187,15 @@ function clearStoredSession(): void {
   try {
     window.sessionStorage.removeItem(ENGINEER_SESSION_KEY)
   } catch {
-    /* 忽略 sessionStorage 清理异常 */
+    /* 忽略 sessionStorage 异常 */
   }
 }
 
 const roiNames = ["tube_roi", "label_roi", "label_contact_roi", "left_grip_zone", "right_grip_zone"]
 const roiLabels: Record<string, string> = {
-  tube_roi: "料管整体参考区",
-  label_roi: "防呆标签参考区",
-  label_contact_roi: "标签接触参考区",
-  left_grip_zone: "左端握持参考区",
-  right_grip_zone: "右端握持参考区",
-}
-const roiShortLabels: Record<string, string> = {
   tube_roi: "料管整体",
   label_roi: "防呆标签",
-  label_contact_roi: "接触区",
+  label_contact_roi: "标签接触",
   left_grip_zone: "左握持区",
   right_grip_zone: "右握持区",
 }
@@ -182,53 +210,51 @@ const defaultStandardRois: Record<string, [number, number, number, number]> = {
 }
 
 const simScenarios: { id: string; label: string; tone?: string }[] = [
-  { id: "a_pass", label: "A 划除" },
-  { id: "b_pass", label: "B 遮挡" },
-  { id: "c_pass", label: "C 撕除" },
+  { id: "a_pass", label: "划除放行" },
+  { id: "b_pass", label: "遮挡放行" },
+  { id: "c_pass", label: "脱落放行" },
   { id: "alarm", label: "未处理报警", tone: "bad" },
   { id: "glare_invalid", label: "反光受阻", tone: "warn" },
   { id: "reset", label: "恢复实时" },
 ]
 
 const thresholdFields: [string, string, string][] = [
-  ["hand_glove_confidence", "手部/手套动态追踪置信度", "0.01"],
-  ["label_min_confidence", "标签分类最小置信度", "0.01"],
-  ["label_min_margin", "置信度最小差值间隔", "0.01"],
-  ["stable_state_ms", "状态稳定确认时长（毫秒）", "1"],
-  ["min_stable_frames", "最少连续稳定帧数", "1"],
-  ["min_laplacian_variance", "标签区清晰度下限（拉普拉斯）", "0.1"],
-  ["min_brightness", "标签区亮度下限", "1"],
-  ["max_brightness", "标签区亮度上限", "1"],
-  ["max_overexposed_fraction", "反光过曝面积上限", "0.01"],
+  ["hand_glove_confidence", "手套置信", "0.01"],
+  ["label_min_confidence", "分类置信", "0.01"],
+  ["label_min_margin", "置信差值", "0.01"],
+  ["stable_state_ms", "稳定毫秒", "1"],
+  ["min_stable_frames", "稳定帧数", "1"],
+  ["min_laplacian_variance", "清晰下限", "0.1"],
+  ["min_brightness", "亮度下限", "1"],
+  ["max_brightness", "亮度上限", "1"],
+  ["max_overexposed_fraction", "反光上限", "0.01"],
 ]
 
-const engineerSteps: { id: EngineerStep; num: string; label: string; icon: typeof Camera }[] = [
-  { id: "monitor", num: "1", label: "实时监控", icon: Camera },
-  { id: "collect", num: "2", label: "采集标注", icon: Database },
-  { id: "train", num: "3", label: "训练部署", icon: Cpu },
-  { id: "records_settings", num: "4", label: "记录与设置", icon: Sliders },
+const engineerSteps: { id: EngineerStep; label: string; icon: typeof Camera }[] = [
+  { id: "monitor", label: "实时监控", icon: Camera },
+  { id: "collect", label: "采集标注", icon: Database },
+  { id: "train", label: "训练部署", icon: Cpu },
+  { id: "records_settings", label: "记录设置", icon: Sliders },
 ]
 
 const sampleClassDefs: {
   id: SampleLabel
   title: string
   short: string
-  desc: string
-  tone: string
 }[] = [
-  { id: "complete", title: "拍【完整标签】", short: "完整标签", desc: "未划除、未遮挡的原始白色标签", tone: "warn" },
-  { id: "crossed_out", title: "拍【A类 · 已划除】", short: "A类划除", desc: "记号笔明显划叉的合格标签", tone: "pass" },
-  { id: "covered", title: "拍【B类 · 已遮挡】", short: "B类遮挡", desc: "深色胶带或标签完全覆盖", tone: "pass" },
-  { id: "absent", title: "拍【C类 · 已脱落】", short: "C类脱落", desc: "已撕除标签、仅露透明管壁", tone: "pass" },
-  { id: "unknown_challenge", title: "拍【挑战样本】", short: "挑战样本", desc: "反光、模糊或手部半遮挡边界", tone: "plain" },
+  { id: "complete", title: "抓拍 · 完整", short: "完整" },
+  { id: "crossed_out", title: "抓拍 · 已划除", short: "已划除" },
+  { id: "covered", title: "抓拍 · 已遮挡", short: "已遮挡" },
+  { id: "absent", title: "抓拍 · 已脱落", short: "已脱落" },
+  { id: "unknown_challenge", title: "抓拍 · 挑战", short: "挑战" },
 ]
 
 const sampleFilterOptions: { id: SampleFilter; label: string }[] = [
   { id: "", label: "全部" },
   { id: "complete", label: "完整" },
-  { id: "crossed_out", label: "A类划除" },
-  { id: "covered", label: "B类遮挡" },
-  { id: "absent", label: "C类脱落" },
+  { id: "crossed_out", label: "已划除" },
+  { id: "covered", label: "已遮挡" },
+  { id: "absent", label: "已脱落" },
   { id: "unknown_challenge", label: "挑战" },
 ]
 
@@ -249,7 +275,7 @@ class ApiError extends Error {
 }
 
 class RequestTimeoutError extends Error {
-  constructor(message = "请求超时，本机工位服务无响应") {
+  constructor(message = "请求超时") {
     super(message)
     this.name = "RequestTimeoutError"
   }
@@ -295,7 +321,7 @@ function writeStoredThemePreference(nextTheme: "light" | "dark"): void {
   try {
     window.localStorage.setItem("igbt-ui-theme", nextTheme)
   } catch {
-    /* 浏览器存储不可用或配额满时保留内存主题状态 */
+    /* 保留内存状态 */
   }
 }
 
@@ -368,13 +394,20 @@ async function api<T = any>(
   }
 }
 
+function getClassCounts(ds: Data): Record<string, number> {
+  return ds?.class_counts || ds?.counts_by_class || {}
+}
+
+function isDatasetReady(ds: Data): boolean {
+  return Boolean(ds?.ready_to_train ?? ds?.ready_for_training)
+}
+
 function App() {
   const [showShowcase, setShowShowcase] = useState(() => {
     const sp = new URLSearchParams(window.location.search)
     return sp.get("showcase") === "1" || sp.get("page") === "showcase"
   })
 
-  // 严格角色隔离：默认 operator；会话主状态保存在内存中，sessionStorage 仅作刷新恢复（不可用时不强制登出）
   const [engineerSession, setEngineerSession] = useState<StoredEngineerSession | null>(() => readStoredSession())
   const role: Role = engineerSession ? "engineer" : "operator"
   const adminToken = engineerSession?.token || ""
@@ -397,6 +430,9 @@ function App() {
   const [currentTime, setCurrentTime] = useState(new Date())
   const [state, setState] = useState<Data>({
     camera_status: "NOT_CONNECTED",
+    camera_width: DEFAULT_CAMERA_WIDTH,
+    camera_height: DEFAULT_CAMERA_HEIGHT,
+    fps: 25,
     view_valid: false,
     label_status: "unknown",
     fsm_state: "WAIT_PART",
@@ -407,7 +443,12 @@ function App() {
   })
   const [cycles, setCycles] = useState<Data[]>([])
   const [evidence, setEvidence] = useState<Data[]>([])
-  const [config, setConfig] = useState<Data>({ rois: {}, thresholds: {} })
+  const [config, setConfig] = useState<Data>({
+    camera_width: DEFAULT_CAMERA_WIDTH,
+    camera_height: DEFAULT_CAMERA_HEIGHT,
+    rois: {},
+    thresholds: {},
+  })
   const [history, setHistory] = useState<Data[]>([])
   const [models, setModels] = useState<Data[]>([])
   const [datasetSummary, setDatasetSummary] = useState<Data>({
@@ -419,7 +460,7 @@ function App() {
   })
   const [trainingStatus, setTrainingStatus] = useState<Data>({
     state: "IDLE",
-    message: "等待启动训练",
+    message: "待启动",
     progress_pct: 0,
     history: [],
   })
@@ -481,7 +522,6 @@ function App() {
 
   const isBusinessInventoryAvailable = useCallback(() => hasInventoryRef.current, [])
 
-  // 登录成功后将键盘焦点移入工程师工作区首步导航控件
   useEffect(() => {
     if (role !== "engineer" || !shouldFocusEngineerRef.current) return
     shouldFocusEngineerRef.current = false
@@ -549,7 +589,6 @@ function App() {
     [clearSelectedCycle, flash]
   )
 
-  // 工程师会话 30 分钟无操作或令牌到期自动锁屏回退作业员屏（基于内存会话，不依赖 sessionStorage 写入成功）
   useEffect(() => {
     if (!engineerSession) return
 
@@ -581,7 +620,7 @@ function App() {
         lastActiveRef.current = stored.lastActiveAt
       }
       if (now - lastActiveRef.current >= engineerSession.idleTimeoutMs || now >= engineerSession.expiresAt) {
-        lockEngineerSession("工程师会话已超时自动锁定，已返回作业员视图")
+        lockEngineerSession("会话超时锁定")
       }
     }, 15_000)
 
@@ -650,7 +689,7 @@ function App() {
             loading: false,
             error: msg,
           }))
-          flash(`加载周期时间线失败：${msg}`)
+          flash(`加载失败：${msg}`)
         }
       } finally {
         if (eventsAbortRef.current === controller) {
@@ -711,9 +750,12 @@ function App() {
           (err) => {
             if (!isCurrent() || isAbortError(err)) return undefined
             setConnected(false)
-            setError(err instanceof Error ? err.message : "无法连接本地工作站服务")
+            setError(err instanceof Error ? err.message : "服务未连接")
             setState({
               camera_status: "FAULT",
+              camera_width: DEFAULT_CAMERA_WIDTH,
+              camera_height: DEFAULT_CAMERA_HEIGHT,
+              fps: 0,
               view_valid: false,
               label_status: "unknown",
               fsm_state: "FAULT",
@@ -779,7 +821,7 @@ function App() {
               },
               (err) => {
                 if (!isCurrent() || isAbortError(err)) return
-                setTrainingError(err instanceof Error ? err.message : "无法获取训练任务状态")
+                setTrainingError(err instanceof Error ? err.message : "训练状态获取失败")
               }
             ),
             Promise.all([statePromise, cyclesPromise]).then(([latestState, latestCycles]) => {
@@ -847,7 +889,7 @@ function App() {
       hasInventoryRef.current = false
       if (confirmDialogRef.current?.requiresInventory) {
         setConfirmDialog((cur) => (cur?.requiresInventory ? null : cur))
-        flash("存储统计已失效，已自动关闭全量销毁确认弹窗，请重新刷新存储统计后再操作")
+        flash("统计已失效，请刷新存储统计后重试")
       }
     }
 
@@ -865,13 +907,13 @@ function App() {
         setStorageError("")
       } else {
         setStorageOverview(null)
-        setStorageError("存储统计返回结构不完整")
+        setStorageError("统计数据不完整")
         invalidateInventoryDialog()
       }
     } catch (err) {
       if (!isLatestForSession() || isAbortError(err)) return
       setStorageOverview(null)
-      setStorageError(err instanceof Error ? err.message : "存储统计获取失败")
+      setStorageError(err instanceof Error ? err.message : "统计获取失败")
       invalidateInventoryDialog()
     } finally {
       if (storageAbortRef.current === controller) {
@@ -897,7 +939,7 @@ function App() {
       setEngineerSession(stored)
       setStep("monitor")
       setAuthModalOpen(false)
-      flash("工程师权限已解锁（30 分钟无操作将自动锁屏）")
+      flash("已进入工程师工作台")
       void refresh(true)
     },
     [flash, refresh]
@@ -907,9 +949,9 @@ function App() {
     try {
       const res = await api<Data>("/api/camera/capture", { method: "POST" }, adminTokenRef.current)
       setCaptureShutterSeq((n) => n + 1)
-      flash(`已抓拍当前画面并归档 (${res.cycle_id})`)
+      flash(`已抓拍归档 (${res.cycle_id})`)
     } catch (err) {
-      flash(`抓拍归档失败：${err instanceof Error ? err.message : String(err)}`)
+      flash(`抓拍失败：${err instanceof Error ? err.message : String(err)}`)
     } finally {
       await refresh()
     }
@@ -927,7 +969,7 @@ function App() {
           },
           adminTokenRef.current
         )
-        flash(show ? "已在实时画面叠加辅助参考框" : "已切换为纯动态目标跟随模式")
+        flash(show ? "已显示辅助框" : "已隐藏辅助框")
         await refresh(true)
       } catch (err) {
         flash(String(err))
@@ -951,7 +993,7 @@ function App() {
         )
         const nextMirror = res.mirror_horizontal !== false
         setState((prev) => ({ ...prev, mirror_horizontal: nextMirror }))
-        flash(nextMirror ? "水平镜像对齐已开启（左右手与现实同步）" : "水平镜像已关闭（原始相机视角）")
+        flash(nextMirror ? "镜像已开启" : "镜像已关闭")
         await refresh(true)
       } catch (err) {
         flash(`镜像切换失败：${err instanceof Error ? err.message : err}`)
@@ -974,14 +1016,10 @@ function App() {
           },
           adminTokenRef.current
         )
-        flash(
-          mode === "debug"
-            ? "已切至【桌面调试模式】：免手套防误锁，适合桌面调参"
-            : "已切至【车间严格模式】：强制白色防静电手套检测与料管入位门控"
-        )
+        flash(mode === "debug" ? "已切换桌面调试" : "已切换车间严格")
         await refresh(true)
       } catch (err) {
-        flash(`模式切换失败：${err instanceof Error ? err.message : err}`)
+        flash(`切换失败：${err instanceof Error ? err.message : err}`)
       }
     },
     [flash, refresh]
@@ -1004,9 +1042,9 @@ function App() {
           e instanceof ApiError &&
           (e.status === 401 || e.status === 403)
         ) {
-          flash("实时报警复位需工程师权限，请先点击右上角「工程师登录」验证后再复位")
+          flash("报警复位需工程师登录")
         } else {
-          flash(`操作失败：${e instanceof Error ? e.message : e}`)
+          flash(`执行失败：${e instanceof Error ? e.message : e}`)
         }
       } finally {
         setSimulating("")
@@ -1065,6 +1103,7 @@ function App() {
       kind: matched?.kind,
       pipeColor: c.pipe_color,
       labelStatus: c.initial_label,
+      reason: c.result_reason,
     }
   })
 
@@ -1100,6 +1139,8 @@ function App() {
   const mirrorHorizontal = state.mirror_horizontal !== false
   const workMode = state.work_mode === "strict" ? "strict" : "debug"
   const isTraining = trainingStatus.state === "TRAINING" || trainingStatus.state === "EXPORTING_ONNX"
+  const camW = Number(state.camera_width) || DEFAULT_CAMERA_WIDTH
+  const camH = Number(state.camera_height) || DEFAULT_CAMERA_HEIGHT
 
   if (showShowcase) {
     return (
@@ -1120,23 +1161,22 @@ function App() {
         <header className="topbar operator-topbar">
           <div className="op-brand">
             <span className="rail-brand-mark" aria-hidden="true" />
-            <h1>晶界智检 · 一号目检工位</h1>
+            <h1>晶界智检</h1>
           </div>
           <div className="spacer" />
           <div className="meta">
             <span className={`lamp ${connected ? "ok" : "bad"}`} aria-hidden="true" />
-            {connected ? "在线" : "离线"}
+            <span>{connected ? "在线" : "离线"}</span>
           </div>
-          <span className="divider" aria-hidden="true" />
           <span className="clock">{currentTime.toLocaleTimeString("zh-CN", { hour12: false })}</span>
           <button
             type="button"
             className="icon-btn"
             aria-label={theme === "light" ? "切换深色模式" : "切换浅色模式"}
-            title={theme === "light" ? "切换深色模式" : "切换浅色模式"}
+            title={theme === "light" ? "深色模式" : "浅色模式"}
             onClick={() => setTheme((cur) => (cur === "light" ? "dark" : "light"))}
           >
-            {theme === "light" ? <Moon size={15} aria-hidden="true" /> : <Sun size={15} aria-hidden="true" />}
+            {theme === "light" ? <Moon size={16} aria-hidden="true" /> : <Sun size={16} aria-hidden="true" />}
           </button>
           <button
             ref={loginTriggerRef}
@@ -1144,7 +1184,7 @@ function App() {
             className="btn sm"
             onClick={() => setAuthModalOpen(true)}
           >
-            <Lock size={14} aria-hidden="true" />
+            <Lock size={16} aria-hidden="true" />
             工程师登录
           </button>
         </header>
@@ -1155,10 +1195,8 @@ function App() {
             <h1>晶界智检</h1>
           </div>
 
-          <span className="divider" aria-hidden="true" />
-
-          <nav className="studio-stepper" aria-label="工程师四步工作流">
-            {engineerSteps.map((item, idx) => {
+          <nav className="studio-stepper" aria-label="工程师工作流">
+            {engineerSteps.map((item) => {
               const Icon = item.icon
               const active = step === item.id
               const badge =
@@ -1173,53 +1211,50 @@ function App() {
                       : null
 
               return (
-                <Fragment key={item.id}>
-                  {idx > 0 && <ChevronRight size={13} className="studio-step-sep" aria-hidden="true" />}
-                  <button
-                    ref={item.id === "monitor" ? engineerEntryFocusRef : undefined}
-                    type="button"
-                    className={`studio-step-btn ${active ? "on" : ""}`}
-                    aria-current={active ? "step" : undefined}
-                    onClick={() => setStep(item.id)}
-                  >
-                    <span className="studio-step-num mono">{item.num}</span>
-                    <Icon size={13} aria-hidden="true" />
-                    <span>{item.label}</span>
-                    {badge !== null && <span className="studio-step-badge mono">{badge}</span>}
-                  </button>
-                </Fragment>
+                <button
+                  key={item.id}
+                  ref={item.id === "monitor" ? engineerEntryFocusRef : undefined}
+                  type="button"
+                  className={`studio-step-btn ${active ? "on" : ""}`}
+                  aria-current={active ? "step" : undefined}
+                  onClick={() => setStep(item.id)}
+                >
+                  <Icon size={16} aria-hidden="true" />
+                  <span>{item.label}</span>
+                  {badge !== null && <span className="studio-step-badge mono">{badge}</span>}
+                </button>
               )
             })}
           </nav>
 
           <div className="spacer" />
 
+          <span className="tag plain mono">C++20 · 720P 25FPS</span>
           <div className="meta">
             <span className={`lamp ${connected ? "ok" : "bad"}`} aria-hidden="true" />
             <span>{connected ? "在线" : "离线"}</span>
           </div>
-          <span className="divider" aria-hidden="true" />
           <span className="clock">{currentTime.toLocaleTimeString("zh-CN", { hour12: false })}</span>
           <button
             type="button"
             className="btn ghost sm"
-            title="打开产品展示官网"
+            title="产品官网"
             onClick={() => {
               setShowShowcase(true)
               window.history.replaceState(null, "", "/?showcase=1")
             }}
           >
-            <Globe size={13} aria-hidden="true" />
+            <Globe size={16} aria-hidden="true" />
             官网
           </button>
           <button
             type="button"
             className="icon-btn"
             aria-label={theme === "light" ? "切换深色模式" : "切换浅色模式"}
-            title={theme === "light" ? "深色模式（快捷键 T）" : "浅色模式（快捷键 T）"}
+            title="切换明暗 (T)"
             onClick={() => setTheme((cur) => (cur === "light" ? "dark" : "light"))}
           >
-            {theme === "light" ? <Moon size={15} aria-hidden="true" /> : <Sun size={15} aria-hidden="true" />}
+            {theme === "light" ? <Moon size={16} aria-hidden="true" /> : <Sun size={16} aria-hidden="true" />}
           </button>
           <button
             type="button"
@@ -1233,23 +1268,23 @@ function App() {
               }
             }}
           >
-            <RefreshCw size={15} aria-hidden="true" />
+            <RefreshCw size={16} aria-hidden="true" />
           </button>
           <button
             type="button"
             className="btn sm"
-            onClick={() => lockEngineerSession("已锁定退出，返回作业员屏")}
+            onClick={() => lockEngineerSession("已返回作业员视图")}
           >
-            <LogOut size={13} aria-hidden="true" />
-            锁定退出
+            <LogOut size={16} aria-hidden="true" />
+            退出
           </button>
         </header>
       )}
 
       {error && (
         <div className="banner studio-banner" role="alert">
-          <AlertTriangle size={15} aria-hidden="true" />
-          <span>本机工位服务离线，系统保持闭锁。</span>
+          <AlertTriangle size={16} aria-hidden="true" />
+          <span>工位服务离线闭锁</span>
           <code>{error}</code>
         </div>
       )}
@@ -1339,7 +1374,6 @@ function App() {
                 passCount={passCount}
                 alarmCount={alarmCount}
                 totalCount={totalCount}
-                statsScope={statsScope}
                 token={adminToken}
                 mirrorHorizontal={mirrorHorizontal}
                 togglingMirror={togglingMirror}
@@ -1371,26 +1405,18 @@ function App() {
             )}
           </main>
 
-          <footer className="studio-statusbar" aria-label="工位运行遥测状态栏">
+          <footer className="studio-statusbar" aria-label="运行遥测栏">
+            <span className="mono">{`${camW} × ${camH}`}</span>
             <span className="mono">
-              {state.camera_width && state.camera_height ? `${state.camera_width}×${state.camera_height}` : "1920×1080"}
+              {state.fps != null ? `${fmt(state.fps, 1)} FPS` : "25.0 FPS"}
+              {state.inference_ms ? ` · ${state.inference_ms} ms` : ""}
             </span>
-            <span className="studio-sb-dot" aria-hidden="true" />
-            <span className="mono">
-              {fmt(state.fps, 1)} FPS{state.inference_ms ? ` · ${state.inference_ms} ms` : ""}
-            </span>
-            <span className="studio-sb-dot" aria-hidden="true" />
             <span>
-              水平镜像：
-              <b className={mirrorHorizontal ? "sb-ok" : "sb-muted"}>
-                {mirrorHorizontal ? "已开启（左右同步）" : "已关闭（原始画面）"}
-              </b>
+              镜像：<b className={mirrorHorizontal ? "sb-ok" : "sb-muted"}>{mirrorHorizontal ? "开" : "关"}</b>
             </span>
-            <span className="studio-sb-dot" aria-hidden="true" />
-            <span>运行模式：{workMode === "strict" ? "车间严格模式" : "桌面调试模式"}</span>
-            <span className="studio-sb-dot" aria-hidden="true" />
+            <span>{workMode === "strict" ? "车间严格" : "桌面调试"}</span>
             <span className="studio-sb-engine mono">
-              推理引擎：{state.inference_backend || state.model_version || "动态视觉引擎"}
+              {state.inference_backend || state.model_version || "C++20 · 720P 25FPS"}
             </span>
             <span className="sep" />
             <span className="studio-sb-keys">
@@ -1422,7 +1448,7 @@ function App() {
         <div className="toast" role="status">
           <span>{notice}</span>
           <button type="button" onClick={() => setNotice("")} aria-label="关闭通知">
-            <X size={14} aria-hidden="true" />
+            <X size={16} aria-hidden="true" />
           </button>
         </div>
       )}
@@ -1502,16 +1528,14 @@ function ConfirmModalContent({
           cancelBtnRef.current?.focus()
         }}
         onEscapeKeyDown={(e) => {
-          if (busy) {
-            e.preventDefault()
-          }
+          if (busy) e.preventDefault()
         }}
       >
         <header className="panel-head">
           <AlertDialog.Title asChild>
-            <h2 id="confirm-dialog-title" className="flex items-center gap-1.5">
+            <h2 id="confirm-dialog-title" className="flex items-center gap-2">
               <ShieldAlert
-                size={15}
+                size={18}
                 aria-hidden="true"
                 style={{ color: dialog.tone === "danger" ? "var(--bad)" : "var(--warn)" }}
               />
@@ -1524,13 +1548,13 @@ function ConfirmModalContent({
               className="icon-btn"
               disabled={busy}
               onClick={onClose}
-              aria-label="取消并关闭"
+              aria-label="关闭"
             >
-              <X size={15} aria-hidden="true" />
+              <X size={16} aria-hidden="true" />
             </button>
           </div>
         </header>
-        <div className="panel-body grid gap-3">
+        <div className="panel-body">
           <div className={`confirm-consequence ${dialog.tone === "danger" ? "danger" : ""}`}>
             <AlertDialog.Description asChild>
               <div id="confirm-dialog-desc">{dialog.description}</div>
@@ -1545,7 +1569,7 @@ function ConfirmModalContent({
           </div>
 
           {dialog.requireCheckLabel && (
-            <label className="check" style={{ color: "var(--ink)", fontWeight: 500 }}>
+            <label className="check" style={{ fontWeight: 600 }}>
               <input
                 type="checkbox"
                 checked={acknowledged}
@@ -1560,7 +1584,7 @@ function ConfirmModalContent({
             <button
               ref={cancelBtnRef}
               type="button"
-              className="btn ghost sm"
+              className="btn ghost"
               disabled={busy}
               onClick={onClose}
             >
@@ -1568,7 +1592,7 @@ function ConfirmModalContent({
             </button>
             <button
               type="button"
-              className={`btn sm ${dialog.tone === "danger" ? "btn-danger" : ""}`}
+              className={`btn ${dialog.tone === "danger" ? "btn-danger" : ""}`}
               disabled={!canConfirm}
               onClick={() => void handleConfirm()}
             >
@@ -1604,33 +1628,35 @@ function SnapshotModal({ item, onClose }: { item: FilmstripItem | null; onClose:
           >
             <header className="panel-head">
               <Dialog.Title asChild>
-                <h2 id="snapshot-title">检验快照</h2>
+                <h2 id="snapshot-title">周期详情</h2>
               </Dialog.Title>
               <span className="sub mono">{item.cycleId}</span>
               <div className="right">
                 <button ref={closeBtnRef} type="button" className="icon-btn" onClick={onClose} aria-label="关闭">
-                  <X size={15} aria-hidden="true" />
+                  <X size={16} aria-hidden="true" />
                 </button>
               </div>
             </header>
             <Dialog.Description className="sr-only">
-              检验周期 {item.cycleId} 证据快照与判定详情
+              周期 {item.cycleId} 快照详情
             </Dialog.Description>
-            <div className="panel-body grid gap-4">
+            <div className="panel-body">
               <CameraFrame
                 src={item.url}
-                alt="检验周期证据快照"
-                emptyTitle="该周期无图像"
-                errorTitle="快照图像不可用"
+                alt="周期证据快照"
+                emptyTitle="无快照图像"
+                errorTitle="快照不可用"
               />
               <dl className="dl">
-                <dt>判定</dt>
+                <dt>判定结果</dt>
                 <dd>
                   <span className={`tag ${v.tone}`}>{v.word}</span>
                 </dd>
-                <dt>时间</dt>
+                <dt>判定原因</dt>
+                <dd>{reasonOf(item.reason) || "—"}</dd>
+                <dt>记录时间</dt>
                 <dd className="mono">{dateTimeOf(item.timestamp)}</dd>
-                <dt>料管</dt>
+                <dt>料管颜色</dt>
                 <dd>{pipeText(item.pipeColor)}</dd>
                 <dt>初始标签</dt>
                 <dd>{labelText[item.labelStatus ?? ""] || "—"}</dd>
@@ -1648,11 +1674,6 @@ function OutcomeTag({ value }: { value: string }) {
   return <span className={`tag ${v.tone}`}>{v.word}</span>
 }
 
-/* ==========================================================================
-   步骤 1（实时监控）& 步骤 2（采集标注）共享左侧固定 16:9 镜头 + 右侧检查器
-   · 步骤 1：右侧顶部永久固定置顶「4× 动态跟随特写」，仅下方诊断区局部滚动
-   · 步骤 2：清晰区分「方式 A 镜头抓拍 / 方式 B 本地选图上传」+ 完整样本筛选/多选批量删/改标注
-   ========================================================================== */
 function LiveStudioWorkspace({
   mode,
   state,
@@ -1698,17 +1719,24 @@ function LiveStudioWorkspace({
   flash: (s: string) => void
   onGoStep: (step: EngineerStep, subTab?: RecordsSettingsTab) => void
 }) {
-  // 步骤 2 采集与拉框状态
   const [pipeColor, setPipeColor] = useState<"yellow" | "blue">("yellow")
-  const [tubeGroup, setTubeGroup] = useState("TUBE_LIVE_01")
-  const [batchGroup, setBatchGroup] = useState("BATCH_2026_LIVE")
+  const [tubeGroup, setTubeGroup] = useState("T01")
+  const [batchGroup, setBatchGroup] = useState("B01")
   const [capturingClass, setCapturingClass] = useState("")
   const [bootstrapping, setBootstrapping] = useState(false)
   const [clearing, setClearing] = useState(false)
   const [manualBox, setManualBox] = useState<[number, number, number, number] | null>(null)
   const [dragStart, setDragStart] = useState<[number, number] | null>(null)
 
-  // 方式 B：本地选图上传加入训练集（严格释放 URL.createObjectURL）
+  // 跳帧自动抓拍 (GET/POST /api/dataset/auto_capture + state.auto_capture)
+  const [autoLabel, setAutoLabel] = useState<AutoCaptureLabel>("complete")
+  const [everyNFrames, setEveryNFrames] = useState("10")
+  const [maxSamples, setMaxSamples] = useState("200")
+  const [autoServerState, setAutoServerState] = useState<AutoCaptureState | null>(null)
+  const [autoBusy, setAutoBusy] = useState(false)
+  const autoInitializedRef = useRef(false)
+
+  // 本地图片上传
   const [uploadFile, setUploadFile] = useState<File | null>(null)
   const [uploadPreviewUrl, setUploadPreviewUrl] = useState("")
   const [uploadLabel, setUploadLabel] = useState<SampleLabel>("complete")
@@ -1717,7 +1745,7 @@ function LiveStudioWorkspace({
   const uploadFileRef = useRef<File | null>(null)
   const previewUrlRef = useRef("")
 
-  // 样本库筛选、加载与多选批量删除状态
+  // 样本库筛选与多选
   const [sampleFilter, setSampleFilter] = useState<SampleFilter>("")
   const [samplesLoadedFilter, setSamplesLoadedFilter] = useState<SampleFilter | null>(null)
   const [samples, setSamples] = useState<Data[]>([])
@@ -1726,7 +1754,7 @@ function LiveStudioWorkspace({
   const [sampleReloadTick, setSampleReloadTick] = useState(0)
   const [bulkBusy, setBulkBusy] = useState(false)
 
-  // 离线补录业务证据帧表单状态
+  // 证据补录
   const [file, setFile] = useState<File | null>(null)
   const [cycle, setCycle] = useState("")
   const [kind, setKind] = useState("initial_label")
@@ -1737,6 +1765,35 @@ function LiveStudioWorkspace({
   useEffect(() => {
     recentSamplesRef.current = Array.isArray(datasetSummary.recent_samples) ? datasetSummary.recent_samples : []
   }, [datasetSummary.recent_samples])
+
+  useEffect(() => {
+    if (mode !== "collect" || !token) return
+    let cancelled = false
+    const controller = new AbortController()
+    void api<Data>("/api/dataset/auto_capture", { signal: controller.signal }, token, POLL_TIMEOUT_MS)
+      .then((res) => {
+        if (cancelled) return
+        const parsed = parseAutoCapture(res)
+        if (!parsed) return
+        setAutoServerState(parsed)
+        if (!autoInitializedRef.current) {
+          autoInitializedRef.current = true
+          setAutoLabel(parsed.label)
+          setEveryNFrames(String(parsed.every_n_frames))
+          setMaxSamples(String(parsed.max_samples))
+        }
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+      controller.abort()
+    }
+  }, [mode, token])
+
+  const stateAutoCapture = parseAutoCapture(state.auto_capture)
+  const effectiveAutoCapture = stateAutoCapture ?? autoServerState
+  const autoEnabled = Boolean(effectiveAutoCapture?.enabled)
+  const autoCapturedCount = effectiveAutoCapture?.captured_count ?? 0
 
   const selectUploadFile = useCallback((nextFile: File | null) => {
     if (previewUrlRef.current) {
@@ -1814,21 +1871,20 @@ function LiveStudioWorkspace({
       controller.abort()
       window.clearTimeout(timer)
     }
-  }, [mode, sampleFilter, sampleReloadTick, datasetSummary.total_samples])
+  }, [mode, sampleFilter, sampleReloadTick, datasetSummary.total_samples, autoCapturedCount])
 
   const valid = state.view_valid === true
   const online = state.camera_status === "ONLINE"
   const timer = Math.max(0, Number(state.c_timer_ms || 0))
   const litSegments = Math.min(12, Math.floor((timer / C_LIMIT_MS) * 12))
-  const outcome = deriveOutcome(state)
   const steps = ["VERIFY_INITIAL", "READY", "INSPECTING", "PASS"]
-  const stepNames = ["初始校验", "就绪", "动态检验中", "放行"]
+  const stepNames = ["核验", "就绪", "检验", "放行"]
   const currentIdx = steps.indexOf(state.fsm_state)
   const showAux = Boolean(state.show_auxiliary_rois)
   const trackedList: Data[] = Array.isArray(state.tracked_objects) ? state.tracked_objects : []
   const isAlarmLatched = Boolean(state.alarm_latched || state.outcome === "ALARM" || state.bare_hand_violation)
   const workMode = state.work_mode === "strict" ? "strict" : "debug"
-  const counts = datasetSummary.class_counts || {}
+  const counts = getClassCounts(datasetSummary)
   const liveSrc = (online && state.live_stream_url) || state.latest_evidence_url || evidence[0]?.url
   const cropSrc = online && state.live_crop_url ? String(state.live_crop_url) : undefined
 
@@ -1839,7 +1895,7 @@ function LiveStudioWorkspace({
     samplesSynced && visibleSampleIds.length > 0 && visibleSampleIds.every((id) => selectedIdSet.has(id))
   const activeFilterLabel = sampleFilterOptions.find((o) => o.id === sampleFilter)?.label || "全部"
 
-  const gripText = (v: unknown) => (v === true ? "已动态锁定" : v === false ? "未入画" : "无信号")
+  const gripText = (v: unknown) => (v === true ? "在位" : v === false ? "未入画" : "—")
 
   const normPoint = (e: React.PointerEvent<HTMLDivElement>): [number, number] => {
     const r = e.currentTarget.getBoundingClientRect()
@@ -1858,10 +1914,54 @@ function LiveStudioWorkspace({
 
   const toggleSelectAllVisible = () => {
     if (!samplesSynced) return
-    if (allVisibleSelected) {
-      setSelectedSampleIds([])
-    } else {
-      setSelectedSampleIds(visibleSampleIds)
+    setSelectedSampleIds(allVisibleSelected ? [] : visibleSampleIds)
+  }
+
+  const handleToggleAutoCapture = async () => {
+    const nextEnabled = !autoEnabled
+    const intervalVal = Math.max(1, Math.min(300, Math.round(Number(everyNFrames) || 10)))
+    const maxVal = Math.max(1, Math.min(5000, Math.round(Number(maxSamples) || 200)))
+    setEveryNFrames(String(intervalVal))
+    setMaxSamples(String(maxVal))
+    setAutoBusy(true)
+    try {
+      const res = await api<Data>(
+        "/api/dataset/auto_capture",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            enabled: nextEnabled,
+            label: autoLabel,
+            every_n_frames: intervalVal,
+            max_samples: maxVal,
+            pipe_color: pipeColor,
+            physical_tube_id: tubeGroup.trim() || "UNGROUPED",
+          }),
+        },
+        token
+      )
+      const parsed = parseAutoCapture(res)
+      if (parsed) {
+        setAutoServerState(parsed)
+      } else {
+        setAutoServerState({
+          enabled: nextEnabled,
+          every_n_frames: intervalVal,
+          label: autoLabel,
+          pipe_color: pipeColor,
+          physical_tube_id: tubeGroup.trim() || "UNGROUPED",
+          max_samples: maxVal,
+          captured_count: nextEnabled ? 0 : autoCapturedCount,
+        })
+      }
+      flash(nextEnabled ? `已开启跳帧抓拍（每 ${intervalVal} 帧）` : "已停止抓拍")
+      await onRefresh()
+      reloadSamples()
+    } catch (err) {
+      flash(`跳帧抓拍设置失败：${err instanceof Error ? err.message : err}`)
+    } finally {
+      setAutoBusy(false)
     }
   }
 
@@ -1883,7 +1983,7 @@ function LiveStudioWorkspace({
         },
         token
       )
-      flash(`已采集【${title}】样本 (${res.sample_id} · ${manualBox ? "手动拉框裁切+COCO标注" : "自动追踪裁切"})`)
+      flash(`已抓拍 ${title} (${res.sample_id})`)
       await onRefresh()
       reloadSamples()
       void onStorageChanged()
@@ -1897,7 +1997,7 @@ function LiveStudioWorkspace({
   const handleLocalSampleUpload = async (e: React.FormEvent) => {
     e.preventDefault()
     const submittedFile = uploadFile
-    if (!submittedFile) return flash("请先选择要加入训练集的本地 JPEG/PNG 图片")
+    if (!submittedFile) return flash("请选择图片")
     setUploadingSample(true)
     try {
       const res = await api<Data>(
@@ -1915,8 +2015,7 @@ function LiveStudioWorkspace({
         },
         token
       )
-      const labelName = sampleClassDefs.find((c) => c.id === uploadLabel)?.short || uploadLabel
-      flash(`已将本地图片加入【${labelName}】训练集 (${res.sample_id || "完成"})`)
+      flash(`已入库 (${res.sample_id || "完成"})`)
       if (uploadFileRef.current === submittedFile) {
         selectUploadFile(null)
         if (uploadInputRef.current) uploadInputRef.current.value = ""
@@ -1925,7 +2024,7 @@ function LiveStudioWorkspace({
       reloadSamples()
       void onStorageChanged()
     } catch (err) {
-      flash(`上传训练样本失败：${err instanceof Error ? err.message : err}`)
+      flash(`上传失败：${err instanceof Error ? err.message : err}`)
     } finally {
       setUploadingSample(false)
     }
@@ -1933,22 +2032,19 @@ function LiveStudioWorkspace({
 
   const requestClearAllSamples = () => {
     const total = Number(datasetSummary.total_samples || 0)
-    if (total === 0) return flash("当前训练集已是空的")
+    if (total === 0) return flash("样本库已空")
     onConfirm({
-      title: "清空全部 AI 训练样本",
-      description: `确认清空 data/dataset/ 中的全部 ${total} 张训练切片与标注索引吗？`,
-      consequences: [
-        "删除全部 5 类训练图片与 JSONL/COCO 标注清单（不可撤销）",
-        "不影响 SQLite 检测周期业务记录及当前运行中的 ONNX 模型",
-      ],
-      confirmLabel: `确认清空 ${total} 张样本`,
+      title: "清空训练样本",
+      description: `确认清空全部 ${total} 张训练样本吗？`,
+      consequences: ["删除全部训练切片与 COCO 标注索引", "不影响业务周期与运行模型"],
+      confirmLabel: "确认清空",
       tone: "danger",
       onConfirm: async () => {
         setClearing(true)
         try {
           await api<Data>("/api/dataset/clear", { method: "POST" }, token)
           setSelectedSampleIds([])
-          flash("已清空全部训练样本，可直接重新采集或上传车间真实数据")
+          flash("已清空训练样本")
           await onRefresh()
           reloadSamples()
           void onStorageChanged()
@@ -1966,10 +2062,9 @@ function LiveStudioWorkspace({
     const ids = [...selectedSampleIds]
     if (ids.length === 0) return
     onConfirm({
-      title: "批量删除选中训练样本",
-      description: `确认从训练集与磁盘中删除选中的 ${ids.length} 张样本吗？`,
-      consequences: ["对应切片图片将被永久移除，标注清单与 COCO 索引将自动重写"],
-      confirmLabel: `确认删除 ${ids.length} 张`,
+      title: "批量删除样本",
+      description: `确认删除选中的 ${ids.length} 张样本吗？`,
+      confirmLabel: `删除 ${ids.length} 张`,
       tone: "danger",
       onConfirm: async () => {
         setBulkBusy(true)
@@ -1984,12 +2079,12 @@ function LiveStudioWorkspace({
             token
           )
           setSelectedSampleIds([])
-          flash(`已批量删除 ${res.deleted_count ?? ids.length} 张训练样本`)
+          flash(`已删除 ${res.deleted_count ?? ids.length} 张样本`)
           await onRefresh()
           reloadSamples()
           void onStorageChanged()
         } catch (err) {
-          flash(`批量删除失败：${err instanceof Error ? err.message : err}`)
+          flash(`删除失败：${err instanceof Error ? err.message : err}`)
         } finally {
           setBulkBusy(false)
         }
@@ -2004,12 +2099,11 @@ function LiveStudioWorkspace({
       return
     }
     const classCount = Number(counts[sampleFilter] || samples.length || 0)
-    if (classCount === 0) return flash(`【${activeFilterLabel}】类别当前暂无样本`)
+    if (classCount === 0) return flash("该类别暂无样本")
     onConfirm({
-      title: `清空【${activeFilterLabel}】类别样本`,
-      description: `确认清空【${activeFilterLabel}】下的全部 ${classCount} 张训练样本吗？`,
-      consequences: ["仅删除该类别的切片图片与索引条目，其余 4 个类别样本保持不变"],
-      confirmLabel: `确认清空该类别 (${classCount})`,
+      title: `清空 ${activeFilterLabel}`,
+      description: `确认清空 ${activeFilterLabel} 共 ${classCount} 张样本吗？`,
+      confirmLabel: "确认清空",
       tone: "danger",
       onConfirm: async () => {
         setBulkBusy(true)
@@ -2024,12 +2118,12 @@ function LiveStudioWorkspace({
             token
           )
           setSelectedSampleIds([])
-          flash(`已清空【${activeFilterLabel}】类别共 ${res.deleted_count ?? classCount} 张样本`)
+          flash(`已清空 ${res.deleted_count ?? classCount} 张样本`)
           await onRefresh()
           reloadSamples()
           void onStorageChanged()
         } catch (err) {
-          flash(`清空类别失败：${err instanceof Error ? err.message : err}`)
+          flash(`清空失败：${err instanceof Error ? err.message : err}`)
         } finally {
           setBulkBusy(false)
         }
@@ -2041,7 +2135,7 @@ function LiveStudioWorkspace({
     setBootstrapping(true)
     try {
       const res = await api<Data>("/api/dataset/bootstrap", { method: "POST" }, token)
-      flash(`已生成 ${res.bootstrapped_count} 张跨 4 个独立料管组的标准训练样本`)
+      flash(`已生成 ${res.bootstrapped_count} 张演示样本`)
       await onRefresh()
       reloadSamples()
       void onStorageChanged()
@@ -2063,27 +2157,26 @@ function LiveStudioWorkspace({
         },
         token
       )
-      flash(`已将样本 ${sampleId} 标注修改为【${labelText[newLabel] || newLabel}】`)
+      flash(`已改为 ${labelText[newLabel] || newLabel}`)
       await onRefresh()
       reloadSamples()
     } catch (err) {
-      flash(`修改标注失败：${err instanceof Error ? err.message : err}`)
+      flash(`修改失败：${err instanceof Error ? err.message : err}`)
     }
   }
 
   const requestDeleteSingleSample = (smp: Data) => {
     const sampleId = String(smp.sample_id)
     onConfirm({
-      title: "删除单张训练样本",
-      description: `确认永久删除训练样本 ${sampleId}（${smp.physical_tube_id || "未分组"}）吗？`,
-      consequences: ["该切片文件将从磁盘删除，manifest 与 COCO 索引同步更新"],
-      confirmLabel: "确认删除",
+      title: "删除样本",
+      description: `确认删除样本 ${sampleId} 吗？`,
+      confirmLabel: "删除",
       tone: "danger",
       onConfirm: async () => {
         try {
           await api(`/api/dataset/sample/${encodeURIComponent(sampleId)}`, { method: "DELETE" }, token)
           setSelectedSampleIds((prev) => prev.filter((id) => id !== sampleId))
-          flash(`已删除样本 ${sampleId}`)
+          flash(`已删除 ${sampleId}`)
           await onRefresh()
           reloadSamples()
           void onStorageChanged()
@@ -2096,7 +2189,7 @@ function LiveStudioWorkspace({
 
   const submitManualEvidence = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!file) return flash("请选择要归档的图片")
+    if (!file) return flash("请选择图片")
     const targetCycle = cycle.trim() || `MANUAL_${Date.now().toString().slice(-6)}`
     setSubmitting(true)
     try {
@@ -2114,14 +2207,14 @@ function LiveStudioWorkspace({
             "X-Label-Status": label,
             "X-Camera-Metadata": JSON.stringify({
               camera_device_id: state.camera_device_id || "CAM_01",
-              resolution: "1920x1080",
+              resolution: "1280x720",
             }),
           },
           body: file,
         },
         token
       )
-      flash(`已手动归档至周期 ${targetCycle}`)
+      flash(`已归档至 ${targetCycle}`)
       setFile(null)
       await onRefresh()
       void onStorageChanged()
@@ -2134,8 +2227,8 @@ function LiveStudioWorkspace({
 
   return (
     <div className="studio-split">
-      {/* 左侧永远固定的超大 16:9 实时镜头舞台 */}
-      <section className="studio-canvas" aria-label={mode === "monitor" ? "实时监控取景舞台" : "实时采集标注画布"}>
+      {/* 左侧永久固定的 16:9 实时镜头舞台 */}
+      <section className="studio-canvas" aria-label={mode === "monitor" ? "实时监控舞台" : "采集标注画布"}>
         {mode === "monitor" && (
           <div className="studio-andon-slot">
             <Andon
@@ -2145,12 +2238,11 @@ function LiveStudioWorkspace({
                 title: state.result_reason
                   ? reasonOf(state.result_reason)
                   : valid
-                    ? "动态追踪锁定中 · 等待周期判定"
+                    ? "动态锁定中"
                     : reasonOf(state.view_valid_reasons?.[0]) || "视野无效",
-                desc: "",
               }}
               meta={[
-                { label: "周期号", value: state.cycle_id || "—" },
+                { label: "周期编号", value: state.cycle_id || "—" },
                 { label: "更新时间", value: timeOf(state.updated_at_utc) },
               ]}
             />
@@ -2160,41 +2252,40 @@ function LiveStudioWorkspace({
         <header className="studio-canvas-bar">
           {mode === "monitor" ? (
             <>
-              <h2>全景动态目标追踪</h2>
-              <span className="sub mono">已锁定 {trackedList.length} 目标</span>
+              <h2>全景画面</h2>
+              <span className="sub mono">720P · 25 FPS</span>
               <div className="right">
                 <button
                   type="button"
                   className={`btn ghost sm ${mirrorHorizontal ? "btn-active" : ""}`}
                   disabled={togglingMirror}
                   onClick={() => onToggleMirror(!mirrorHorizontal)}
-                  title="切换水平镜像对齐（左右手与现实同步）"
                 >
-                  <FlipHorizontal2 size={13} aria-hidden="true" />
-                  {mirrorHorizontal ? "镜像同步" : "原始方向"}
+                  <FlipHorizontal2 size={16} aria-hidden="true" />
+                  {mirrorHorizontal ? "镜像开" : "镜像关"}
                 </button>
                 <button type="button" className="btn ghost sm" onClick={() => onToggleAuxRois(!showAux)}>
-                  <Eye size={13} aria-hidden="true" />
-                  {showAux ? "隐藏辅助框" : "辅助框"}
+                  <Eye size={16} aria-hidden="true" />
+                  {showAux ? "隐藏框" : "辅助框"}
                 </button>
                 <button type="button" className="btn ghost sm" onClick={onManualCapture}>
-                  <Camera size={13} aria-hidden="true" />
+                  <Camera size={16} aria-hidden="true" />
                   抓拍
                 </button>
               </div>
             </>
           ) : (
             <>
-              <h2>16:9 实时手动拉框标注</h2>
-              <span className="sub mono">
-                {manualBox
-                  ? `手动框 [${manualBox.map((v) => v.toFixed(2)).join(", ")}]`
-                  : "方式 A：拖拽拉框或直接点击右侧拍样本 · 方式 B：右侧选本地图上传"}
-              </span>
+              <h2>拉框采集</h2>
+              {manualBox && (
+                <span className="sub mono">
+                  [{manualBox.map((v) => v.toFixed(2)).join(", ")}]
+                </span>
+              )}
               <div className="right">
                 {manualBox && (
                   <button type="button" className="btn ghost sm" onClick={() => setManualBox(null)}>
-                    清除手动框
+                    清除选框
                   </button>
                 )}
                 <a className="btn ghost sm" href="/api/dataset/coco" target="_blank" rel="noreferrer">
@@ -2206,7 +2297,7 @@ function LiveStudioWorkspace({
                   disabled={clearing}
                   onClick={requestClearAllSamples}
                 >
-                  {clearing ? "清空中…" : "清空全部样本"}
+                  {clearing ? "清空中…" : "清空样本"}
                 </button>
               </div>
             </>
@@ -2251,9 +2342,9 @@ function LiveStudioWorkspace({
               <CameraFrame
                 fill
                 src={liveSrc}
-                alt="16:9 实时采集与手动拉框画面"
+                alt="16:9 实时采集画面"
                 focusLocked={online && valid}
-                emptyTitle="等待实时相机"
+                emptyTitle="等待相机画面"
               />
               {manualBox && (
                 <div
@@ -2266,8 +2357,8 @@ function LiveStudioWorkspace({
                   }}
                 >
                   <span className="bbox-rect-tag">
-                    手动裁切框 ({Math.round((manualBox[2] - manualBox[0]) * (Number(state.camera_width) || 1920))}×
-                    {Math.round((manualBox[3] - manualBox[1]) * (Number(state.camera_height) || 1080))})
+                    {Math.round((manualBox[2] - manualBox[0]) * (Number(state.camera_width) || DEFAULT_CAMERA_WIDTH))}×
+                    {Math.round((manualBox[3] - manualBox[1]) * (Number(state.camera_height) || DEFAULT_CAMERA_HEIGHT))}
                   </span>
                 </div>
               )}
@@ -2277,65 +2368,41 @@ function LiveStudioWorkspace({
               <CameraFrame
                 fill
                 src={liveSrc}
-                alt="全景 16:9 实时动态追踪画面"
+                alt="16:9 实时追踪画面"
                 shutterKey={shutterKey}
                 focusLocked={online && valid}
                 emptyTitle="等待相机画面"
-                errorTitle="相机画面不可用"
+                errorTitle="画面不可用"
               />
             </div>
           )}
         </div>
 
         {mode === "collect" && (
-          <div className="studio-class-strip" aria-label="五类样本统计">
+          <div className="studio-class-strip" aria-label="类别样本计数">
             {sampleClassDefs.map((c) => (
               <div className="studio-class-cell" key={c.id}>
                 <span>{c.short}</span>
                 <b className="mono">{counts[c.id] || 0}</b>
               </div>
             ))}
-            <div className="studio-class-cell studio-class-total">
-              <span>总计 / 独立组</span>
-              <b className="mono">
-                {datasetSummary.total_samples || 0} / {datasetSummary.independent_tube_groups || 0}
-              </b>
-            </div>
           </div>
         )}
       </section>
 
-      {/* 右侧检查器：监控模式将 4× 动态跟随特写永久固定置顶，下方诊断区独立滚动 */}
-      <aside className="studio-inspector" aria-label={mode === "monitor" ? "实时监控检查器" : "样本采集与标注检查器"}>
-        <header className="studio-inspector-head">
-          {mode === "monitor" ? (
-            <>
-              <h2>实时诊断检查器</h2>
-              <span className={`tag ${valid ? "pass" : "warn"}`}>{human(state.fsm_state || "WAIT_PART")}</span>
-            </>
-          ) : (
-            <>
-              <h2>采集标注与样本库</h2>
-              <button type="button" className="btn sm" onClick={() => onGoStep("train")}>
-                <Cpu size={13} aria-hidden="true" />
-                前往训练部署
-              </button>
-            </>
-          )}
-        </header>
-
-        {/* 永久固定置顶的 4× 动态跟随特写（位于滚动区外部，永不随右侧滚动移出视野） */}
+      {/* 右侧检查器：监控模式顶部永久置顶 4× 标签特写，下方卡片栈宽敞滚动 */}
+      <aside className="studio-inspector" aria-label={mode === "monitor" ? "实时诊断栏" : "样本采集栏"}>
         {mode === "monitor" && (
-          <section className="inspector-pinned-crop" aria-label="标签特写动态跟随置顶锁定区">
+          <section className="inspector-pinned-crop" aria-label="标签特写置顶区">
             <div className="inspector-section-head">
-              <div className="flex items-center gap-1.5">
-                <h3>标签特写 · 动态跟随</h3>
+              <div className="flex items-center gap-2">
+                <h3>标签特写</h3>
                 <span className="pin-badge">
-                  <Pin size={10} aria-hidden="true" />
+                  <Pin size={14} aria-hidden="true" />
                   4× 置顶
                 </span>
               </div>
-              <span className="mono" style={{ fontSize: 12, color: "var(--ink-2)" }}>
+              <span className="mono" style={{ fontSize: 14, color: "var(--ink-2)" }}>
                 {state.label_confidence != null ? `${(Number(state.label_confidence) * 100).toFixed(1)}%` : "—"}
               </span>
             </div>
@@ -2343,20 +2410,17 @@ function LiveStudioWorkspace({
               <CameraFrame
                 fill
                 src={cropSrc}
-                alt="4 倍动态跟随标签特写"
+                alt="标签 4 倍特写"
                 focusLocked={Boolean(online && valid && cropSrc)}
-                emptyTitle={online ? "特写画面不可用" : "等待锁定标签"}
-                emptyHint={online ? "当前未获取到 4× 标签特写流" : undefined}
-                errorTitle="特写画面不可用"
+                emptyTitle={online ? "无特写流" : "等待入位"}
+                errorTitle="特写不可用"
               />
             </div>
             <div className="inspector-verdict-row">
               <div>
-                <small>实时标签判定</small>
+                <small>标签状态</small>
                 <b style={{ color: isAlarmLatched ? "var(--bad)" : undefined }}>
-                  {state.bare_hand_violation
-                    ? "裸手违规报警"
-                    : labelText[state.label_status] || human(state.label_status)}
+                  {state.bare_hand_violation ? "裸手违规" : labelText[state.label_status] || human(state.label_status)}
                 </b>
               </div>
               <div style={{ textAlign: "right" }}>
@@ -2364,11 +2428,11 @@ function LiveStudioWorkspace({
                 <b>{pipeText(state.pipe_color)}</b>
               </div>
             </div>
-            <div style={{ marginTop: 8 }}>
-              <div className="flex items-baseline justify-between" style={{ marginBottom: 5 }}>
-                <span style={{ fontSize: 11.5, color: "var(--ink-3)" }}>C 类脱落确认计时</span>
-                <span className="mono" style={{ fontSize: 11.5 }}>
-                  {formatCTimerSeconds(timer, 2)} / 1.20 秒
+            <div style={{ display: "grid", gap: 8 }}>
+              <div className="flex items-baseline justify-between">
+                <span style={{ fontSize: 14, color: "var(--ink-2)" }}>脱落确认</span>
+                <span className="mono" style={{ fontSize: 14, fontWeight: 600 }}>
+                  {formatCTimerSeconds(timer, 2)} / 1.20s
                 </span>
               </div>
               <div className={`segments ${litSegments >= 12 ? "done" : ""}`}>
@@ -2380,13 +2444,12 @@ function LiveStudioWorkspace({
             {isAlarmLatched && (
               <button
                 type="button"
-                className="btn btn-danger sm block"
-                style={{ marginTop: 8 }}
+                className="btn btn-danger block"
                 onClick={() => onSimulate("reset")}
                 disabled={simulating !== ""}
               >
-                <RotateCcw size={13} aria-hidden="true" />
-                解除报警闭锁并复位
+                <RotateCcw size={16} aria-hidden="true" />
+                报警复位
               </button>
             )}
           </section>
@@ -2396,199 +2459,162 @@ function LiveStudioWorkspace({
           <div className="studio-inspector-body">
             {mode === "monitor" ? (
               <>
-                {/* 分区 1：状态机与目标坐标 */}
-                <details className="inspector-group" style={{ borderTop: 0 }} open>
-                  <summary>
-                    <span>状态机与目标坐标</span>
-                    <span className="mono">{trackedList.length} 目标</span>
-                  </summary>
-                  <div className="inspector-group-body grid gap-3">
-                    <div className="fsm-track">
-                      {steps.map((s, i) => (
-                        <div key={s} className={`fsm-step ${i === currentIdx ? "now" : i < currentIdx ? "past" : ""}`}>
-                          {stepNames[i]}
-                        </div>
+                <section className="inspector-section">
+                  <div className="inspector-section-head">
+                    <h3>运行状态</h3>
+                    <span className={`tag ${valid ? "pass" : "warn"}`}>{human(state.fsm_state || "WAIT_PART")}</span>
+                  </div>
+                  <div className="fsm-track">
+                    {steps.map((s, i) => (
+                      <div key={s} className={`fsm-step ${i === currentIdx ? "now" : i < currentIdx ? "past" : ""}`}>
+                        {stepNames[i]}
+                      </div>
+                    ))}
+                  </div>
+                  <div className="inspector-mini-grid">
+                    <div className="inspector-mini-cell">
+                      <small>相机连接</small>
+                      <b>{cameraText[state.camera_status] || "未知"}</b>
+                    </div>
+                    <div className="inspector-mini-cell">
+                      <small>手套状态</small>
+                      <b style={{ color: state.bare_hand_violation ? "var(--bad)" : undefined }}>
+                        {state.bare_hand_violation
+                          ? "裸手违规"
+                          : state.bare_hand_detected
+                            ? "裸手警告"
+                            : state.glove_compliant
+                              ? "合规"
+                              : "待检"}
+                      </b>
+                    </div>
+                    <div className="inspector-mini-cell">
+                      <small>左手握持</small>
+                      <b>{gripText(state.left_grip_active)}</b>
+                    </div>
+                    <div className="inspector-mini-cell">
+                      <small>右手握持</small>
+                      <b>{gripText(state.right_grip_active)}</b>
+                    </div>
+                  </div>
+                  {trackedList.length > 0 && (
+                    <div className="flex flex-wrap gap-2">
+                      {trackedList.map((obj, idx) => (
+                        <span
+                          key={idx}
+                          className="tag plain mono"
+                          title={
+                            Array.isArray(obj.box)
+                              ? `[${obj.box.map((v: number) => Number(v).toFixed(2)).join(", ")}]`
+                              : undefined
+                          }
+                        >
+                          {obj.label}
+                        </span>
                       ))}
                     </div>
+                  )}
+                </section>
 
-                    <div className="inspector-mini-grid">
-                      <div className="inspector-mini-cell">
-                        <small>物理相机</small>
-                        <b>{cameraText[state.camera_status] || "未知"}</b>
-                      </div>
-                      <div className="inspector-mini-cell">
-                        <small>手套与接触</small>
-                        <b style={{ color: state.bare_hand_violation ? "var(--bad)" : undefined }}>
-                          {state.bare_hand_violation
-                            ? "裸手违规"
-                            : state.bare_hand_detected
-                              ? "裸手警告"
-                              : state.glove_compliant
-                                ? "手套合规"
-                                : "待检测"}
-                        </b>
-                      </div>
-                      <div className="inspector-mini-cell">
-                        <small>左手动态追踪</small>
-                        <b>{gripText(state.left_grip_active)}</b>
-                      </div>
-                      <div className="inspector-mini-cell">
-                        <small>右手动态追踪</small>
-                        <b>{gripText(state.right_grip_active)}</b>
-                      </div>
-                    </div>
-
-                    <dl className="dl">
-                      <dt>手部与标签重叠</dt>
-                      <dd style={state.hand_contact_candidate ? { color: "var(--warn)", fontWeight: 600 } : undefined}>
-                        {state.hand_contact_candidate ? "检测到动态接触" : "无重叠"}
-                      </dd>
-                      <dt>视野判定结论</dt>
-                      <dd>{outcome === "VIEW_INVALID" ? "手部接触或光学受阻" : valid ? "视野有效" : "待定"}</dd>
-                    </dl>
-
-                    <div>
-                      <div className="inspector-sublabel">实时追踪目标归一化坐标</div>
-                      {trackedList.length > 0 ? (
-                        <div className="flex flex-wrap gap-1.5">
-                          {trackedList.map((obj, idx) => (
-                            <span key={idx} className="tag plain mono" style={{ fontSize: 11 }}>
-                              {obj.label}: [
-                              {Array.isArray(obj.box) ? obj.box.map((v: number) => Number(v).toFixed(2)).join(", ") : ""}
-                              ]
-                            </span>
-                          ))}
-                        </div>
-                      ) : (
-                        <div className="note">当前画面未锁定活动目标框</div>
-                      )}
-                    </div>
+                <section className="inspector-section">
+                  <div className="inspector-section-head">
+                    <h3>光学指标</h3>
+                    <span className={`tag ${valid ? "pass" : "warn"}`}>{valid ? "有效" : "受阻"}</span>
                   </div>
-                </details>
+                  <OpticalGauges
+                    laplacianVariance={state.laplacian_variance}
+                    minLaplacian={config.thresholds?.min_laplacian_variance}
+                    overexposedFraction={state.overexposed_fraction}
+                    maxOverexposed={config.thresholds?.max_overexposed_fraction}
+                    brightness={state.brightness}
+                    minBrightness={config.thresholds?.min_brightness}
+                    maxBrightness={config.thresholds?.max_brightness}
+                    viewValid={state.view_valid}
+                  />
+                </section>
 
-                {/* 分区 2：光学质量仪表 */}
-                <details className="inspector-group" open>
-                  <summary>
-                    <span>光学质量仪表</span>
-                    <span className={`tag ${valid ? "pass" : "warn"}`} style={{ height: 20, fontSize: 11 }}>
-                      {valid ? "达标" : "受阻"}
-                    </span>
-                  </summary>
-                  <div className="inspector-group-body grid gap-2.5">
-                    <OpticalGauges
-                      laplacianVariance={state.laplacian_variance}
-                      minLaplacian={config.thresholds?.min_laplacian_variance}
-                      overexposedFraction={state.overexposed_fraction}
-                      maxOverexposed={config.thresholds?.max_overexposed_fraction}
-                      brightness={state.brightness}
-                      minBrightness={config.thresholds?.min_brightness}
-                      maxBrightness={config.thresholds?.max_brightness}
-                      viewValid={state.view_valid}
-                    />
-                    {Array.isArray(state.view_valid_reasons) && state.view_valid_reasons.length > 0 && (
-                      <div className="flex flex-wrap gap-1.5">
-                        {state.view_valid_reasons.map((code: string) => (
-                          <span key={code} className="tag warn">
-                            {reasonOf(code)}
-                          </span>
-                        ))}
-                      </div>
-                    )}
+                <section className="inspector-section">
+                  <div className="inspector-section-head">
+                    <h3>工况演练</h3>
+                    <span className="tag plain">{workMode === "strict" ? "车间严格" : "桌面调试"}</span>
                   </div>
-                </details>
-
-                {/* 分区 3：工况演练与快速调试 */}
-                <details className="inspector-group" open>
-                  <summary>
-                    <span>工况演练与快速调试</span>
-                    <span className="mono">{workMode === "strict" ? "车间严格" : "桌面调试"}</span>
-                  </summary>
-                  <div className="inspector-group-body grid gap-3">
-                    <div>
-                      <div className="inspector-sublabel">影子工况回放注入</div>
-                      <div className="grid grid-cols-3 gap-1.5">
-                        {simScenarios.map((item) => (
-                          <button
-                            key={item.id}
-                            type="button"
-                            disabled={simulating !== ""}
-                            className={`btn ghost sm ${item.tone === "bad" ? "btn-outline-bad" : ""}`}
-                            style={{ padding: "0 8px", fontSize: 12 }}
-                            onClick={() => onSimulate(item.id)}
-                          >
-                            {simulating === item.id ? "执行…" : item.label}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    <div>
-                      <div className="inspector-sublabel">工位运行模式</div>
-                      <div className="sim-bar" style={{ width: "100%", display: "grid", gridTemplateColumns: "1fr 1fr" }}>
-                        <button
-                          type="button"
-                          className={`sim-btn ${workMode === "debug" ? "busy" : ""}`}
-                          onClick={() => onSwitchWorkMode("debug")}
-                        >
-                          桌面调试模式
-                        </button>
-                        <button
-                          type="button"
-                          className={`sim-btn ${workMode === "strict" ? "busy" : ""}`}
-                          onClick={() => onSwitchWorkMode("strict")}
-                        >
-                          车间严格模式
-                        </button>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-3 gap-1.5">
+                  <div className="grid grid-cols-2 gap-3">
+                    {simScenarios.map((item) => (
                       <button
+                        key={item.id}
                         type="button"
-                        className="btn ghost sm block"
-                        style={{ padding: "0 6px", fontSize: 11.5 }}
-                        onClick={() => onGoStep("records_settings", "records")}
+                        disabled={simulating !== ""}
+                        className={`btn ghost sm ${item.tone === "bad" ? "btn-outline-bad" : ""}`}
+                        onClick={() => onSimulate(item.id)}
                       >
-                        周期与证据
+                        {simulating === item.id ? "执行中…" : item.label}
                       </button>
-                      <button
-                        type="button"
-                        className="btn ghost sm block"
-                        style={{ padding: "0 6px", fontSize: 11.5 }}
-                        onClick={() => onGoStep("records_settings", "storage")}
-                      >
-                        数据库管理
-                      </button>
-                      <button
-                        type="button"
-                        className="btn ghost sm block"
-                        style={{ padding: "0 6px", fontSize: 11.5 }}
-                        onClick={() => onGoStep("records_settings", "settings")}
-                      >
-                        镜像与参数
-                      </button>
-                    </div>
+                    ))}
                   </div>
-                </details>
+                  <div className="sim-bar" style={{ width: "100%", display: "grid", gridTemplateColumns: "1fr 1fr" }}>
+                    <button
+                      type="button"
+                      className={`sim-btn ${workMode === "debug" ? "busy" : ""}`}
+                      onClick={() => onSwitchWorkMode("debug")}
+                    >
+                      桌面调试
+                    </button>
+                    <button
+                      type="button"
+                      className={`sim-btn ${workMode === "strict" ? "busy" : ""}`}
+                      onClick={() => onSwitchWorkMode("strict")}
+                    >
+                      车间严格
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-3 gap-3">
+                    <button
+                      type="button"
+                      className="btn ghost sm block"
+                      onClick={() => onGoStep("records_settings", "records")}
+                    >
+                      周期记录
+                    </button>
+                    <button
+                      type="button"
+                      className="btn ghost sm block"
+                      onClick={() => onGoStep("records_settings", "storage")}
+                    >
+                      存储管理
+                    </button>
+                    <button
+                      type="button"
+                      className="btn ghost sm block"
+                      onClick={() => onGoStep("records_settings", "settings")}
+                    >
+                      系统参数
+                    </button>
+                  </div>
+                </section>
               </>
             ) : (
               <>
-                {/* 步骤 2 检查器：共用采集分组元数据 */}
-                <section className="inspector-section grid gap-2.5">
+                {/* 卡片 1：分组标识 + 前往训练 */}
+                <section className="inspector-section">
                   <div className="inspector-section-head">
-                    <h3>采集分组元数据（方式 A / B 共用）</h3>
-                    <button
-                      type="button"
-                      className="btn ghost sm"
-                      style={{ height: 26, fontSize: 11.5 }}
-                      disabled={bootstrapping}
-                      onClick={() => void handleBootstrapDataset()}
-                    >
-                      <Sparkles size={12} aria-hidden="true" />
-                      {bootstrapping ? "生成中…" : "生成演示集"}
-                    </button>
+                    <h3>样本分组</h3>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        className="btn ghost sm"
+                        disabled={bootstrapping}
+                        onClick={() => void handleBootstrapDataset()}
+                      >
+                        <Sparkles size={14} aria-hidden="true" />
+                        {bootstrapping ? "生成中…" : "演示集"}
+                      </button>
+                      <button type="button" className="btn sm" onClick={() => onGoStep("train")}>
+                        <Cpu size={14} aria-hidden="true" />
+                        去训练
+                      </button>
+                    </div>
                   </div>
-                  <div className="grid grid-cols-2 gap-2">
+                  <div className="grid grid-cols-3 gap-4">
                     <div className="field">
                       <label htmlFor="collect-pipe-color">料管颜色</label>
                       <Select value={pipeColor} onValueChange={(v) => setPipeColor(v as "yellow" | "blue")}>
@@ -2602,72 +2628,139 @@ function LiveStudioWorkspace({
                       </Select>
                     </div>
                     <div className="field">
-                      <label htmlFor="collect-tube-group">物理料管分组号</label>
+                      <label htmlFor="collect-tube-group">料管编号</label>
                       <Input
                         id="collect-tube-group"
                         value={tubeGroup}
                         onChange={(e) => setTubeGroup(e.target.value)}
                         className="mono"
-                        placeholder="TUBE_LIVE_01"
+                        placeholder="如T01"
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="collect-batch-group">批次编号</label>
+                      <Input
+                        id="collect-batch-group"
+                        value={batchGroup}
+                        onChange={(e) => setBatchGroup(e.target.value)}
+                        className="mono"
+                        placeholder="如B01"
                       />
                     </div>
                   </div>
-                  <div className="field">
-                    <label htmlFor="collect-batch-group">生产批次号</label>
-                    <Input
-                      id="collect-batch-group"
-                      value={batchGroup}
-                      onChange={(e) => setBatchGroup(e.target.value)}
-                      className="mono"
-                      placeholder="BATCH_2026_LIVE"
-                    />
+                </section>
+
+                {/* 卡片 2：跳帧自动抓拍 (A3 核心功能) */}
+                <section className="inspector-section" aria-label="跳帧自动抓拍">
+                  <div className="inspector-section-head">
+                    <h3>跳帧自动抓拍</h3>
+                    <span className={`tag ${autoEnabled ? "pass" : "plain"}`}>
+                      {autoEnabled ? "抓拍中" : "已停止"}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-4">
+                    <div className="field">
+                      <label htmlFor="auto-capture-label">目标类别</label>
+                      <Select
+                        value={autoLabel}
+                        disabled={autoEnabled || autoBusy}
+                        onValueChange={(v) => setAutoLabel(v as AutoCaptureLabel)}
+                      >
+                        <SelectTrigger id="auto-capture-label">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="complete">完整</SelectItem>
+                          <SelectItem value="crossed_out">已划除</SelectItem>
+                          <SelectItem value="covered">已遮挡</SelectItem>
+                          <SelectItem value="absent">已脱落</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                    <div className="field">
+                      <label htmlFor="auto-capture-interval">帧间隔</label>
+                      <Input
+                        id="auto-capture-interval"
+                        type="number"
+                        min="1"
+                        max="300"
+                        value={everyNFrames}
+                        disabled={autoEnabled || autoBusy}
+                        onChange={(e) => setEveryNFrames(e.target.value)}
+                        placeholder="默认10"
+                        className="mono"
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor="auto-capture-max">张数上限</label>
+                      <Input
+                        id="auto-capture-max"
+                        type="number"
+                        min="1"
+                        max="5000"
+                        value={maxSamples}
+                        disabled={autoEnabled || autoBusy}
+                        onChange={(e) => setMaxSamples(e.target.value)}
+                        placeholder="默认200"
+                        className="mono"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-4" style={{ alignItems: "stretch" }}>
+                    <div className="kpi-tile">
+                      <b className="mono">{autoCapturedCount}</b>
+                      <span>已抓拍</span>
+                    </div>
+                    <button
+                      type="button"
+                      className={`btn block ${autoEnabled ? "btn-danger" : ""}`}
+                      style={{ height: "100%" }}
+                      disabled={autoBusy}
+                      onClick={() => void handleToggleAutoCapture()}
+                    >
+                      {autoEnabled ? <Square size={16} aria-hidden="true" /> : <Play size={16} aria-hidden="true" />}
+                      {autoEnabled ? "停止抓拍" : "开启跳帧抓拍"}
+                    </button>
                   </div>
                 </section>
 
-                {/* 增加训练数据 · 方式 A：5 类实时镜头一键拍样本 */}
-                <section className="inspector-section grid gap-2">
+                {/* 卡片 3：单帧手动抓拍 */}
+                <section className="inspector-section">
                   <div className="inspector-section-head">
-                    <div className="flex items-center gap-1.5">
-                      <span className="method-badge">方式 A</span>
-                      <h3>实时镜头抓拍入库</h3>
-                    </div>
-                    <span className="note">{manualBox ? "手动拉框裁切" : "自动追踪裁切"}</span>
+                    <h3>单帧抓拍</h3>
+                    <span className="tag plain">{manualBox ? "选框裁切" : "自动裁切"}</span>
                   </div>
-                  <div className="grid gap-1.5">
+                  <div className="grid gap-3">
                     {sampleClassDefs.map((item) => (
                       <button
                         key={item.id}
                         type="button"
                         disabled={capturingClass !== ""}
                         className={`btn ${item.id === "unknown_challenge" ? "ghost" : ""} block`}
-                        style={{ justifyContent: "space-between", height: 34, padding: "0 11px" }}
+                        style={{ justifyContent: "space-between" }}
                         onClick={() => void handleQuickCapture(item.id, item.short)}
                       >
                         <span className="flex items-center gap-2">
-                          <Camera size={13} aria-hidden="true" />
-                          <span>{capturingClass === item.id ? "抓拍裁切中…" : item.title}</span>
+                          <Camera size={16} aria-hidden="true" />
+                          <span>{capturingClass === item.id ? "抓拍中…" : item.title}</span>
                         </span>
-                        <span className="mono" style={{ opacity: 0.8, fontSize: 12 }}>
-                          {counts[item.id] || 0} 张
-                        </span>
+                        <span className="mono">{counts[item.id] || 0}</span>
                       </button>
                     ))}
                   </div>
                 </section>
 
-                {/* 增加训练数据 · 方式 B：本地选图上传加入训练集 */}
-                <section className="inspector-section grid gap-2">
+                {/* 卡片 4：本地上传 */}
+                <section className="inspector-section">
                   <div className="inspector-section-head">
-                    <div className="flex items-center gap-1.5">
-                      <span className="method-badge alt">方式 B</span>
-                      <h3>本地选图上传加入训练集</h3>
-                    </div>
-                    <span className="note">JPEG / PNG</span>
+                    <h3>本地上传</h3>
                   </div>
                   <form className="upload-box" onSubmit={(e) => void handleLocalSampleUpload(e)}>
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="grid grid-cols-2 gap-4">
                       <div className="field">
-                        <label htmlFor="collect-upload-file">选择本地图片</label>
+                        <label htmlFor="collect-upload-file">选择图片</label>
                         <Input
                           id="collect-upload-file"
                           ref={uploadInputRef}
@@ -2678,17 +2771,17 @@ function LiveStudioWorkspace({
                         />
                       </div>
                       <div className="field">
-                        <label htmlFor="collect-upload-label">目标训练类别</label>
+                        <label htmlFor="collect-upload-label">目标类别</label>
                         <Select value={uploadLabel} onValueChange={(v) => setUploadLabel(v as SampleLabel)}>
                           <SelectTrigger id="collect-upload-label">
                             <SelectValue />
                           </SelectTrigger>
                           <SelectContent>
-                            <SelectItem value="complete">完整标签</SelectItem>
-                            <SelectItem value="crossed_out">A类 · 已划除</SelectItem>
-                            <SelectItem value="covered">B类 · 已遮挡</SelectItem>
-                            <SelectItem value="absent">C类 · 已脱落</SelectItem>
-                            <SelectItem value="unknown_challenge">挑战样本</SelectItem>
+                            <SelectItem value="complete">完整</SelectItem>
+                            <SelectItem value="crossed_out">已划除</SelectItem>
+                            <SelectItem value="covered">已遮挡</SelectItem>
+                            <SelectItem value="absent">已脱落</SelectItem>
+                            <SelectItem value="unknown_challenge">挑战</SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
@@ -2698,7 +2791,7 @@ function LiveStudioWorkspace({
                       <div className="upload-preview-row">
                         <img
                           src={uploadPreviewUrl}
-                          alt="待上传训练图片预览"
+                          alt="预览"
                           className="upload-preview-thumb"
                           onError={() => {
                             if (previewUrlRef.current) {
@@ -2706,53 +2799,44 @@ function LiveStudioWorkspace({
                               previewUrlRef.current = ""
                             }
                             setUploadPreviewUrl("")
-                            flash("无法预览所选图片，请确认文件为有效 JPEG/PNG")
+                            flash("无法预览所选图片")
                           }}
                         />
                         <div className="upload-preview-info">
                           <b>{uploadFile.name}</b>
-                          <small className="mono">{Math.max(1, Math.round(uploadFile.size / 1024))} KB</small>
                         </div>
                         <button
                           type="button"
                           className="icon-btn"
-                          style={{ width: 24, height: 24 }}
                           disabled={uploadingSample}
-                          aria-label="清除已选图片"
+                          aria-label="清除图片"
                           onClick={() => {
                             selectUploadFile(null)
                             if (uploadInputRef.current) uploadInputRef.current.value = ""
                           }}
                         >
-                          <X size={12} aria-hidden="true" />
+                          <X size={16} aria-hidden="true" />
                         </button>
                       </div>
                     )}
 
-                    <button
-                      type="submit"
-                      className="btn sm block"
-                      disabled={uploadingSample || !uploadFile}
-                    >
-                      <ImagePlus size={13} aria-hidden="true" />
-                      {uploadingSample ? "正在写入训练集…" : "上传并加入训练集"}
+                    <button type="submit" className="btn block" disabled={uploadingSample || !uploadFile}>
+                      <ImagePlus size={16} aria-hidden="true" />
+                      {uploadingSample ? "上传中…" : "上传入库"}
                     </button>
                   </form>
                 </section>
 
-                {/* 样本图库：按类别筛选 + 多选批量删除 + 直接改标注 / 单张删除 */}
-                <section className="inspector-section grid gap-2.5">
+                {/* 卡片 5：样本图库 */}
+                <section className="inspector-section">
                   <div className="inspector-section-head">
-                    <h3>样本管理（筛选 / 改标注 / 批量删）</h3>
-                    <span className="mono" style={{ fontSize: 11.5, color: "var(--ink-3)" }}>
-                      {!samplesSynced
-                        ? "筛选加载中…"
-                        : `显示 ${samples.length} / 总 ${datasetSummary.total_samples || 0}`}
+                    <h3>样本图库</h3>
+                    <span className="mono" style={{ fontSize: 14, color: "var(--ink-2)" }}>
+                      {!samplesSynced ? "加载中…" : `${samples.length} / ${datasetSummary.total_samples || 0}`}
                     </span>
                   </div>
 
-                  {/* 按类别筛选标签条 */}
-                  <div className="filter-chip-bar" role="group" aria-label="按训练类别筛选样本">
+                  <div className="filter-chip-bar" role="group" aria-label="类别筛选">
                     {sampleFilterOptions.map((opt) => {
                       const cnt = opt.id === "" ? Number(datasetSummary.total_samples || 0) : Number(counts[opt.id] || 0)
                       const active = sampleFilter === opt.id
@@ -2774,34 +2858,29 @@ function LiveStudioWorkspace({
                     })}
                   </div>
 
-                  {/* 多选与批量删除工具栏 */}
                   <div className="sample-bulk-bar">
-                    <label className="check" style={{ fontSize: 11.5 }}>
+                    <label className="check" style={{ fontSize: 14 }}>
                       <input
                         type="checkbox"
                         checked={allVisibleSelected}
                         disabled={!samplesSynced || samples.length === 0 || bulkBusy}
                         onChange={toggleSelectAllVisible}
                       />
-                      <span>
-                        全选{selectedSampleIds.length > 0 ? `（已选 ${selectedSampleIds.length}）` : ""}
-                      </span>
+                      <span>{selectedSampleIds.length > 0 ? `已选 ${selectedSampleIds.length}` : "全选"}</span>
                     </label>
                     <div className="sample-bulk-actions">
                       <button
                         type="button"
                         className="btn ghost sm btn-outline-bad"
-                        style={{ height: 24, padding: "0 8px", fontSize: 11.5 }}
                         disabled={!samplesSynced || selectedSampleIds.length === 0 || bulkBusy}
                         onClick={requestBatchDeleteSelected}
                       >
-                        <Trash2 size={11} aria-hidden="true" />
-                        批量删除选中
+                        <Trash2 size={14} aria-hidden="true" />
+                        删除选中
                       </button>
                       <button
                         type="button"
                         className="btn ghost sm btn-outline-bad"
-                        style={{ height: 24, padding: "0 8px", fontSize: 11.5 }}
                         disabled={!samplesSynced || samples.length === 0 || bulkBusy}
                         onClick={requestClearCurrentClass}
                       >
@@ -2811,74 +2890,64 @@ function LiveStudioWorkspace({
                   </div>
 
                   {!samplesSynced ? (
-                    <div className="empty" style={{ minHeight: 100 }}>
-                      正在加载【{activeFilterLabel}】样本列表…
-                    </div>
+                    <div className="empty">加载中…</div>
                   ) : samples.length > 0 ? (
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="sample-grid">
                       {samples.map((smp) => {
                         const sid = String(smp.sample_id)
                         const checked = selectedIdSet.has(sid)
+                        const tip = `${sid} · ${smp.physical_tube_id || "未分组"}`
                         return (
-                          <div key={sid} className={`sample-thumb-card ${checked ? "selected" : ""}`}>
-                            <label className="sample-thumb-check" title="勾选用于批量删除">
+                          <div key={sid} className={`sample-thumb-card ${checked ? "selected" : ""}`} title={tip}>
+                            <label className="sample-thumb-check">
                               <input
                                 type="checkbox"
                                 checked={checked}
                                 disabled={!samplesSynced || bulkBusy}
-                                aria-label={`选择样本 ${sid}`}
+                                aria-label={`选择 ${sid}`}
                                 onChange={() => toggleSampleSelection(sid)}
                               />
                             </label>
                             <img src={smp.image_url} alt={sid} loading="lazy" />
                             <div className="sample-thumb-meta">
-                              <div className="flex items-center justify-between gap-1">
-                                <span className="mono sample-thumb-id" title={smp.physical_tube_id || sid}>
-                                  {smp.physical_tube_id || sid}
-                                </span>
-                                <button
-                                  type="button"
-                                  className="sample-del-btn"
-                                  onClick={() => requestDeleteSingleSample(smp)}
-                                >
-                                  删除
-                                </button>
-                              </div>
                               <select
-                                aria-label={`修改样本 ${sid} 类别`}
+                                aria-label={`类别 ${sid}`}
                                 value={smp.label}
                                 className="sample-label-select"
                                 onChange={(e) => void handleChangeSampleLabel(sid, e.target.value)}
                               >
-                                <option value="complete">完整标签</option>
-                                <option value="crossed_out">A类·已划除</option>
-                                <option value="covered">B类·已遮挡</option>
-                                <option value="absent">C类·已脱落</option>
-                                <option value="unknown_challenge">挑战样本</option>
+                                <option value="complete">完整</option>
+                                <option value="crossed_out">已划除</option>
+                                <option value="covered">已遮挡</option>
+                                <option value="absent">已脱落</option>
+                                <option value="unknown_challenge">挑战</option>
                               </select>
+                              <button
+                                type="button"
+                                className="sample-del-btn"
+                                onClick={() => requestDeleteSingleSample(smp)}
+                              >
+                                删除
+                              </button>
                             </div>
                           </div>
                         )
                       })}
                     </div>
                   ) : (
-                    <div className="empty" style={{ minHeight: 100 }}>
-                      {sampleFilter
-                        ? `【${activeFilterLabel}】类别暂无样本，请用上方方式 A 抓拍或方式 B 本地上传`
-                        : "暂无训练样本，请用上方方式 A 镜头抓拍、方式 B 本地上传或生成演示集"}
-                    </div>
+                    <div className="empty">暂无样本</div>
                   )}
                 </section>
 
-                {/* 折叠高级本地上传（业务证据帧，区别于 AI 训练集） */}
+                {/* 折叠：离线证据补录 */}
                 <details className="inspector-group">
                   <summary>
-                    <span>高级：离线补录业务证据帧（SQLite 证据库）</span>
-                    <Upload size={13} aria-hidden="true" />
+                    <span>证据补录</span>
+                    <Upload size={16} aria-hidden="true" />
                   </summary>
-                  <form className="inspector-group-body grid gap-2.5" onSubmit={(e) => void submitManualEvidence(e)}>
+                  <form className="inspector-group-body" onSubmit={(e) => void submitManualEvidence(e)}>
                     <div className="field">
-                      <label htmlFor="evidence-upload-file">本地 JPEG / PNG 图像</label>
+                      <label htmlFor="evidence-upload-file">证据图片</label>
                       <Input
                         id="evidence-upload-file"
                         type="file"
@@ -2886,15 +2955,15 @@ function LiveStudioWorkspace({
                         onChange={(e) => setFile(e.target.files?.[0] || null)}
                       />
                     </div>
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="grid grid-cols-2 gap-4">
                       <div className="field">
-                        <label htmlFor="evidence-cycle-id">周期号（留空自动）</label>
+                        <label htmlFor="evidence-cycle-id">周期编号</label>
                         <Input
                           id="evidence-cycle-id"
                           list="cycle-options"
                           value={cycle}
                           onChange={(e) => setCycle(e.target.value)}
-                          placeholder="自动生成"
+                          placeholder="自动"
                           className="mono"
                         />
                         <datalist id="cycle-options">
@@ -2904,17 +2973,17 @@ function LiveStudioWorkspace({
                         </datalist>
                       </div>
                       <div className="field">
-                        <label htmlFor="evidence-kind">证据类别</label>
+                        <label htmlFor="evidence-kind">证据类型</label>
                         <Select value={kind} onValueChange={setKind}>
                           <SelectTrigger id="evidence-kind">
                             <SelectValue />
                           </SelectTrigger>
                           <SelectContent>
                             <SelectItem value="initial_label">初始标签</SelectItem>
-                            <SelectItem value="A">A 类 · 划除</SelectItem>
-                            <SelectItem value="B">B 类 · 遮挡</SelectItem>
-                            <SelectItem value="C">C 类 · 脱落</SelectItem>
-                            <SelectItem value="anomaly">异常快照</SelectItem>
+                            <SelectItem value="A">划除</SelectItem>
+                            <SelectItem value="B">遮挡</SelectItem>
+                            <SelectItem value="C">脱落</SelectItem>
+                            <SelectItem value="anomaly">异常</SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
@@ -2927,16 +2996,16 @@ function LiveStudioWorkspace({
                         </SelectTrigger>
                         <SelectContent>
                           <SelectItem value="complete">完整</SelectItem>
-                          <SelectItem value="crossed_out">A 类 · 已划除</SelectItem>
-                          <SelectItem value="covered">B 类 · 已遮挡</SelectItem>
-                          <SelectItem value="absent">C 类 · 已脱落</SelectItem>
-                          <SelectItem value="unknown">未知 / 难判</SelectItem>
+                          <SelectItem value="crossed_out">已划除</SelectItem>
+                          <SelectItem value="covered">已遮挡</SelectItem>
+                          <SelectItem value="absent">已脱落</SelectItem>
+                          <SelectItem value="unknown">未知</SelectItem>
                         </SelectContent>
                       </Select>
                     </div>
-                    <button type="submit" className="btn sm block" disabled={submitting}>
-                      <Upload size={13} aria-hidden="true" />
-                      {submitting ? "上传中…" : "上传并写入证据库"}
+                    <button type="submit" className="btn block" disabled={submitting}>
+                      <Upload size={16} aria-hidden="true" />
+                      {submitting ? "上传中…" : "归档证据"}
                     </button>
                   </form>
                 </details>
@@ -2949,9 +3018,6 @@ function LiveStudioWorkspace({
   )
 }
 
-/* ==========================================================================
-   步骤 3：训练部署（左侧独立滚动看板 + 右侧独立滚动超参与模型库检查器）
-   ========================================================================== */
 function TrainDeployStep({
   state,
   models,
@@ -2973,7 +3039,7 @@ function TrainDeployStep({
   onSaved: () => Promise<void>
   onGoCollect: () => void
 }) {
-  const [epochs, setEpochs] = useState("8")
+  const [epochs, setEpochs] = useState("12")
   const [inputSize, setInputSize] = useState("96")
   const [batchSize, setBatchSize] = useState("8")
   const [lr, setLr] = useState("0.0025")
@@ -2983,26 +3049,30 @@ function TrainDeployStep({
   const [starting, setStarting] = useState(false)
   const [bootstrapping, setBootstrapping] = useState(false)
 
-  const [name, setName] = useState("mobilenetv3-igbt-label")
+  const [onnxFile, setOnnxFile] = useState<File | null>(null)
+  const [importingOnnx, setImportingOnnx] = useState(false)
+
+  const [name, setName] = useState("opencv-mlp-cpp-igbt")
   const [version, setVersion] = useState("v1.0.0")
   const [sha, setSha] = useState("")
-  const [notes, setNotes] = useState("手动登记外部预训练权重")
+  const [notes, setNotes] = useState("")
   const [registering, setRegistering] = useState(false)
 
   const isTraining = trainingStatus.state === "TRAINING" || trainingStatus.state === "EXPORTING_ONNX"
   const latestRun = trainingStatus.latest_run
   const historyList: Data[] = Array.isArray(trainingStatus.history) ? trainingStatus.history : []
   const confusionMatrix = latestRun?.confusion_matrix
-  const counts = datasetSummary.class_counts || {}
+  const counts = getClassCounts(datasetSummary)
+  const readyToTrain = isDatasetReady(datasetSummary)
 
   const handleBootstrap = async () => {
     setBootstrapping(true)
     try {
       await api<Data>("/api/dataset/bootstrap", { method: "POST" }, token)
       await onSaved()
-      flash("标准演示训练集已就绪，可立即启动 MobileNetV3 微调")
+      flash("演示训练集已就绪")
     } catch (err) {
-      flash(`数据集生成失败：${err instanceof Error ? err.message : err}`)
+      flash(`生成失败：${err instanceof Error ? err.message : err}`)
     } finally {
       setBootstrapping(false)
     }
@@ -3012,28 +3082,28 @@ function TrainDeployStep({
     e.preventDefault()
     const epochsVal = Number(epochs)
     if (!epochs.trim() || !Number.isInteger(epochsVal) || epochsVal < 2 || epochsVal > 50) {
-      const msg = "训练轮数 (Epochs) 须为 2 ~ 50 之间的整数"
+      const msg = "训练轮数须为 2 ~ 50 整数"
       setTrainFormError(msg)
       flash(msg)
       return
     }
     const inputSizeVal = Number(inputSize)
     if (!inputSize.trim() || !Number.isInteger(inputSizeVal) || inputSizeVal < 64 || inputSizeVal > 320) {
-      const msg = "输入尺寸 (px) 须为 64 ~ 320 之间的整数"
+      const msg = "输入尺寸须为 64 ~ 320 整数"
       setTrainFormError(msg)
       flash(msg)
       return
     }
     const batchSizeVal = Number(batchSize)
     if (!batchSize.trim() || !Number.isInteger(batchSizeVal) || batchSizeVal < 2 || batchSizeVal > 64) {
-      const msg = "批次大小 (Batch) 须为 2 ~ 64 之间的整数"
+      const msg = "批次大小须为 2 ~ 64 整数"
       setTrainFormError(msg)
       flash(msg)
       return
     }
     const lrVal = Number(lr)
     if (!lr.trim() || !Number.isFinite(lrVal) || lrVal <= 0 || lrVal > 0.1) {
-      const msg = "学习率 (LR) 须大于 0 且不超过 0.1"
+      const msg = "学习率须在 (0, 0.1] 之间"
       setTrainFormError(msg)
       flash(msg)
       return
@@ -3057,19 +3127,55 @@ function TrainDeployStep({
         },
         token
       )
-      flash("已启动 PyTorch MobileNetV3-Small 训练任务，完成后将自动导出 ONNX 并热加载")
+      flash("已启动训练任务")
       await onSaved()
     } catch (err) {
-      flash(`启动训练失败：${err instanceof Error ? err.message : err}`)
+      flash(`启动失败：${err instanceof Error ? err.message : err}`)
     } finally {
       setStarting(false)
+    }
+  }
+
+  const handleImportOnnx = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!onnxFile) return flash("请选择 ONNX 文件")
+    const safeVersion = onnxFile.name
+      .replace(/\.onnx$/i, "")
+      .replace(/[^A-Za-z0-9._-]/g, "_")
+      .replace(/^[_.-]+|[_.-]+$/g, "")
+      .slice(0, 60)
+    const headers: Record<string, string> = {
+      "Content-Type": "application/octet-stream",
+      "X-Input-Size": String(Math.max(64, Math.min(320, Math.round(Number(inputSize) || 96)))),
+    }
+    if (safeVersion) {
+      headers["X-Model-Version"] = safeVersion
+    }
+    setImportingOnnx(true)
+    try {
+      const res = await api<Data>(
+        "/api/models/import_onnx",
+        {
+          method: "POST",
+          headers,
+          body: onnxFile,
+        },
+        token
+      )
+      setOnnxFile(null)
+      flash(`已导入并加载 ${res.model_version || "ONNX 模型"}`)
+      await onSaved()
+    } catch (err) {
+      flash(`导入失败：${err instanceof Error ? err.message : err}`)
+    } finally {
+      setImportingOnnx(false)
     }
   }
 
   const handleActivateModel = async (modelId: string, modelVer: string) => {
     try {
       await api<Data>(`/api/models/${encodeURIComponent(modelId)}/activate`, { method: "POST" }, token)
-      flash(`已将模型 ${modelVer} 热加载至实时相机引擎`)
+      flash(`已启用 ${modelVer}`)
       await onSaved()
     } catch (err) {
       flash(`切换失败：${err instanceof Error ? err.message : err}`)
@@ -3078,7 +3184,7 @@ function TrainDeployStep({
 
   const registerManual = async (e: React.FormEvent) => {
     e.preventDefault()
-    if (!token) return flash("当前工程师会话无效，请重新登录")
+    if (!token) return flash("请重新登录")
     setRegistering(true)
     try {
       await api(
@@ -3096,7 +3202,7 @@ function TrainDeployStep({
         },
         token
       )
-      flash("外部模型版本已登记")
+      flash("模型已登记")
       setSha("")
       await onSaved()
     } catch (err) {
@@ -3110,19 +3216,18 @@ function TrainDeployStep({
     navigator.clipboard
       .writeText(hash)
       .then(() => flash("已复制 SHA256"))
-      .catch(() => flash("复制失败，请手动选中复制"))
+      .catch(() => flash("复制失败"))
   }
 
   return (
     <div className="studio-split">
-      {/* 左侧独立滚动训练看板 */}
-      <div className="studio-board" aria-label="训练指标与数据集评估看板">
-        {/* 数据集分组就绪卡片 */}
+      {/* 左侧宽敞滚动训练看板 */}
+      <div className="studio-board" aria-label="训练看板">
         <section className="panel">
           <header className="panel-head">
-            <h2>数据集分组就绪状态</h2>
-            <span className={`tag ${datasetSummary.ready_to_train ? "pass" : "warn"}`}>
-              {datasetSummary.ready_to_train ? "可启动训练" : "待补充样本"}
+            <h2>训练数据</h2>
+            <span className={`tag ${readyToTrain ? "pass" : "warn"}`}>
+              {readyToTrain ? "可训练" : "缺样本"}
             </span>
             <div className="right">
               <button
@@ -3131,58 +3236,53 @@ function TrainDeployStep({
                 disabled={bootstrapping || isTraining}
                 onClick={() => void handleBootstrap()}
               >
-                <Sparkles size={13} aria-hidden="true" />
-                {bootstrapping ? "生成中…" : "一键生成演示集"}
+                <Sparkles size={14} aria-hidden="true" />
+                {bootstrapping ? "生成中…" : "生成演示集"}
               </button>
               <button type="button" className="btn ghost sm" onClick={onGoCollect}>
-                返回采集标注
+                返回采集
               </button>
             </div>
           </header>
-          <div className="panel-body grid gap-3">
-            <div className="callout">
-              <div>
-                <b style={{ display: "block", color: "var(--ink)", fontSize: 13 }}>
-                  已入库 {datasetSummary.total_samples || 0} 张样本 · 覆盖 {datasetSummary.independent_tube_groups || 0}{" "}
-                  个独立物理料管组
-                </b>
-                <span>{datasetSummary.readiness_reason || "按物理料管 ID 严格隔离训练 / 验证 / 测试集"}</span>
+          <div className="kpi-grid-2">
+            <div className="kpi-tile">
+              <b className="mono">{datasetSummary.total_samples || 0}</b>
+              <span>总样本数</span>
+            </div>
+            <div className="kpi-tile">
+              <b className="mono">{datasetSummary.independent_tube_groups || 0}</b>
+              <span>独立料管组</span>
+            </div>
+          </div>
+          <div className="kpi-row kpi-row-5">
+            {sampleClassDefs.map((c) => (
+              <div className="readout" key={c.id}>
+                <b className="mono">{counts[c.id] || 0}</b>
+                <small>{c.short}</small>
               </div>
-            </div>
-            <div className="kpi-row kpi-row-5 drawer-kpi">
-              {sampleClassDefs.map((c) => (
-                <div className="readout" key={c.id}>
-                  <small>{c.short}</small>
-                  <b style={{ fontSize: 20 }}>
-                    {counts[c.id] || 0}
-                    <em>张</em>
-                  </b>
-                </div>
-              ))}
-            </div>
+            ))}
           </div>
         </section>
 
-        {/* 实时训练进度条与 Epoch 曲线表 */}
         <section className="panel">
           <header className="panel-head">
-            <h2>实时训练进度与 Epoch 曲线</h2>
+            <h2>训练进度</h2>
             <div className="right">
               <span className={`tag ${isTraining ? "warn" : trainingStatus.state === "FAILED" ? "alarm" : "plain"} mono`}>
                 {trainingStatus.progress_pct || 0}%
               </span>
             </div>
           </header>
-          <div className="panel-body grid gap-3">
+          <div className="panel-body">
             {trainingError && (
               <div className="auth-error" role="alert">
-                <AlertTriangle size={14} aria-hidden="true" />
-                <span>训练服务状态获取失败（不影响实时目检判定）：{trainingError}</span>
+                <AlertTriangle size={16} aria-hidden="true" />
+                <span>{trainingError}</span>
               </div>
             )}
-            <div className="flex items-center justify-between gap-2">
-              <b style={{ fontSize: 13 }}>{trainingStatus.message || "等待启动训练"}</b>
-              <span className="mono" style={{ fontSize: 12, color: "var(--ink-3)" }}>
+            <div className="flex items-center justify-between gap-4">
+              <b style={{ fontSize: 16, fontWeight: 600 }}>{trainingStatus.message || "待启动"}</b>
+              <span className="mono" style={{ fontSize: 14, color: "var(--ink-2)" }}>
                 {trainingStatus.state || "IDLE"}
               </span>
             </div>
@@ -3193,14 +3293,14 @@ function TrainDeployStep({
               />
             </div>
 
-            {historyList.length > 0 ? (
-              <div style={{ border: "1px solid var(--rule)", borderRadius: 4, overflowX: "auto" }}>
+            {historyList.length > 0 && (
+              <div style={{ overflowX: "auto" }}>
                 <table className="grid-table">
                   <thead>
                     <tr>
-                      <th>轮次 (Epoch)</th>
-                      <th>训练集 Loss</th>
-                      <th>验证集准确率</th>
+                      <th>轮次</th>
+                      <th>训练损失</th>
+                      <th>验证准确率</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -3214,43 +3314,37 @@ function TrainDeployStep({
                   </tbody>
                 </table>
               </div>
-            ) : (
-              <div className="note">在右侧配置超参并点击「启动 MobileNetV3 训练并导出 ONNX」后，此处将实时刷新每轮 Loss 与准确率。</div>
             )}
           </div>
         </section>
 
-        {/* 4×4 混淆矩阵与 ONNX 校验报告 */}
         <section className="panel">
           <header className="panel-head">
-            <h2>4×4 混淆矩阵与 ONNX 数值校验报告</h2>
-            {latestRun && <span className="tag pass mono">最大绝对误差 {latestRun.onnx_max_abs_diff}</span>}
+            <h2>评估报告</h2>
+            {latestRun && <span className="tag pass mono">{latestRun.model_version}</span>}
           </header>
-          <div className="panel-body grid gap-3">
+          <div className="panel-body">
             {latestRun ? (
               <>
-                <div className="callout" style={{ background: "var(--ok-tint)", borderColor: "var(--ok-border)" }}>
-                  <CheckCircle2 size={16} aria-hidden="true" style={{ color: "var(--ok)" }} />
-                  <div style={{ minWidth: 0, flex: 1 }}>
-                    <b style={{ color: "var(--ok)", fontSize: 13.5, display: "block" }}>
-                      最新产出：{latestRun.model_version}
+                <div className="kpi-grid-2">
+                  <div className="kpi-tile">
+                    <b className="mono" style={{ color: "var(--ok)" }}>
+                      {latestRun.test_accuracy != null ? `${(Number(latestRun.test_accuracy) * 100).toFixed(1)}%` : "—"}
                     </b>
-                    <div className="flex flex-wrap gap-x-5 gap-y-1 mono" style={{ fontSize: 12, marginTop: 4 }}>
-                      <span>
-                        跨管测试准确率：<b>{(Number(latestRun.test_accuracy) * 100).toFixed(1)}%</b> ({latestRun.test_samples} 张)
-                      </span>
-                      <span>
-                        完整标签误放行 (FAR)：<b>{latestRun.complete_false_accept_total} 次</b>
-                      </span>
-                    </div>
-                    <div className="mono" style={{ fontSize: 11, color: "var(--ink-2)", marginTop: 4, wordBreak: "break-all" }}>
-                      SHA256: {latestRun.onnx_sha256}
-                    </div>
+                    <span>测试准确率</span>
+                  </div>
+                  <div className="kpi-tile">
+                    <b className="mono">
+                      {latestRun.val_accuracy != null
+                        ? `${(Number(latestRun.val_accuracy) * 100).toFixed(1)}%`
+                        : `${latestRun.complete_false_accept_total ?? 0}`}
+                    </b>
+                    <span>{latestRun.val_accuracy != null ? "验证准确率" : "误放行次数"}</span>
                   </div>
                 </div>
 
                 {confusionMatrix && Array.isArray(confusionMatrix.labels) && Array.isArray(confusionMatrix.matrix) && (
-                  <div style={{ border: "1px solid var(--rule)", borderRadius: 4, overflowX: "auto" }}>
+                  <div style={{ overflowX: "auto" }}>
                     <table className="grid-table">
                       <thead>
                         <tr>
@@ -3271,7 +3365,7 @@ function TrainDeployStep({
                                 key={cIdx}
                                 className="mono"
                                 style={{
-                                  fontWeight: rIdx === cIdx ? 700 : 400,
+                                  fontWeight: rIdx === cIdx ? 600 : 400,
                                   color: rIdx === cIdx ? "var(--ok)" : val > 0 ? "var(--bad)" : "var(--ink-3)",
                                 }}
                               >
@@ -3286,38 +3380,28 @@ function TrainDeployStep({
                 )}
               </>
             ) : (
-              <div className="empty" style={{ minHeight: 120 }}>
-                尚未产出训练校验报告，完成一次模型训练后自动展示 4×4 混淆矩阵与 ONNX 误差校验
-              </div>
+              <div className="empty">暂无评估报告</div>
             )}
           </div>
         </section>
       </div>
 
-      {/* 右侧独立滚动超参与模型库检查器 */}
-      <aside className="studio-inspector" aria-label="训练超参与模型版本库">
-        <header className="studio-inspector-head">
-          <h2>训练超参与模型部署</h2>
-          <span className="tag pass mono" style={{ maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }}>
-            {state.model_version || "动态引擎"}
-          </span>
-        </header>
-
+      {/* 右侧超参与模型部署检查器 */}
+      <aside className="studio-inspector" aria-label="超参与模型库">
         <div className="studio-inspector-scroll-wrap">
           <div className="studio-inspector-body">
-            {/* 训练超参配置 */}
-            <section className="inspector-section grid gap-3">
+            <section className="inspector-section">
               <div className="inspector-section-head">
-                <h3>MobileNetV3-Small 超参配置</h3>
-                <span className={`tag ${datasetSummary.ready_to_train ? "pass" : "warn"}`}>
-                  {datasetSummary.ready_to_train ? "就绪" : "缺样本"}
+                <h3>训练参数</h3>
+                <span className="tag pass mono" style={{ maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {state.model_version || "C++20"}
                 </span>
               </div>
 
-              <form className="grid gap-3" onSubmit={(e) => void handleStartTraining(e)} noValidate>
-                <div className="grid grid-cols-2 gap-2.5">
+              <form className="grid gap-4" onSubmit={(e) => void handleStartTraining(e)} noValidate>
+                <div className="grid grid-cols-2 gap-4">
                   <div className="field">
-                    <label htmlFor="train-epochs">训练轮数 (Epochs)</label>
+                    <label htmlFor="train-epochs">训练轮数</label>
                     <Input
                       id="train-epochs"
                       type="number"
@@ -3325,6 +3409,7 @@ function TrainDeployStep({
                       max="50"
                       step="1"
                       value={epochs}
+                      placeholder="2-50"
                       onChange={(e) => {
                         setEpochs(e.target.value)
                         if (trainFormError) setTrainFormError("")
@@ -3333,7 +3418,7 @@ function TrainDeployStep({
                     />
                   </div>
                   <div className="field">
-                    <label htmlFor="train-input-size">输入尺寸 (px)</label>
+                    <label htmlFor="train-input-size">输入尺寸</label>
                     <Input
                       id="train-input-size"
                       type="number"
@@ -3341,6 +3426,7 @@ function TrainDeployStep({
                       max="320"
                       step="1"
                       value={inputSize}
+                      placeholder="64-320"
                       onChange={(e) => {
                         setInputSize(e.target.value)
                         if (trainFormError) setTrainFormError("")
@@ -3349,7 +3435,7 @@ function TrainDeployStep({
                     />
                   </div>
                   <div className="field">
-                    <label htmlFor="train-batch-size">批次大小 (Batch)</label>
+                    <label htmlFor="train-batch-size">批次大小</label>
                     <Input
                       id="train-batch-size"
                       type="number"
@@ -3357,6 +3443,7 @@ function TrainDeployStep({
                       max="64"
                       step="1"
                       value={batchSize}
+                      placeholder="2-64"
                       onChange={(e) => {
                         setBatchSize(e.target.value)
                         if (trainFormError) setTrainFormError("")
@@ -3365,7 +3452,7 @@ function TrainDeployStep({
                     />
                   </div>
                   <div className="field">
-                    <label htmlFor="train-lr">学习率 (LR)</label>
+                    <label htmlFor="train-lr">学习率</label>
                     <Input
                       id="train-lr"
                       type="number"
@@ -3373,6 +3460,7 @@ function TrainDeployStep({
                       max="0.1"
                       step="0.0005"
                       value={lr}
+                      placeholder="默认"
                       onChange={(e) => {
                         setLr(e.target.value)
                         if (trainFormError) setTrainFormError("")
@@ -3382,14 +3470,14 @@ function TrainDeployStep({
                   </div>
                 </div>
 
-                <div className="grid gap-2">
+                <div className="grid gap-3">
                   <label className="check">
                     <input
                       type="checkbox"
                       checked={resumeFromLatest}
                       onChange={(e) => setResumeFromLatest(e.target.checked)}
                     />
-                    基于上一版最优权重增量微调
+                    增量微调
                   </label>
                   <label className="check">
                     <input
@@ -3397,13 +3485,13 @@ function TrainDeployStep({
                       checked={useAugmentation}
                       onChange={(e) => setUseAugmentation(e.target.checked)}
                     />
-                    启用车间光学增强（光照 / 反光 / 微旋）
+                    光学增强
                   </label>
                 </div>
 
                 {trainFormError && (
                   <div className="auth-error" role="alert">
-                    <AlertTriangle size={14} aria-hidden="true" />
+                    <AlertTriangle size={16} aria-hidden="true" />
                     <span>{trainFormError}</span>
                   </div>
                 )}
@@ -3411,86 +3499,112 @@ function TrainDeployStep({
                 <button
                   type="submit"
                   className="btn block"
-                  style={{ height: 40 }}
-                  disabled={isTraining || starting || !datasetSummary.ready_to_train}
+                  disabled={isTraining || starting || !readyToTrain}
                 >
-                  <Play size={14} aria-hidden="true" />
-                  {isTraining
-                    ? `训练中 ${trainingStatus.progress_pct || 0}%`
-                    : "启动 MobileNetV3 训练并导出 ONNX"}
+                  <Play size={16} aria-hidden="true" />
+                  {isTraining ? `训练中 ${trainingStatus.progress_pct || 0}%` : "开始训练"}
                 </button>
               </form>
             </section>
 
-            {/* 已登记模型版本库（一键热加载） */}
-            <section className="inspector-section" style={{ padding: 0 }}>
-              <div className="inspector-section-head" style={{ padding: "12px 14px 8px" }}>
-                <h3>已登记模型版本库</h3>
-                <span className="mono" style={{ fontSize: 11.5, color: "var(--ink-3)" }}>
-                  {models.length} 版
+            <section className="inspector-section">
+              <div className="inspector-section-head">
+                <h3>模型版本</h3>
+                <span className="mono" style={{ fontSize: 14, color: "var(--ink-2)" }}>
+                  {models.length}
                 </span>
               </div>
               {models.length ? (
-                models.map((m) => {
-                  const isActive = state.model_version === m.model_version
-                  return (
-                    <div className="model-row" key={m.model_id}>
-                      <div className="name">
-                        {m.model_name}
-                        <span>{m.model_version}</span>
-                      </div>
-                      <div>
-                        {isActive ? (
-                          <span className="tag pass">运行中</span>
-                        ) : (
+                <div className="model-list">
+                  {models.map((m) => {
+                    const isActive = state.model_version === m.model_version
+                    const tip = `${m.model_name} · ${m.sha256 || ""} · ${dateTimeOf(m.created_at_utc)}`
+                    return (
+                      <div className="model-row" key={m.model_id} title={tip}>
+                        <div className="name mono">{m.model_version}</div>
+                        <div className="row-actions">
                           <button
                             type="button"
-                            className="btn ghost sm"
-                            style={{ height: 26, fontSize: 11.5 }}
-                            onClick={() => void handleActivateModel(m.model_id, m.model_version)}
+                            className="icon-btn"
+                            onClick={() => copyHash(String(m.sha256 || ""))}
+                            title="复制 SHA256"
+                            aria-label={`复制 ${m.model_version} 哈希`}
                           >
-                            一键热加载
+                            <Copy size={14} aria-hidden="true" />
                           </button>
-                        )}
+                          {isActive ? (
+                            <span className="tag pass">运行中</span>
+                          ) : (
+                            <button
+                              type="button"
+                              className="btn ghost sm"
+                              onClick={() => void handleActivateModel(m.model_id, m.model_version)}
+                            >
+                              启用
+                            </button>
+                          )}
+                        </div>
                       </div>
-                      <div className="hash">
-                        <code>{m.sha256}</code>
-                        <button type="button" onClick={() => copyHash(m.sha256)} title="复制 SHA256" aria-label="复制 SHA256">
-                          <Copy size={12} aria-hidden="true" />
-                        </button>
-                      </div>
-                      <div className="meta">
-                        {dateTimeOf(m.created_at_utc)} · {m.registered_by}
-                        {m.notes ? ` · ${m.notes}` : ""}
-                      </div>
-                    </div>
-                  )
-                })
-              ) : (
-                <div className="empty" style={{ minHeight: 110, padding: "0 14px" }}>
-                  尚未登记模型，点击上方启动训练自动导出并部署
+                    )
+                  })}
                 </div>
+              ) : (
+                <div className="empty">暂无模型</div>
               )}
             </section>
 
-            {/* 折叠外部 SHA256 手动登记 */}
             <details className="inspector-group">
               <summary>
-                <span>外部预训练权重 SHA256 手动登记</span>
+                <span>导入 ONNX 权重</span>
               </summary>
-              <form className="inspector-group-body grid gap-2.5" onSubmit={(e) => void registerManual(e)}>
-                <div className="grid grid-cols-2 gap-2">
+              <form className="inspector-group-body" onSubmit={(e) => void handleImportOnnx(e)}>
+                <div className="field">
+                  <label htmlFor="onnx-import-file">权重文件</label>
+                  <Input
+                    id="onnx-import-file"
+                    type="file"
+                    accept=".onnx,application/octet-stream"
+                    onChange={(e) => setOnnxFile(e.target.files?.[0] || null)}
+                  />
+                </div>
+                <button type="submit" className="btn block" disabled={importingOnnx || !onnxFile}>
+                  <Upload size={16} aria-hidden="true" />
+                  {importingOnnx ? "导入中…" : "导入并启用"}
+                </button>
+              </form>
+            </details>
+
+            <details className="inspector-group">
+              <summary>
+                <span>手动登记哈希</span>
+              </summary>
+              <form className="inspector-group-body" onSubmit={(e) => void registerManual(e)}>
+                <div className="grid grid-cols-2 gap-4">
                   <div className="field">
                     <label htmlFor="model-reg-name">模型名称</label>
-                    <Input id="model-reg-name" value={name} onChange={(e) => setName(e.target.value)} required className="mono" />
+                    <Input
+                      id="model-reg-name"
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                      required
+                      placeholder="名称"
+                      className="mono"
+                    />
                   </div>
                   <div className="field">
                     <label htmlFor="model-reg-version">版本号</label>
-                    <Input id="model-reg-version" value={version} onChange={(e) => setVersion(e.target.value)} required className="mono" />
+                    <Input
+                      id="model-reg-version"
+                      value={version}
+                      onChange={(e) => setVersion(e.target.value)}
+                      required
+                      placeholder="如v1"
+                      className="mono"
+                    />
                   </div>
                 </div>
                 <div className="field">
-                  <label htmlFor="model-reg-sha256">权重文件 SHA256（64 位十六进制）</label>
+                  <label htmlFor="model-reg-sha256">校验哈希</label>
                   <Input
                     id="model-reg-sha256"
                     className="mono"
@@ -3499,15 +3613,20 @@ function TrainDeployStep({
                     required
                     pattern="[0-9a-fA-F]{64}"
                     maxLength={64}
-                    placeholder="64 位十六进制 SHA256"
+                    placeholder="哈希"
                   />
                 </div>
                 <div className="field">
-                  <label htmlFor="model-reg-notes">备注</label>
-                  <Input id="model-reg-notes" value={notes} onChange={(e) => setNotes(e.target.value)} />
+                  <label htmlFor="model-reg-notes">备注说明</label>
+                  <Input
+                    id="model-reg-notes"
+                    value={notes}
+                    onChange={(e) => setNotes(e.target.value)}
+                    placeholder="选填"
+                  />
                 </div>
-                <button type="submit" className="btn sm block" disabled={registering}>
-                  {registering ? "登记中…" : "使用当前工程师会话登记"}
+                <button type="submit" className="btn block" disabled={registering}>
+                  {registering ? "登记中…" : "确认登记"}
                 </button>
               </form>
             </details>
@@ -3518,13 +3637,10 @@ function TrainDeployStep({
   )
 }
 
-/* ==========================================================================
-   步骤 4：记录与设置（3 子页：检测周期与证据 | 数据与数据库管理 | 相机镜像与系统参数）
-   ========================================================================== */
 const step4SubTabs: { id: RecordsSettingsTab; label: string; icon: typeof ClipboardList }[] = [
-  { id: "records", label: "检测周期与证据", icon: ClipboardList },
-  { id: "storage", label: "数据与数据库管理", icon: HardDrive },
-  { id: "settings", label: "相机镜像与系统参数", icon: Sliders },
+  { id: "records", label: "周期记录", icon: ClipboardList },
+  { id: "storage", label: "存储管理", icon: HardDrive },
+  { id: "settings", label: "系统参数", icon: Sliders },
 ]
 
 function RecordsSettingsStep({
@@ -3550,7 +3666,6 @@ function RecordsSettingsStep({
   passCount,
   alarmCount,
   totalCount,
-  statsScope,
   token,
   mirrorHorizontal,
   togglingMirror,
@@ -3590,7 +3705,6 @@ function RecordsSettingsStep({
   passCount: number
   alarmCount: number
   totalCount: number
-  statsScope: "all" | "recent"
   token: string
   mirrorHorizontal: boolean
   togglingMirror: boolean
@@ -3608,7 +3722,6 @@ function RecordsSettingsStep({
   onSwitchWorkMode: (mode: "debug" | "strict") => void
   onGoStep: (step: EngineerStep, subTab?: RecordsSettingsTab) => void
 }) {
-  const yieldRate = totalCount > 0 ? `${((passCount / totalCount) * 100).toFixed(1)}%` : "—"
   const subTabRefs = useRef<Partial<Record<RecordsSettingsTab, HTMLButtonElement | null>>>({})
 
   const handleSubTabKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>, currentId: RecordsSettingsTab) => {
@@ -3628,13 +3741,10 @@ function RecordsSettingsStep({
 
   const requestPurgeSimulated = () => {
     onConfirm({
-      title: "仅清理演练假周期",
-      description: "确认清理 SQLite 中全部模拟演练周期（CYC_*）及其关联状态事件与磁盘证据图片吗？",
-      consequences: [
-        "仅删除模拟演练产生的 CYC_* 周期、事件日志与对应证据帧文件",
-        "保留所有真实产线检测周期、系统参数历史、AI 训练样本与 ONNX 模型",
-      ],
-      confirmLabel: "确认清理演练数据",
+      title: "清理演练数据",
+      description: "确认清理全部模拟演练周期（CYC_*）及其关联事件与证据图吗？",
+      consequences: ["仅删除模拟演练产生的记录", "保留真实产线周期、训练样本与模型"],
+      confirmLabel: "确认清理",
       tone: "warn",
       onConfirm: async () => {
         try {
@@ -3648,12 +3758,10 @@ function RecordsSettingsStep({
             token
           )
           onClearSelectedCycle()
-          flash(
-            `已清理 ${res.deleted_cycles ?? 0} 条演练周期、${res.deleted_events ?? 0} 条事件，释放 ${res.freed_files ?? 0} 个证据文件`
-          )
+          flash(`已清理 ${res.deleted_cycles ?? 0} 条演练记录`)
           await onSaved()
         } catch (err) {
-          flash(`清理演练数据失败：${err instanceof Error ? err.message : err}`)
+          flash(`清理失败：${err instanceof Error ? err.message : err}`)
         }
       },
     })
@@ -3662,7 +3770,7 @@ function RecordsSettingsStep({
   return (
     <div className="studio-step4">
       <div className="studio-subbar">
-        <div className="studio-subtabs" role="tablist" aria-label="记录与设置子页">
+        <div className="studio-subtabs" role="tablist" aria-label="记录与设置">
           {step4SubTabs.map((tab) => {
             const Icon = tab.icon
             const selected = activeSubTab === tab.id
@@ -3682,7 +3790,7 @@ function RecordsSettingsStep({
                 onClick={() => onChangeSubTab(tab.id)}
                 onKeyDown={(e) => handleSubTabKeyDown(e, tab.id)}
               >
-                <Icon size={14} aria-hidden="true" />
+                <Icon size={16} aria-hidden="true" />
                 {tab.label}
               </button>
             )
@@ -3692,52 +3800,36 @@ function RecordsSettingsStep({
         <div className="studio-subbar-right">
           {activeSubTab === "records" ? (
             <>
-              <span className="tag plain mono">
-                {statsScope === "all" ? `累计总 ${totalCount}` : `近30条 ${totalCount}`}
-              </span>
+              <span className="tag plain mono">总计 {totalCount}</span>
               <span className="tag pass mono">放行 {passCount}</span>
               <span className="tag alarm mono">报警 {alarmCount}</span>
-              <span className="tag plain mono">良率 {yieldRate}</span>
               <button
                 type="button"
                 className="btn ghost sm btn-outline-bad"
                 onClick={requestPurgeSimulated}
               >
-                <Trash2 size={12} aria-hidden="true" />
-                仅清空演练数据
+                <Trash2 size={14} aria-hidden="true" />
+                清理演练
               </button>
               <button type="button" className="btn sm" onClick={onManualCapture}>
-                <Camera size={13} aria-hidden="true" />
-                抓拍当前帧
+                <Camera size={14} aria-hidden="true" />
+                抓拍
               </button>
             </>
           ) : activeSubTab === "storage" ? (
-            <>
-              {storageOverview?.business_db && !storageError && (
-                <span className="tag plain mono">
-                  SQLite {fmt(storageOverview.business_db.db_size_kb, 1)} KB
-                </span>
-              )}
-              {storageOverview?.training_dataset && !storageError && (
-                <span className="tag plain mono">
-                  样本 {storageOverview.training_dataset.total_samples ?? 0} 张 ·{" "}
-                  {fmt(storageOverview.training_dataset.dataset_size_mb, 2)} MB
-                </span>
-              )}
-              <button
-                type="button"
-                className="btn ghost sm"
-                disabled={storageLoading}
-                onClick={onRefreshStorage}
-              >
-                <RefreshCw size={12} aria-hidden="true" />
-                {storageLoading ? "统计中…" : "刷新存储统计"}
-              </button>
-            </>
+            <button
+              type="button"
+              className="btn ghost sm"
+              disabled={storageLoading}
+              onClick={onRefreshStorage}
+            >
+              <RefreshCw size={14} aria-hidden="true" />
+              {storageLoading ? "刷新中…" : "刷新统计"}
+            </button>
           ) : (
             <span className="tag plain mono">
               {!config.roi_config_version || config.roi_config_version === "ROI_UNCALIBRATED"
-                ? "默认五区配置"
+                ? "五区标定"
                 : config.roi_config_version}
             </span>
           )}
@@ -3853,26 +3945,20 @@ function RecordsSubView({
 
   const requestDeleteCycle = (cycleId: string) => {
     onConfirm({
-      title: "删除单条检测周期",
-      description: `确认永久删除检测周期 ${cycleId} 及其全部关联记录吗？`,
-      consequences: [
-        "事务内级联删除 SQLite 中该周期的 cycles 行、events 状态跃迁日志与 evidence 记录",
-        "同步安全清理磁盘 data/evidence/ 中该周期对应的快照图片文件",
-      ],
-      confirmLabel: "确认删除该周期",
+      title: "删除周期",
+      description: `确认永久删除周期 ${cycleId} 及其证据文件吗？`,
+      confirmLabel: "删除",
       tone: "danger",
       onConfirm: async () => {
         try {
-          const res = await api<Data>(`/api/cycles/${encodeURIComponent(cycleId)}`, { method: "DELETE" }, token)
+          await api<Data>(`/api/cycles/${encodeURIComponent(cycleId)}`, { method: "DELETE" }, token)
           if (selectedCycleId === cycleId) {
             onClearSelectedCycle()
           }
-          flash(
-            `已删除周期 ${cycleId}（清理 ${res.deleted_events ?? 0} 条事件，释放 ${res.freed_files ?? 0} 个证据文件）`
-          )
+          flash(`已删除 ${cycleId}`)
           await onSaved()
         } catch (err) {
-          flash(`删除周期失败：${err instanceof Error ? err.message : err}`)
+          flash(`删除失败：${err instanceof Error ? err.message : err}`)
         }
       },
     })
@@ -3887,25 +3973,25 @@ function RecordsSubView({
       <div className="records-split">
         <section className="panel records-pane">
           <header className="panel-head">
-            <h2>检测周期记录</h2>
-            <span className="sub mono">{filteredCycles.length} 条</span>
+            <h2>周期列表</h2>
+            <span className="sub mono">{filteredCycles.length}</span>
             <div className="right">
-              <div className="sim-bar" role="group" aria-label="按判定结果筛选">
+              <div className="sim-bar" role="group" aria-label="判定筛选">
                 {(
                   [
                     ["ALL", "全部"],
                     ["PASS", "放行"],
                     ["ALARM", "报警"],
-                    ["VIEW_INVALID", "视野无效"],
+                    ["VIEW_INVALID", "受阻"],
                   ] as [CycleFilter, string][]
-                ).map(([val, label]) => (
+                ).map(([val, lbl]) => (
                   <button
                     key={val}
                     type="button"
                     className={`sim-btn ${filter === val ? "busy" : ""}`}
                     onClick={() => setFilter(val)}
                   >
-                    {label}
+                    {lbl}
                   </button>
                 ))}
               </div>
@@ -3915,11 +4001,8 @@ function RecordsSubView({
             <table className="grid-table records-table">
               <thead>
                 <tr>
-                  <th>周期号</th>
-                  <th>更新时间</th>
-                  <th>料管</th>
-                  <th>判定</th>
-                  <th>原因</th>
+                  <th>周期编号</th>
+                  <th>判定结果</th>
                   <th>操作</th>
                 </tr>
               </thead>
@@ -3927,25 +4010,23 @@ function RecordsSubView({
                 {filteredCycles.length ? (
                   filteredCycles.map((row) => {
                     const matched = evidence.find((e) => e.cycle_id === row.cycle_id)
+                    const rowTip = `${pipeText(row.pipe_color)} · ${dateTimeOf(row.updated_at_utc)} · ${reasonOf(row.result_reason) || "—"}`
                     return (
                       <tr
                         key={row.cycle_id}
                         className={`click ${selectedCycleId === row.cycle_id ? "sel" : ""}`}
+                        title={rowTip}
                         onClick={() => onSelectCycle(row.cycle_id)}
                       >
                         <td className="mono">{row.cycle_id}</td>
-                        <td className="mono">{dateTimeOf(row.updated_at_utc)}</td>
-                        <td>{pipeText(row.pipe_color)}</td>
                         <td>
                           <OutcomeTag value={row.final_outcome} />
                         </td>
-                        <td className="reason">{reasonOf(row.result_reason) || "—"}</td>
                         <td>
                           <div className="row-actions">
                             <button
                               type="button"
                               className="btn ghost sm"
-                              style={{ height: 24, padding: "0 8px", fontSize: 11.5 }}
                               onClick={(e) => {
                                 e.stopPropagation()
                                 onOpenSnapshot({
@@ -3957,6 +4038,7 @@ function RecordsSubView({
                                   kind: matched?.kind,
                                   pipeColor: row.pipe_color,
                                   labelStatus: row.initial_label,
+                                  reason: row.result_reason,
                                 })
                               }}
                             >
@@ -3965,8 +4047,7 @@ function RecordsSubView({
                             <button
                               type="button"
                               className="btn ghost sm btn-outline-bad"
-                              style={{ height: 24, padding: "0 7px", fontSize: 11.5 }}
-                              aria-label={`删除周期 ${row.cycle_id}`}
+                              aria-label={`删除 ${row.cycle_id}`}
                               onClick={(e) => {
                                 e.stopPropagation()
                                 requestDeleteCycle(String(row.cycle_id))
@@ -3981,8 +4062,8 @@ function RecordsSubView({
                   })
                 ) : (
                   <tr>
-                    <td colSpan={6}>
-                      <div className="empty">暂无符合条件的周期记录</div>
+                    <td colSpan={3}>
+                      <div className="empty">暂无记录</div>
                     </td>
                   </tr>
                 )}
@@ -3993,49 +4074,42 @@ function RecordsSubView({
 
         <section className="panel records-pane">
           <header className="panel-head">
-            <h2>单周期状态跃迁时间线</h2>
+            <h2>状态时间线</h2>
             <span className="sub mono">{selectedCycleId || ""}</span>
             <div className="right mono">
-              {eventsLoading ? "加载中…" : `${events.length} 步`}
+              {eventsLoading ? "加载中…" : `${events.length}`}
             </div>
           </header>
           <div className="records-scroll">
             {eventsLoading && events.length === 0 ? (
-              <div className="empty">正在加载周期 {selectedCycleId} 的状态跃迁…</div>
+              <div className="empty">加载中…</div>
             ) : eventsError ? (
-              <div className="panel-body grid gap-2">
+              <div className="panel-body">
                 <div className="auth-error" role="alert">
-                  <AlertTriangle size={14} aria-hidden="true" />
-                  <span>时间线加载失败：{eventsError}</span>
+                  <AlertTriangle size={16} aria-hidden="true" />
+                  <span>{eventsError}</span>
                 </div>
                 <div>
                   <button type="button" className="btn ghost sm" onClick={onRetryEvents}>
-                    <RefreshCw size={12} aria-hidden="true" />
-                    重试加载
+                    <RefreshCw size={14} aria-hidden="true" />
+                    重试
                   </button>
                 </div>
               </div>
             ) : events.length ? (
-              <ol className="timeline records-timeline">
+              <ol className="timeline">
                 {events.map((row) => (
-                  <li key={row.event_id}>
-                    <div className="row">
+                  <li key={row.event_id} title={reasonOf(row.reason) || undefined}>
+                    <div className="row-main">
                       <b>{human(row.event_type)}</b>
-                      <time>{timeOf(row.created_at_utc)}</time>
+                      <span>{`${human(row.state_before)} → ${human(row.state_after)}`}</span>
                     </div>
-                    <div className="flow">
-                      {human(row.state_before)}{" "}
-                      <ChevronRight size={11} aria-hidden="true" style={{ display: "inline", verticalAlign: -1 }} />{" "}
-                      <b style={{ color: "var(--ink)" }}>{human(row.state_after)}</b>
-                    </div>
-                    {row.reason && <div className="why">{reasonOf(row.reason)}</div>}
+                    <time>{timeOf(row.created_at_utc)}</time>
                   </li>
                 ))}
               </ol>
             ) : (
-              <div className="empty">
-                {selectedCycleId ? "该周期暂无状态跃迁事件" : "点击左侧周期行查看完整状态跃迁事件"}
-              </div>
+              <div className="empty">{selectedCycleId ? "暂无事件" : "选择左侧周期"}</div>
             )}
           </div>
         </section>
@@ -4044,9 +4118,6 @@ function RecordsSubView({
   )
 }
 
-/* ==========================================================================
-   步骤 4B：数据与数据库管理中心（两套存储架构对比 + 模型销毁保护 + 危险区压缩）
-   ========================================================================== */
 function StorageManagerSubView({
   state,
   models,
@@ -4086,32 +4157,32 @@ function StorageManagerSubView({
   const ma = storageOverview?.model_artifacts || {}
   const hasInventory = Boolean(storageOverview?.business_db && storageOverview.business_db.tables && !storageError)
   const formatInventoryCount = (value: unknown) =>
-    typeof value === "number" && Number.isFinite(value) ? String(value) : "未知（统计获取失败）"
-  const classCounts = ds.class_counts || datasetSummary.class_counts || {}
+    typeof value === "number" && Number.isFinite(value) ? String(value) : "—"
+  const classCounts = ds.class_counts || getClassCounts(datasetSummary)
   const activeModelVersion = ma.active_model_version || state.model_version || ""
 
   const sqliteTableItems = [
-    { key: "cycles", name: "检测周期", count: hasInventory ? tables.cycles : undefined },
-    { key: "events", name: "状态事件", count: hasInventory ? tables.events : undefined },
-    { key: "evidence", name: "证据快照", count: hasInventory ? tables.evidence : undefined },
-    { key: "configuration_history", name: "参数历史", count: hasInventory ? tables.configuration_history : undefined },
-    { key: "model_registry", name: "模型版本", count: hasInventory ? tables.model_registry : undefined },
+    { key: "cycles", name: "周期", count: hasInventory ? tables.cycles : undefined },
+    { key: "events", name: "事件", count: hasInventory ? tables.events : undefined },
+    { key: "evidence", name: "证据", count: hasInventory ? tables.evidence : undefined },
+    { key: "configuration_history", name: "参数", count: hasInventory ? tables.configuration_history : undefined },
+    { key: "model_registry", name: "模型", count: hasInventory ? tables.model_registry : undefined },
   ]
 
   const copyHash = (hash: string) => {
     navigator.clipboard
       .writeText(hash)
       .then(() => flash("已复制 SHA256"))
-      .catch(() => flash("复制失败，请手动选中复制"))
+      .catch(() => flash("复制失败"))
   }
 
   const handleActivateModel = async (modelId: string, modelVer: string) => {
     try {
       await api<Data>(`/api/models/${encodeURIComponent(modelId)}/activate`, { method: "POST" }, token)
-      flash(`已切换实时引擎至模型 ${modelVer}`)
+      flash(`已启用 ${modelVer}`)
       await onSaved()
     } catch (err) {
-      flash(`热加载切换失败：${err instanceof Error ? err.message : err}`)
+      flash(`切换失败：${err instanceof Error ? err.message : err}`)
     }
   }
 
@@ -4119,22 +4190,18 @@ function StorageManagerSubView({
     const modelId = String(m.model_id)
     const modelVer = String(m.model_version)
     onConfirm({
-      title: "销毁历史模型版本",
+      title: "销毁模型版本",
       description: `确认永久销毁模型 ${m.model_name} (${modelVer}) 吗？`,
-      consequences: [
-        "删除 SQLite model_registry 表中的该模型登记记录",
-        `安全清理磁盘 data/runs/label_classifier/${modelVer} 下的 ONNX / PyTorch 权重目录`,
-        "当前正在实时运行的模型受系统锁保护，不会被误删",
-      ],
-      confirmLabel: "确认永久销毁模型",
+      consequences: ["删除数据库模型记录及磁盘权重目录", "运行中模型受保护不会被误删"],
+      confirmLabel: "确认销毁",
       tone: "danger",
       onConfirm: async () => {
         try {
           await api<Data>(`/api/models/${encodeURIComponent(modelId)}`, { method: "DELETE" }, token)
-          flash(`已销毁废弃模型 ${modelVer} 并清理磁盘产物目录`)
+          flash(`已销毁 ${modelVer}`)
           await onSaved()
         } catch (err) {
-          flash(`销毁模型失败：${err instanceof Error ? err.message : err}`)
+          flash(`销毁失败：${err instanceof Error ? err.message : err}`)
         }
       },
     })
@@ -4142,13 +4209,9 @@ function StorageManagerSubView({
 
   const requestPurgeSimulated = () => {
     onConfirm({
-      title: "仅清理演练假周期",
-      description: "确认清理全部演练模拟周期（CYC_*）及其关联事件和证据图片吗？",
-      consequences: [
-        "仅删除 cycle_id 以 CYC_ 开头的演练周期、对应 events 与 evidence 磁盘图片",
-        "真实产线记录、参数配置、AI 训练样本与 ONNX 模型均完整保留",
-      ],
-      confirmLabel: "确认清理演练假周期",
+      title: "清理演练周期",
+      description: "确认清理全部演练周期（CYC_*）及对应事件与证据图片吗？",
+      confirmLabel: "确认清理",
       tone: "warn",
       onConfirm: async () => {
         try {
@@ -4162,12 +4225,10 @@ function StorageManagerSubView({
             token
           )
           onClearSelectedCycle()
-          flash(
-            `已清理 ${res.deleted_cycles ?? 0} 条演练周期、${res.deleted_events ?? 0} 条事件，释放 ${res.freed_files ?? 0} 个证据文件`
-          )
+          flash(`已清理 ${res.deleted_cycles ?? 0} 条演练周期`)
           await onSaved()
         } catch (err) {
-          flash(`清理演练周期失败：${err instanceof Error ? err.message : err}`)
+          flash(`清理失败：${err instanceof Error ? err.message : err}`)
         }
       },
     })
@@ -4176,21 +4237,17 @@ function StorageManagerSubView({
   const requestClearTrainingSamples = () => {
     const totalSamples = Number(ds.total_samples ?? datasetSummary.total_samples ?? 0)
     onConfirm({
-      title: "清空全部 AI 训练样本",
-      description: `确认永久清空 data/dataset/ 下全部 ${totalSamples} 张训练切片与标注索引吗？`,
-      consequences: [
-        "删除 5 个类别下的全部切片图像及 manifest / COCO 标注清单",
-        "不影响 SQLite 业务检测周期记录，也不影响当前已训练部署的 ONNX 模型",
-      ],
-      confirmLabel: `确认清空 ${totalSamples} 张训练样本`,
+      title: "清空训练样本",
+      description: `确认清空全部 ${totalSamples} 张训练样本吗？`,
+      confirmLabel: "确认清空",
       tone: "danger",
       onConfirm: async () => {
         try {
           await api<Data>("/api/dataset/clear", { method: "POST" }, token)
-          flash("已清空全部 AI 训练样本")
+          flash("已清空训练样本")
           await onSaved()
         } catch (err) {
-          flash(`清空训练样本失败：${err instanceof Error ? err.message : err}`)
+          flash(`清空失败：${err instanceof Error ? err.message : err}`)
         }
       },
     })
@@ -4198,32 +4255,26 @@ function StorageManagerSubView({
 
   const requestDestroyAllBusiness = () => {
     if (!hasInventory) {
-      flash("存储统计获取失败，当前业务记录数量未知，请先刷新存储统计核对后再执行全量销毁")
+      flash("请先刷新统计")
       return
     }
     const cyclesText = formatInventoryCount(tables.cycles)
     const eventsText = formatInventoryCount(tables.events)
     const evidenceText = formatInventoryCount(tables.evidence)
-    const filesText = formatInventoryCount(bdb.evidence_files)
-    const sizeText =
-      typeof bdb.evidence_size_mb === "number" && Number.isFinite(bdb.evidence_size_mb)
-        ? `${fmt(bdb.evidence_size_mb, 2)} MB`
-        : "未知"
     onConfirm({
-      title: "销毁全部业务周期与证据 + VACUUM 压缩空间",
-      description: "高危操作：即将永久清空 SQLite 中全部检测周期、状态跃迁事件与磁盘证据快照，并执行 VACUUM 立即压缩数据库文件。",
+      title: "重置业务数据库",
+      description: "高危操作：永久清空全部检测周期、状态事件与磁盘证据快照，并执行 VACUUM 压缩。",
       consequences: [
-        `删除全部 ${cyclesText} 条检测周期、${eventsText} 条状态事件与 ${evidenceText} 条证据索引`,
-        `永久删除磁盘 data/evidence/ 下 ${filesText} 个证据快照图片（释放约 ${sizeText}）`,
-        "执行 SQLite VACUUM 收缩 station.sqlite3 磁盘占用；保留系统参数历史与模型版本库",
+        `删除 ${cyclesText} 条周期、${eventsText} 条事件与 ${evidenceText} 条证据`,
+        "保留系统参数历史与模型版本库",
       ],
-      confirmLabel: "确认永久销毁并 VACUUM",
+      confirmLabel: "确认销毁并压缩",
       tone: "danger",
-      requireCheckLabel: "我已知晓全部业务检测周期与证据快照将永久删除且不可恢复",
+      requireCheckLabel: "确认永久删除全部业务周期与证据快照",
       requiresInventory: true,
       onConfirm: async () => {
         if (!isInventoryAvailable()) {
-          flash("当前存储统计已失效，已中止全量销毁，请重新刷新存储统计核对后再操作")
+          flash("存储统计已失效，已中止")
           return
         }
         try {
@@ -4237,24 +4288,22 @@ function StorageManagerSubView({
             token
           )
           onClearSelectedCycle()
-          flash(
-            `已销毁全部 ${res.deleted_cycles ?? 0} 条周期、释放 ${res.freed_files ?? 0} 个证据文件并完成 SQLite VACUUM 压缩`
-          )
+          flash(`已清空 ${res.deleted_cycles ?? 0} 条周期并完成压缩`)
           await onSaved()
         } catch (err) {
-          flash(`销毁业务库失败：${err instanceof Error ? err.message : err}`)
+          flash(`执行失败：${err instanceof Error ? err.message : err}`)
         }
       },
     })
   }
 
   return (
-    <div className="storage-layout" aria-label="数据与数据库管理中心">
+    <div className="storage-layout" aria-label="存储管理中心">
       {storageError && (
         <div className="auth-error" role="alert" style={{ justifyContent: "space-between" }}>
           <span className="inline-flex items-center gap-2">
-            <AlertTriangle size={15} aria-hidden="true" />
-            <span>存储统计获取失败，当前库存数量未知（{storageError}）。为防止误删，已暂时锁定全量业务库销毁。</span>
+            <AlertTriangle size={16} aria-hidden="true" />
+            <span>统计获取失败：{storageError}</span>
           </span>
           <button
             type="button"
@@ -4262,193 +4311,84 @@ function StorageManagerSubView({
             disabled={storageLoading}
             onClick={onRefreshStorage}
           >
-            <RefreshCw size={12} aria-hidden="true" />
-            重新获取统计
+            <RefreshCw size={14} aria-hidden="true" />
+            重试
           </button>
         </div>
       )}
-      {/* 顶部两列：后台存储逻辑架构卡（一眼看懂两套数据） */}
+
       <div className="storage-arch-grid">
-        {/* 左卡：生产运行业务库 */}
-        <section className="panel storage-card">
+        <section
+          className="panel storage-card"
+          title={`${bdb.db_path || "data/station.db"} · ${bdb.evidence_dir || "data/evidence"}`}
+        >
           <header className="panel-head">
-            <h2 className="flex items-center gap-1.5">
-              <HardDrive size={14} aria-hidden="true" />
-              生产运行业务库
+            <h2 className="flex items-center gap-2">
+              <HardDrive size={16} aria-hidden="true" />
+              业务数据库
             </h2>
-            <span className="tag plain mono">SQLite + 证据图</span>
             <div className="right mono">
-              {storageLoading && !storageOverview
-                ? "统计中…"
-                : !hasInventory
-                  ? "未知（统计获取失败）"
-                  : `${fmt(bdb.db_size_kb, 1)} KB · 证据 ${fmt(bdb.evidence_size_mb, 2)} MB`}
+              {hasInventory ? `${fmt(bdb.db_size_kb, 1)} KB` : "—"}
             </div>
           </header>
 
-          <div className="storage-card-body">
-            {/* 5 张表实时行数 */}
-            <div className="storage-metric-grid" aria-label="SQLite 五张业务表实时行数">
-              {sqliteTableItems.map((t) => (
-                <div className="storage-metric-cell" key={t.key}>
-                  <small>{t.name}</small>
-                  <b>{hasInventory ? (t.count ?? "—") : "未知"}</b>
-                  <code title={t.key}>{t.key}</code>
-                </div>
-              ))}
-            </div>
-
-            {/* 真实文件与路径 */}
-            <div className="storage-path-list">
-              <div className="storage-path-row">
-                <span>SQLite 库</span>
-                <code>{bdb.db_path || "data/station.sqlite3"}</code>
-                <em>{hasInventory ? `${fmt(bdb.db_size_kb, 1)} KB` : "未知"}</em>
+          <div className="storage-metric-grid" aria-label="业务表行数">
+            {sqliteTableItems.map((t) => (
+              <div className="storage-metric-cell" key={t.key} title={t.key}>
+                <b>{hasInventory ? (t.count ?? "—") : "—"}</b>
+                <small>{t.name}</small>
               </div>
-              <div className="storage-path-row">
-                <span>证据目录</span>
-                <code>{bdb.evidence_dir || "data/evidence"}</code>
-                <em>
-                  {hasInventory
-                    ? `${formatInventoryCount(bdb.evidence_files)} 张 · ${fmt(bdb.evidence_size_mb, 2)} MB`
-                    : "未知（统计获取失败）"}
-                </em>
-              </div>
-            </div>
-
-            {/* 一眼看懂：存什么 / 怎么删 / 怎么销毁 */}
-            <div className="storage-logic-list">
-              <div className="storage-logic-row">
-                <span className="storage-logic-pill">存什么</span>
-                <span>实时产线检测周期、状态机跃迁日志、抓拍证据帧、参数版本历史与已登记模型表。</span>
-              </div>
-              <div className="storage-logic-row">
-                <span className="storage-logic-pill">怎么删</span>
-                <span>前往「检测周期与证据」逐行级联删除单条周期，或在下方销毁非运行中的废弃模型。</span>
-              </div>
-              <div className="storage-logic-row">
-                <span className="storage-logic-pill">怎么销毁</span>
-                <span>在下方危险区一键清理演练假周期，或清空全部周期证据并执行 VACUUM 收缩体积。</span>
-              </div>
-            </div>
+            ))}
           </div>
 
           <footer className="storage-card-foot">
             <button type="button" className="btn ghost sm" onClick={() => onChangeSubTab("records")}>
-              <ClipboardList size={13} aria-hidden="true" />
-              前往检测周期与证据
+              周期记录
             </button>
           </footer>
         </section>
 
-        {/* 右卡：AI 训练样本与模型库 */}
-        <section className="panel storage-card">
+        <section
+          className="panel storage-card"
+          title={`${ds.dataset_dir || "data/dataset"} · ${ma.runs_dir || "data/runs/label_classifier"}`}
+        >
           <header className="panel-head">
-            <h2 className="flex items-center gap-1.5">
-              <Layers size={14} aria-hidden="true" />
-              AI 训练样本与模型库
+            <h2 className="flex items-center gap-2">
+              <Database size={16} aria-hidden="true" />
+              样本与模型库
             </h2>
-            <span className="tag plain mono">切片 + ONNX</span>
             <div className="right mono">
-              {storageLoading && !storageOverview
-                ? "统计中…"
-                : `样本 ${fmt(ds.dataset_size_mb, 2)} MB · 模型 ${fmt(ma.models_size_mb, 2)} MB`}
+              {`${fmt(ds.dataset_size_mb, 2)} MB`}
             </div>
           </header>
 
-          <div className="storage-card-body">
-            {/* 5 类训练切片实时数量 */}
-            <div className="storage-metric-grid" aria-label="五类 AI 训练切片统计">
-              {sampleClassDefs.map((c) => (
-                <div className="storage-metric-cell" key={c.id}>
-                  <small>{c.short}</small>
-                  <b>{classCounts[c.id] ?? 0}</b>
-                  <code>{c.id}</code>
-                </div>
-              ))}
-            </div>
-
-            {/* 汇总指标 */}
-            <div className="storage-summary-strip">
-              <div className="storage-summary-item">
-                <small>训练切片 / 独立料管组</small>
-                <b className="mono">
-                  {ds.total_samples ?? datasetSummary.total_samples ?? 0} 张 /{" "}
-                  {ds.independent_tube_groups ?? datasetSummary.independent_tube_groups ?? 0} 组
-                </b>
+          <div className="storage-metric-grid" aria-label="类别切片数">
+            {sampleClassDefs.map((c) => (
+              <div className="storage-metric-cell" key={c.id}>
+                <b>{classCounts[c.id] ?? 0}</b>
+                <small>{c.short}</small>
               </div>
-              <div className="storage-summary-item">
-                <small>COCO 框标注数</small>
-                <b className="mono">{ds.coco_annotations ?? 0} 条</b>
-              </div>
-              <div className="storage-summary-item">
-                <small>模型产出目录 / 实时运行</small>
-                <b className="mono" title={activeModelVersion || "未加载 ONNX"}>
-                  {ma.run_count ?? 0} 版 · {activeModelVersion || "动态引擎"}
-                </b>
-              </div>
-            </div>
-
-            {/* 真实文件与路径 */}
-            <div className="storage-path-list">
-              <div className="storage-path-row">
-                <span>样本目录</span>
-                <code>{ds.dataset_dir || "data/dataset"}</code>
-                <em>{fmt(ds.dataset_size_mb, 2)} MB</em>
-              </div>
-              <div className="storage-path-row">
-                <span>索引清单</span>
-                <code>{ds.manifest_path || "data/dataset/manifest.csv"}</code>
-                <em>{ds.coco_annotations ?? 0} COCO</em>
-              </div>
-              <div className="storage-path-row">
-                <span>模型目录</span>
-                <code>{ma.runs_dir || "data/runs/label_classifier"}</code>
-                <em>{fmt(ma.models_size_mb, 2)} MB</em>
-              </div>
-            </div>
-
-            {/* 一眼看懂：存什么 / 怎么删 / 怎么销毁 */}
-            <div className="storage-logic-list">
-              <div className="storage-logic-row">
-                <span className="storage-logic-pill">存什么</span>
-                <span>5 类标签训练切片、拉框 COCO 标注清单，以及 PyTorch 训练产出的 ONNX 推理权重。</span>
-              </div>
-              <div className="storage-logic-row">
-                <span className="storage-logic-pill">怎么删</span>
-                <span>在「2. 采集标注」按类筛选、修改标注、单删或勾选多张样本一键批量删除。</span>
-              </div>
-              <div className="storage-logic-row">
-                <span className="storage-logic-pill">怎么销毁</span>
-                <span>在下方清空全部 AI 训练样本，或按版本销毁非运行中的废弃 ONNX 模型目录。</span>
-              </div>
-            </div>
+            ))}
           </div>
 
           <footer className="storage-card-foot">
             <button type="button" className="btn ghost sm" onClick={() => onGoStep("collect")}>
-              <Database size={13} aria-hidden="true" />
-              前往采集标注
+              采集标注
             </button>
             <button type="button" className="btn sm" onClick={() => onGoStep("train")}>
-              <Cpu size={13} aria-hidden="true" />
-              前往训练部署
+              训练部署
             </button>
           </footer>
         </section>
       </div>
 
-      {/* 中部：模型版本清理与销毁（当前实时运行模型绿锁保护） */}
-      <section className="panel" aria-label="模型版本清理与销毁">
+      <section className="panel" aria-label="模型管理">
         <header className="panel-head">
-          <h2>模型版本清理与销毁</h2>
-          <span className="sub mono">
-            已登记 {models.length} 版 · 实时引擎：{activeModelVersion || "动态启发式引擎"}
-          </span>
+          <h2>模型管理</h2>
           <div className="right">
             <span className="protected-lock-badge">
-              <Lock size={11} aria-hidden="true" />
-              运行中模型自动受保护，防误删
+              <Lock size={14} aria-hidden="true" />
+              运行模型受保护
             </span>
           </div>
         </header>
@@ -4457,9 +4397,7 @@ function StorageManagerSubView({
           <table className="grid-table">
             <thead>
               <tr>
-                <th>模型名称与版本</th>
-                <th>SHA256 校验摘要</th>
-                <th>登记时间与备注</th>
+                <th>模型版本</th>
                 <th>状态</th>
                 <th>操作</th>
               </tr>
@@ -4468,79 +4406,60 @@ function StorageManagerSubView({
               {models.length > 0 ? (
                 models.map((m) => {
                   const isActive = Boolean(activeModelVersion && m.model_version === activeModelVersion)
+                  const rowTip = `${m.model_name} · SHA256: ${m.sha256 || "—"} · ${dateTimeOf(m.created_at_utc)}${m.notes ? ` · ${m.notes}` : ""}`
                   return (
-                    <tr key={m.model_id}>
-                      <td>
-                        <b>{m.model_name}</b>{" "}
-                        <span className="mono" style={{ color: "var(--ink-2)", fontSize: 12 }}>
-                          {m.model_version}
-                        </span>
-                      </td>
-                      <td className="mono">
-                        <span className="inline-flex items-center gap-1.5">
-                          <code style={{ fontSize: 11.5 }}>{String(m.sha256 || "").slice(0, 16)}…</code>
-                          <button
-                            type="button"
-                            className="icon-btn"
-                            style={{ width: 22, height: 22 }}
-                            onClick={() => copyHash(String(m.sha256 || ""))}
-                            title="复制完整 SHA256"
-                            aria-label={`复制模型 ${m.model_version} SHA256`}
-                          >
-                            <Copy size={11} aria-hidden="true" />
-                          </button>
-                        </span>
-                      </td>
-                      <td className="reason">
-                        {dateTimeOf(m.created_at_utc)}
-                        {m.notes ? ` · ${m.notes}` : ""}
+                    <tr key={m.model_id} title={rowTip}>
+                      <td className="mono" style={{ fontWeight: 600 }}>
+                        {m.model_version}
                       </td>
                       <td>
                         {isActive ? (
                           <span className="protected-lock-badge">
-                            <Lock size={11} aria-hidden="true" />
-                            运行中·受保护
+                            <Lock size={14} aria-hidden="true" />
+                            运行中
                           </span>
                         ) : (
-                          <span className="tag plain">历史归档</span>
+                          <span className="tag plain">已归档</span>
                         )}
                       </td>
                       <td>
-                        {isActive ? (
-                          <span className="note" style={{ fontSize: 11.5 }}>
-                            请先切换其他版本再销毁
-                          </span>
-                        ) : (
-                          <div className="row-actions">
-                            <button
-                              type="button"
-                              className="btn ghost sm"
-                              style={{ height: 24, padding: "0 8px", fontSize: 11.5 }}
-                              onClick={() => void handleActivateModel(String(m.model_id), String(m.model_version))}
-                            >
-                              热加载
-                            </button>
-                            <button
-                              type="button"
-                              className="btn ghost sm btn-outline-bad"
-                              style={{ height: 24, padding: "0 8px", fontSize: 11.5 }}
-                              onClick={() => requestDeleteModel(m)}
-                            >
-                              <Trash2 size={11} aria-hidden="true" />
-                              销毁
-                            </button>
-                          </div>
-                        )}
+                        <div className="row-actions">
+                          <button
+                            type="button"
+                            className="icon-btn"
+                            onClick={() => copyHash(String(m.sha256 || ""))}
+                            title="复制 SHA256"
+                            aria-label={`复制 ${m.model_version} 哈希`}
+                          >
+                            <Copy size={14} aria-hidden="true" />
+                          </button>
+                          {!isActive && (
+                            <>
+                              <button
+                                type="button"
+                                className="btn ghost sm"
+                                onClick={() => void handleActivateModel(String(m.model_id), String(m.model_version))}
+                              >
+                                启用
+                              </button>
+                              <button
+                                type="button"
+                                className="btn ghost sm btn-outline-bad"
+                                onClick={() => requestDeleteModel(m)}
+                              >
+                                销毁
+                              </button>
+                            </>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   )
                 })
               ) : (
                 <tr>
-                  <td colSpan={5}>
-                    <div className="empty" style={{ minHeight: 84 }}>
-                      尚未登记训练模型，可前往「3. 训练部署」训练并导出 ONNX
-                    </div>
+                  <td colSpan={3}>
+                    <div className="empty">暂无模型</div>
                   </td>
                 </tr>
               )}
@@ -4549,81 +4468,46 @@ function StorageManagerSubView({
         </div>
       </section>
 
-      {/* 底部：危险区 · 数据库批量清理与空间回收（二次确认保护） */}
-      <section className="panel danger-panel" aria-label="危险区：数据库批量清理与空间回收">
+      <section className="panel" aria-label="数据清理">
         <header className="panel-head">
-          <h2>
-            <ShieldAlert size={15} aria-hidden="true" />
-            危险区：数据库批量清理与空间回收（二次确认保护）
-          </h2>
-          <span className="sub">每项操作均需携带工程师会话令牌并通过显式二次确认，绝不盲目清空</span>
+          <h2>数据清理</h2>
         </header>
-        <div className="panel-body">
-          <div className="danger-action-grid">
-            <div className="danger-action-card">
-              <div>
-                <h3>1. 仅清理演练假周期</h3>
-                <p>
-                  仅删除影子演练产生的模拟周期（<code>CYC_*</code>）及对应事件与证据图；完整保留真实产线记录、参数历史与训练集。
-                </p>
-              </div>
-              <button
-                type="button"
-                className="btn ghost sm btn-outline-bad block"
-                onClick={requestPurgeSimulated}
-              >
-                <Trash2 size={13} aria-hidden="true" />
-                仅清理演练假周期
-              </button>
-            </div>
+        <div className="danger-action-grid">
+          <div className="danger-action-card">
+            <h3>清理演练周期</h3>
+            <button
+              type="button"
+              className="btn ghost btn-outline-bad block"
+              onClick={requestPurgeSimulated}
+            >
+              <Trash2 size={16} aria-hidden="true" />
+              清理演练
+            </button>
+          </div>
 
-            <div className="danger-action-card">
-              <div>
-                <h3>2. 清空全部 AI 训练样本</h3>
-                <p>
-                  删除 <code>data/dataset/</code> 下全部{" "}
-                  <b className="mono">{ds.total_samples ?? datasetSummary.total_samples ?? 0}</b>{" "}
-                  张训练切片与标注索引；不影响业务库及已部署模型。
-                </p>
-              </div>
-              <button
-                type="button"
-                className="btn ghost sm btn-outline-bad block"
-                onClick={requestClearTrainingSamples}
-              >
-                <Trash2 size={13} aria-hidden="true" />
-                清空全部 AI 训练样本
-              </button>
-            </div>
+          <div className="danger-action-card">
+            <h3>清空训练样本</h3>
+            <button
+              type="button"
+              className="btn ghost btn-outline-bad block"
+              onClick={requestClearTrainingSamples}
+            >
+              <Trash2 size={16} aria-hidden="true" />
+              清空样本
+            </button>
+          </div>
 
-            <div className="danger-action-card severe">
-              <div>
-                <h3>3. 销毁全部业务周期与证据 + VACUUM</h3>
-                <p>
-                  {hasInventory ? (
-                    <>
-                      永久清空全部检测周期（<b className="mono">{formatInventoryCount(tables.cycles)}</b> 条）、状态事件与证据快照，并执行 SQLite{" "}
-                      <code>VACUUM</code> 立即回收磁盘空间。
-                    </>
-                  ) : storageLoading ? (
-                    <>正在核对当前业务库记录数量，加载完成后可确认操作…</>
-                  ) : (
-                    <>
-                      当前业务库记录数量<b>未知（统计获取失败）</b>，需先成功刷新存储统计核对后再执行全量销毁。
-                    </>
-                  )}
-                </p>
-              </div>
-              <button
-                type="button"
-                className="btn btn-danger sm block"
-                disabled={storageLoading || !hasInventory}
-                onClick={requestDestroyAllBusiness}
-              >
-                <ShieldAlert size={13} aria-hidden="true" />
-                {hasInventory ? "销毁全部业务周期与证据 + VACUUM 压缩空间" : "需先成功获取存储统计"}
-              </button>
-            </div>
+          <div className="danger-action-card severe">
+            <h3>重置业务数据库</h3>
+            <button
+              type="button"
+              className="btn btn-danger block"
+              disabled={storageLoading || !hasInventory}
+              onClick={requestDestroyAllBusiness}
+            >
+              <ShieldAlert size={16} aria-hidden="true" />
+              {hasInventory ? "全量销毁并压缩" : "请先刷新统计"}
+            </button>
           </div>
         </div>
       </section>
@@ -4659,15 +4543,15 @@ function SettingsSubView({
   const [rois, setRois] = useState<Data>(() =>
     config.rois && Object.keys(config.rois).length > 0 ? config.rois : defaultStandardRois
   )
-  const [width, setWidth] = useState(String(config.camera_width || 1920))
-  const [height, setHeight] = useState(String(config.camera_height || 1080))
-  const [device, setDevice] = useState(config.camera_device_id || "USB_CAM_00_C920")
+  const [width, setWidth] = useState(String(config.camera_width || DEFAULT_CAMERA_WIDTH))
+  const [height, setHeight] = useState(String(config.camera_height || DEFAULT_CAMERA_HEIGHT))
+  const [device, setDevice] = useState(config.camera_device_id || "CAM_0")
   const [both, setBoth] = useState(config.camera_covers_both_ends !== false)
   const [thresholds, setThresholds] = useState<Data>(config.thresholds || {})
   const [target, setTarget] = useState(roiNames[0])
   const [image, setImage] = useState<HTMLImageElement | null>(null)
   const [drag, setDrag] = useState<[number, number] | null>(null)
-  const [canvasSize, setCanvasSize] = useState<[number, number]>([960, 540])
+  const [canvasSize, setCanvasSize] = useState<[number, number]>([DEFAULT_CAMERA_WIDTH, DEFAULT_CAMERA_HEIGHT])
   const canvasRefElem = useRef<HTMLCanvasElement | null>(null)
 
   const activeRois = both ? roiNames : roiNames.slice(0, 3)
@@ -4678,7 +4562,7 @@ function SettingsSubView({
     const im = new Image()
     im.onload = () => {
       setImage(im)
-      setCanvasSize([im.naturalWidth || 1920, im.naturalHeight || 1080])
+      setCanvasSize([im.naturalWidth || DEFAULT_CAMERA_WIDTH, im.naturalHeight || DEFAULT_CAMERA_HEIGHT])
     }
     im.src = src
   }, [])
@@ -4689,7 +4573,7 @@ function SettingsSubView({
     const im = new Image()
     im.onload = () => {
       setImage(im)
-      setCanvasSize([im.naturalWidth || 1920, im.naturalHeight || 1080])
+      setCanvasSize([im.naturalWidth || DEFAULT_CAMERA_WIDTH, im.naturalHeight || DEFAULT_CAMERA_HEIGHT])
     }
     im.onerror = () => loadPresetFrame(tubeYellowImg)
     im.src = `/api/camera/frame.jpg?t=${Date.now()}`
@@ -4740,12 +4624,13 @@ function SettingsSubView({
       ctx.setLineDash([])
 
       const text = roiLabels[k] || k
-      ctx.font = `600 ${12 * u}px "Geist Variable", "Microsoft YaHei UI", sans-serif`
-      const tw = ctx.measureText(text).width + 12 * u
+      ctx.font = '600 16px "Geist Variable", "Microsoft YaHei UI", sans-serif'
+      const tw = ctx.measureText(text).width + 16
+      const boxH = 24
       ctx.fillStyle = color
-      ctx.fillRect(rx, ry - 20 * u < 0 ? ry : ry - 20 * u, tw, 20 * u)
+      ctx.fillRect(rx, ry - boxH < 0 ? ry : ry - boxH, tw, boxH)
       ctx.fillStyle = "#fff"
-      ctx.fillText(text, rx + 6 * u, (ry - 20 * u < 0 ? ry : ry - 20 * u) + 14 * u)
+      ctx.fillText(text, rx + 8, (ry - boxH < 0 ? ry : ry - boxH) + 18)
     })
   }, [rois, image, target, canvasSize])
 
@@ -4763,22 +4648,22 @@ function SettingsSubView({
     const im = new Image()
     im.onload = () => {
       setImage(im)
-      setCanvasSize([im.naturalWidth || 1920, im.naturalHeight || 1080])
+      setCanvasSize([im.naturalWidth || DEFAULT_CAMERA_WIDTH, im.naturalHeight || DEFAULT_CAMERA_HEIGHT])
       URL.revokeObjectURL(url)
     }
     im.onerror = () => {
       URL.revokeObjectURL(url)
-      flash("无法解析所选图片，请选择有效的 JPEG/PNG 文件")
+      flash("无法解析所选图片")
     }
     im.src = url
   }
 
   const save = async () => {
-    if (!token) return flash("当前工程师会话无效，请重新验证登录")
+    if (!token) return flash("请重新登录")
     const required = both ? roiNames : roiNames.slice(0, 3)
     const invalidRois = required.filter((k) => !isValidRoiBox(rois[k]))
     if (invalidRois.length > 0) {
-      return flash(`ROI 区域未标定或面积无效：${invalidRois.map((k) => roiLabels[k]).join("、")}`)
+      return flash(`区域无效：${invalidRois.map((k) => roiLabels[k]).join("、")}`)
     }
     try {
       await api(
@@ -4788,8 +4673,8 @@ function SettingsSubView({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             camera_device_id: device || "CAM_DEFAULT",
-            camera_width: Number(width),
-            camera_height: Number(height),
+            camera_width: Number(width) || DEFAULT_CAMERA_WIDTH,
+            camera_height: Number(height) || DEFAULT_CAMERA_HEIGHT,
             camera_covers_both_ends: both,
             rois: Object.fromEntries(Object.entries(rois).filter(([k]) => required.includes(k))),
             thresholds,
@@ -4797,7 +4682,7 @@ function SettingsSubView({
         },
         token
       )
-      flash("参数与五区 ROI 已保存为新版本")
+      flash("参数已保存")
       onSaved()
     } catch (e) {
       flash(`保存失败：${e instanceof Error ? e.message : e}`)
@@ -4806,26 +4691,23 @@ function SettingsSubView({
 
   return (
     <div className="studio-split">
-      {/* 左侧固定 16:9 五区 ROI 标定画布（不随右侧检查器滚动丢失） */}
-      <section className="studio-canvas" aria-label="五区 ROI 交互式标定画布">
+      <section className="studio-canvas" aria-label="五区标定画布">
         <header className="studio-canvas-bar">
-          <h2>五区 ROI 标定画布</h2>
-          <span className="sub">
-            正在编辑：<b style={{ color: "var(--ink)" }}>{roiLabels[target]}</b>
-          </span>
+          <h2>五区标定</h2>
+          <span className="sub">{roiLabels[target]}</span>
           <div className="right">
             <button
               type="button"
               className="btn sm"
               onClick={() => loadPresetFrame(`/api/camera/frame.jpg?t=${Date.now()}`)}
             >
-              抓取相机帧
+              实时帧
             </button>
             <button type="button" className="btn ghost sm" onClick={() => loadPresetFrame(tubeYellowImg)}>
-              黄管参考
+              黄管
             </button>
             <button type="button" className="btn ghost sm" onClick={() => loadPresetFrame(tubeBlueImg)}>
-              蓝管参考
+              蓝管
             </button>
             <button
               type="button"
@@ -4835,10 +4717,10 @@ function SettingsSubView({
                 setRois(defaultStandardRois)
               }}
             >
-              重置五区
+              重置
             </button>
             <label htmlFor="settings-roi-image" className="btn ghost sm file-btn">
-              <Upload size={13} aria-hidden="true" />
+              <Upload size={14} aria-hidden="true" />
               载入
               <input
                 id="settings-roi-image"
@@ -4872,7 +4754,7 @@ function SettingsSubView({
                 ]
                 setDrag(null)
                 if (!isValidRoiBox(box)) {
-                  flash("拖拽选区面积为零或过小，已保留原有 ROI 区域")
+                  flash("选区过小")
                   return
                 }
                 setRois((r: Data) => ({ ...r, [target]: box }))
@@ -4882,12 +4764,12 @@ function SettingsSubView({
           </div>
         </div>
 
-        <div className="roi-bar" aria-label="选择编辑 ROI 区域">
+        <div className="roi-bar" aria-label="选择标定区">
           {activeRois.map((r, i) => (
             <button key={r} type="button" className={target === r ? "on" : ""} onClick={() => setTarget(r)}>
               <div className="roi-bar-top">
                 <i style={{ background: roiColors[i] }} />
-                <span>{roiShortLabels[r] || roiLabels[r]}</span>
+                <span>{roiLabels[r]}</span>
               </div>
               <code className="mono">
                 {Array.isArray(rois[r]) ? rois[r].map((v: number) => v.toFixed(2)).join(" ") : "未标定"}
@@ -4897,36 +4779,29 @@ function SettingsSubView({
         </div>
       </section>
 
-      {/* 右侧独立局部滚动参数检查器 */}
-      <aside className="studio-inspector" aria-label="相机镜像与系统参数检查器">
-        <header className="studio-inspector-head">
-          <h2>相机镜像与系统参数</h2>
-          <button type="button" className="btn sm" onClick={() => void save()}>
-            保存参数
-          </button>
-        </header>
-
+      <aside className="studio-inspector" aria-label="参数设置栏">
         <div className="studio-inspector-scroll-wrap">
           <div className="studio-inspector-body">
-            {/* 水平镜像 + 运行模式 + 辅助标定框 */}
-            <section className="inspector-section grid gap-3">
+            <section className="inspector-section">
               <div className="inspector-section-head">
-                <h3>画面方向与防呆运行模式</h3>
+                <h3>画面与模式</h3>
+                <button type="button" className="btn sm" onClick={() => void save()}>
+                  保存
+                </button>
               </div>
 
               <div className="toggle-row">
                 <div className="toggle-copy">
                   <b>
-                    <FlipHorizontal2 size={14} aria-hidden="true" style={{ display: "inline", marginRight: 6, verticalAlign: -2 }} />
-                    水平镜像对齐（左右手与现实同步）
+                    <FlipHorizontal2 size={16} aria-hidden="true" />
+                    水平镜像
                   </b>
-                  <small>{mirrorHorizontal ? "已开启：抬真实左手命中画面左侧" : "已关闭：输出原始未翻转相机视角"}</small>
                 </div>
                 <button
                   type="button"
                   role="switch"
                   aria-checked={mirrorHorizontal}
-                  aria-label="水平镜像对齐开关"
+                  aria-label="水平镜像开关"
                   disabled={togglingMirror}
                   className={`studio-switch ${mirrorHorizontal ? "on" : ""}`}
                   onClick={() => onToggleMirror(!mirrorHorizontal)}
@@ -4938,16 +4813,15 @@ function SettingsSubView({
               <div className="toggle-row">
                 <div className="toggle-copy">
                   <b>
-                    <Crosshair size={14} aria-hidden="true" style={{ display: "inline", marginRight: 6, verticalAlign: -2 }} />
-                    叠加辅助标定框
+                    <Crosshair size={16} aria-hidden="true" />
+                    辅助标定框
                   </b>
-                  <small>{showAux ? "实时画面已叠加五区参考线" : "纯动态追踪画面，无静态参考框"}</small>
                 </div>
                 <button
                   type="button"
                   role="switch"
                   aria-checked={showAux}
-                  aria-label="叠加辅助标定框开关"
+                  aria-label="辅助标定框开关"
                   className={`studio-switch ${showAux ? "on" : ""}`}
                   onClick={() => onToggleAuxRois(!showAux)}
                 >
@@ -4955,50 +4829,38 @@ function SettingsSubView({
                 </button>
               </div>
 
-              <div className="grid gap-1.5">
-                <div className="inspector-sublabel">防呆运行模式</div>
-                <div className="sim-bar" style={{ width: "100%", display: "grid", gridTemplateColumns: "1fr 1fr" }}>
-                  <button
-                    type="button"
-                    className={`sim-btn ${workMode === "debug" ? "busy" : ""}`}
-                    onClick={() => onSwitchWorkMode("debug")}
-                  >
-                    桌面调试模式
-                  </button>
-                  <button
-                    type="button"
-                    className={`sim-btn ${workMode === "strict" ? "busy" : ""}`}
-                    onClick={() => onSwitchWorkMode("strict")}
-                  >
-                    车间严格模式
-                  </button>
-                </div>
-                <span className="note">
-                  {workMode === "strict"
-                    ? "强制白色防静电手套合规检测与细长料管入位门控"
-                    : "免手套防误锁，适合桌面调试与样本抓拍"}
-                </span>
+              <div className="sim-bar" style={{ width: "100%", display: "grid", gridTemplateColumns: "1fr 1fr" }}>
+                <button
+                  type="button"
+                  className={`sim-btn ${workMode === "debug" ? "busy" : ""}`}
+                  onClick={() => onSwitchWorkMode("debug")}
+                >
+                  桌面调试
+                </button>
+                <button
+                  type="button"
+                  className={`sim-btn ${workMode === "strict" ? "busy" : ""}`}
+                  onClick={() => onSwitchWorkMode("strict")}
+                >
+                  车间严格
+                </button>
               </div>
             </section>
 
-            {/* 9 项阈值 */}
-            <details className="inspector-group" open>
-              <summary>
-                <span>识别与光学阈值参数</span>
-                <span className="mono">9 项</span>
-              </summary>
-              <div className="inspector-group-body">
-                {thresholdFields.map(([key, label, step]) => (
+            <section className="inspector-section">
+              <div className="inspector-section-head">
+                <h3>光学阈值</h3>
+              </div>
+              <div className="th-grid">
+                {thresholdFields.map(([key, lbl, step]) => (
                   <div className="th-row" key={key}>
-                    <div>
-                      <label htmlFor={`threshold-${key}`}>{label}</label>
-                    </div>
+                    <label htmlFor={`threshold-${key}`}>{lbl}</label>
                     <Input
                       id={`threshold-${key}`}
                       type="number"
                       step={step}
                       value={thresholds[key] ?? ""}
-                      placeholder="—"
+                      placeholder="默认"
                       onChange={(e) =>
                         setThresholds((t: Data) => ({
                           ...t,
@@ -5009,81 +4871,76 @@ function SettingsSubView({
                   </div>
                 ))}
               </div>
-            </details>
+            </section>
 
-            {/* 硬件绑定 */}
-            <details className="inspector-group" open>
-              <summary>
-                <span>相机硬件绑定</span>
-                <span className="mono">
-                  {width}×{height}
-                </span>
-              </summary>
-              <div className="inspector-group-body grid gap-3">
+            <section className="inspector-section">
+              <div className="inspector-section-head">
+                <h3>相机规格</h3>
+                <span className="tag plain mono">720P · 25 FPS</span>
+              </div>
+              <div className="field">
+                <label htmlFor="settings-camera-device">设备编号</label>
+                <Input
+                  id="settings-camera-device"
+                  value={device}
+                  placeholder="如C0"
+                  onChange={(e) => setDevice(e.target.value)}
+                  className="mono"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
                 <div className="field">
-                  <label htmlFor="settings-camera-device">设备 ID</label>
+                  <label htmlFor="settings-camera-width">画面宽度</label>
                   <Input
-                    id="settings-camera-device"
-                    value={device}
-                    onChange={(e) => setDevice(e.target.value)}
+                    id="settings-camera-width"
+                    type="number"
+                    value={width}
+                    placeholder="1280"
+                    onChange={(e) => setWidth(e.target.value)}
                     className="mono"
                   />
                 </div>
-                <div className="grid grid-cols-2 gap-2.5">
-                  <div className="field">
-                    <label htmlFor="settings-camera-width">采集宽度</label>
-                    <Input
-                      id="settings-camera-width"
-                      type="number"
-                      value={width}
-                      onChange={(e) => setWidth(e.target.value)}
-                      className="mono"
-                    />
-                  </div>
-                  <div className="field">
-                    <label htmlFor="settings-camera-height">采集高度</label>
-                    <Input
-                      id="settings-camera-height"
-                      type="number"
-                      value={height}
-                      onChange={(e) => setHeight(e.target.value)}
-                      className="mono"
-                    />
-                  </div>
+                <div className="field">
+                  <label htmlFor="settings-camera-height">画面高度</label>
+                  <Input
+                    id="settings-camera-height"
+                    type="number"
+                    value={height}
+                    placeholder="720"
+                    onChange={(e) => setHeight(e.target.value)}
+                    className="mono"
+                  />
                 </div>
-                <label className="check">
-                  <input type="checkbox" checked={both} onChange={(e) => setBoth(e.target.checked)} />
-                  单相机覆盖料管左右双端握持区（五区标定）
-                </label>
-                <button type="button" className="btn block" onClick={() => void save()}>
-                  保存参数为新版本
-                </button>
               </div>
-            </details>
+              <label className="check">
+                <input type="checkbox" checked={both} onChange={(e) => setBoth(e.target.checked)} />
+                双端覆盖
+              </label>
+              <button type="button" className="btn block" onClick={() => void save()}>
+                保存配置
+              </button>
+            </section>
 
-            {/* 版本历史 */}
             <details className="inspector-group">
               <summary>
-                <span>参数变更历史</span>
-                <span className="mono">{history.length} 条</span>
+                <span>版本历史</span>
+                <span className="mono">{history.length}</span>
               </summary>
-              <div className="inspector-group-body" style={{ padding: 0 }}>
+              <div className="inspector-group-body">
                 {history.length ? (
-                  <ol className="timeline" style={{ maxHeight: 240 }}>
+                  <ol className="timeline">
                     {history.slice(0, 10).map((h) => (
                       <li key={h.config_version}>
-                        <div className="row">
+                        <div className="row-main">
                           <b className="mono">#{h.config_version}</b>
-                          <time>{dateTimeOf(h.created_at_utc)}</time>
+                          <span className="mono">{h.roi_config_version}</span>
                         </div>
-                        <div className="flow mono">{h.roi_config_version}</div>
+                        <time>{dateTimeOf(h.created_at_utc)}</time>
                       </li>
                     ))}
                   </ol>
                 ) : (
-                  <div className="empty" style={{ minHeight: 72 }}>
-                    暂无变更记录
-                  </div>
+                  <div className="empty">暂无历史</div>
                 )}
               </div>
             </details>

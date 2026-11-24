@@ -1,4 +1,4 @@
-import { pipeText, verdictOf } from "@/lib/station"
+import { dateTimeOf, pipeText, verdictOf } from "@/lib/station"
 
 export interface FilmstripItem {
   id: string
@@ -9,6 +9,7 @@ export interface FilmstripItem {
   timestamp: string
   labelStatus?: string
   pipeColor?: string
+  reason?: string
 }
 
 interface FilmstripProps {
@@ -21,8 +22,8 @@ export function Filmstrip({ items, selectedId, onSelect }: FilmstripProps) {
   return (
     <section className="panel">
       <header className="panel-head">
-        <h2>最近检验</h2>
-        <div className="right mono">{items.length} 条</div>
+        <h2>最近记录</h2>
+        <div className="right mono">{items.length}</div>
       </header>
       {items.length ? (
         <div className="strip">
@@ -35,27 +36,23 @@ export function Filmstrip({ items, selectedId, onSelect }: FilmstripProps) {
                 type="button"
                 aria-pressed={sel}
                 className={sel ? "sel" : ""}
+                title={`${item.cycleId} · ${pipeText(item.pipeColor)} · ${dateTimeOf(item.timestamp)}`}
                 onClick={() => onSelect(item)}
               >
                 <div className="thumb">
-                  {item.url ? <img src={item.url} alt={item.cycleId} /> : <span>{pipeText(item.pipeColor)} 无图</span>}
+                  {item.url ? <img src={item.url} alt={item.cycleId} /> : <span>{pipeText(item.pipeColor)}</span>}
                   <i className={`bar ${v.tone}`} />
                 </div>
                 <div className="info">
                   <b>{item.cycleId}</b>
-                  <span>
-                    <span className="mono">{item.timestamp ? new Date(item.timestamp).toLocaleTimeString("zh-CN", { hour12: false }) : "—"}</span>
-                    <span>{v.word}</span>
-                  </span>
+                  <span>{v.word}</span>
                 </div>
               </button>
             )
           })}
         </div>
       ) : (
-        <div className="empty" style={{ minHeight: 96 }}>
-          暂无检验记录
-        </div>
+        <div className="empty">暂无记录</div>
       )}
     </section>
   )
