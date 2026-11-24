@@ -75,7 +75,6 @@ function EngineerAuthDialogContent({
   const [showPasscode, setShowPasscode] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState("")
-  const [defaultPinActive, setDefaultPinActive] = useState(false)
   const [authConfigured, setAuthConfigured] = useState<boolean | null>(null)
 
   const inputRef = useRef<HTMLInputElement | null>(null)
@@ -89,16 +88,13 @@ function EngineerAuthDialogContent({
       .then((res) => (res.ok ? res.json() : null))
       .then((data: Record<string, unknown> | null) => {
         if (unmountedRef.current || !data) return
-        setDefaultPinActive(data.default_pin_active === true)
         if (typeof data.auth_configured === "boolean") {
           setAuthConfigured(data.auth_configured)
         } else if (typeof data.pin_configured === "boolean") {
           setAuthConfigured(data.pin_configured)
         }
       })
-      .catch(() => {
-        /* 忽略弹窗关闭中止或离线查询失败；保持默认通用提示 */
-      })
+      .catch(() => {})
     return () => {
       unmountedRef.current = true
       statusController.abort()
@@ -112,8 +108,12 @@ function EngineerAuthDialogContent({
     e.preventDefault()
     const trimmed = passcode.trim()
     if (!trimmed) {
-      setError("请输入工程师口令")
+      setError("请输入口令")
       inputRef.current?.focus()
+      return
+    }
+    if (authConfigured === false) {
+      setError("服务端未配置工程师口令环境变量")
       return
     }
 
@@ -137,39 +137,24 @@ function EngineerAuthDialogContent({
         signal: controller.signal,
       })
 
-      if (unmountedRef.current || reqSeq !== requestSeqRef.current) {
-        return
-      }
-      if (timedOut) {
-        throw new DOMException("Verification timed out", "AbortError")
-      }
-      if (controller.signal.aborted) {
-        return
-      }
+      if (unmountedRef.current || reqSeq !== requestSeqRef.current) return
+      if (timedOut) throw new DOMException("Verification timed out", "AbortError")
+      if (controller.signal.aborted) return
 
       let data: Record<string, unknown> = {}
       try {
         data = (await response.json()) as Record<string, unknown>
       } catch (parseErr) {
-        if (timedOut || controller.signal.aborted) {
-          throw parseErr
-        }
+        if (timedOut || controller.signal.aborted) throw parseErr
         data = {}
       }
 
-      if (unmountedRef.current || reqSeq !== requestSeqRef.current) {
-        return
-      }
-      if (timedOut) {
-        throw new DOMException("Verification timed out", "AbortError")
-      }
-      if (controller.signal.aborted) {
-        return
-      }
+      if (unmountedRef.current || reqSeq !== requestSeqRef.current) return
+      if (timedOut) throw new DOMException("Verification timed out", "AbortError")
+      if (controller.signal.aborted) return
 
       if (!response.ok) {
-        const detail =
-          typeof data.detail === "string" && data.detail ? data.detail : "工程师口令错误，请重试"
+        const detail = typeof data.detail === "string" && data.detail ? data.detail : "口令错误"
         setError(detail)
         window.requestAnimationFrame(() => {
           inputRef.current?.focus()
@@ -189,23 +174,19 @@ function EngineerAuthDialogContent({
           expiresInSeconds: Number(data.expires_in_seconds) || 1800,
         })
       } else {
-        setError("验证响应无效，请联系设备工程师")
+        setError("验证响应无效")
       }
     } catch (err) {
-      if (unmountedRef.current || reqSeq !== requestSeqRef.current) {
-        return
-      }
+      if (unmountedRef.current || reqSeq !== requestSeqRef.current) return
       if (timedOut) {
-        setError("验证请求超时，请检查本机工位服务后重试")
+        setError("请求超时")
         window.requestAnimationFrame(() => {
           inputRef.current?.focus()
         })
         return
       }
-      if (err instanceof DOMException && err.name === "AbortError") {
-        return
-      }
-      setError("无法连接本机工位服务，请稍后重试")
+      if (err instanceof DOMException && err.name === "AbortError") return
+      setError("服务未连接")
     } finally {
       window.clearTimeout(timeoutId)
       if (abortControllerRef.current === controller) {
@@ -217,18 +198,11 @@ function EngineerAuthDialogContent({
     }
   }
 
-  const hintText = defaultPinActive
-    ? "本机处于演示模式，请输入本机配置的演示工程师口令"
-    : authConfigured === false
-      ? "本机尚未配置工程师口令，请先设置环境变量 IGBT_ENGINEER_PIN 或 IGBT_ADMIN_TOKEN"
-      : "请输入现场配置的工程师口令"
-
   return (
     <Dialog.Portal>
       <Dialog.Overlay className="modal-scrim" />
       <Dialog.Content
         className="modal auth-modal"
-        aria-describedby="engineer-auth-hint"
         onOpenAutoFocus={(e) => {
           e.preventDefault()
           inputRef.current?.focus()
@@ -245,9 +219,9 @@ function EngineerAuthDialogContent({
         }}
       >
         <header className="panel-head">
-          <Lock size={15} aria-hidden="true" />
+          <Lock size={16} aria-hidden="true" />
           <Dialog.Title asChild>
-            <h2 id="engineer-auth-title">工程师权限验证</h2>
+            <h2 id="engineer-auth-title">工程师登录</h2>
           </Dialog.Title>
           <div className="right">
             <button
@@ -256,14 +230,16 @@ function EngineerAuthDialogContent({
               onClick={onCancel}
               aria-label="关闭弹窗"
             >
-              <X size={15} aria-hidden="true" />
+              <X size={16} aria-hidden="true" />
             </button>
           </div>
         </header>
 
-        <form className="panel-body auth-form" onSubmit={(e) => void handleSubmit(e)} noValidate>
+        <Dialog.Description className="sr-only">工程师权限验证</Dialog.Description>
+
+        <form className="auth-form" onSubmit={(e) => void handleSubmit(e)} noValidate>
           <div className="field">
-            <label htmlFor="engineer-passcode-input">工程师口令</label>
+            <label htmlFor="engineer-passcode-input">登录口令</label>
             <div className="auth-input-wrap">
               <input
                 ref={inputRef}
@@ -276,9 +252,9 @@ function EngineerAuthDialogContent({
                   if (error) setError("")
                 }}
                 autoComplete="current-password"
-                placeholder="请输入工程师口令"
+                placeholder="输入口令"
                 aria-invalid={error ? "true" : "false"}
-                aria-describedby={error ? "engineer-auth-error engineer-auth-hint" : "engineer-auth-hint"}
+                aria-describedby={error ? "engineer-auth-error" : undefined}
                 disabled={submitting}
               />
               <button
@@ -288,19 +264,14 @@ function EngineerAuthDialogContent({
                 aria-label={showPasscode ? "隐藏口令" : "显示口令"}
                 disabled={submitting}
               >
-                {showPasscode ? <EyeOff size={15} aria-hidden="true" /> : <Eye size={15} aria-hidden="true" />}
+                {showPasscode ? <EyeOff size={16} aria-hidden="true" /> : <Eye size={16} aria-hidden="true" />}
               </button>
             </div>
-            <Dialog.Description asChild>
-              <small id="engineer-auth-hint" className="auth-hint">
-                {hintText}
-              </small>
-            </Dialog.Description>
           </div>
 
           {error && (
             <div id="engineer-auth-error" className="auth-error" role="alert">
-              <AlertCircle size={15} aria-hidden="true" />
+              <AlertCircle size={16} aria-hidden="true" />
               <span>{error}</span>
             </div>
           )}
@@ -310,7 +281,7 @@ function EngineerAuthDialogContent({
               取消
             </button>
             <button type="submit" className="btn" disabled={submitting}>
-              {submitting ? "验证中…" : "验证并进入工程师后台"}
+              {submitting ? "验证中…" : "登录"}
             </button>
           </div>
         </form>

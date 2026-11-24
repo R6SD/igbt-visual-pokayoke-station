@@ -1,7 +1,7 @@
 import { Camera, RotateCcw, ShieldAlert, ShieldCheck } from "lucide-react"
 import { Andon } from "@/components/Andon"
 import { CameraFrame } from "@/components/CameraFrame"
-import { C_LIMIT_MS, type Data, deriveOutcome, formatCTimerSeconds, labelText, pipeText } from "@/lib/station"
+import { C_LIMIT_MS, type Data, formatCTimerSeconds, guidanceFor, labelText, pipeText } from "@/lib/station"
 
 interface OperatorViewProps {
   state: Data
@@ -14,44 +14,6 @@ interface OperatorViewProps {
   shutterKey?: number
   onManualTrigger?: () => void
   onResetAlarm?: () => void
-}
-
-function operatorGuidanceFor(state: Data): { title: string; desc?: string } {
-  const outcome = deriveOutcome(state)
-  const valid = state.view_valid === true
-  const cTimer = Math.max(0, Number(state.c_timer_ms || 0))
-
-  if (outcome === "FAULT" || state.camera_status === "FAULT") {
-    return { title: "工位异常，已闭锁", desc: "请联系设备工程师排查相机与本机服务" }
-  }
-  if (state.camera_status !== "ONLINE") {
-    return { title: "相机未连接", desc: "请等待设备就绪或联系工程师检查接口" }
-  }
-  if (state.bare_hand_violation || state.result_reason === "BARE_HAND_VIOLATION") {
-    return { title: "裸手触管违规 · 已闭锁", desc: "请佩戴白色防静电手套后点击「解除报警闭锁并复位」" }
-  }
-  if (state.alarm_latched || outcome === "ALARM") {
-    return { title: "防呆报警已闭锁，禁止流转", desc: "请将料管放入返工暂存区，人工复核后复位" }
-  }
-  if (state.bare_hand_detected || state.result_reason === "BARE_HAND_WARNING_NO_GLOVE") {
-    return { title: "检测到裸手 · 请佩戴白色防静电手套", desc: "佩戴好白色防静电手套后再拿取料管" }
-  }
-  if (state.result_reason === "WAITING_FOR_PART" || state.view_valid_reasons?.[0] === "TUBE_NOT_PRESENT") {
-    return { title: "等待料管入位", desc: "请佩戴白色防静电手套，双手水平持料管进入取景框" }
-  }
-  if (!valid) {
-    if (state.left_grip_active !== true || state.right_grip_active !== true) {
-      return { title: "请双手握持料管两端", desc: "保持料管水平进入取景框中央" }
-    }
-    return { title: "请轻转料管正对镜头", desc: "避开管壁反光与手部遮挡" }
-  }
-  if (cTimer > 0 && cTimer < C_LIMIT_MS) {
-    return { title: "请保持稳定", desc: `C 类撕除确认 ${formatCTimerSeconds(cTimer, 2)} / 1.20 秒` }
-  }
-  if (outcome === "PASS") {
-    return { title: "合格放行", desc: "请移入合格品料盒，准备下一管" }
-  }
-  return { title: "等待防呆处理", desc: "完成划除、遮挡或撕除后自动放行" }
 }
 
 export function OperatorView({
@@ -68,7 +30,7 @@ export function OperatorView({
 }: OperatorViewProps) {
   const cTimer = Math.max(0, Number(state.c_timer_ms || 0))
   const litSegments = Math.min(12, Math.floor((cTimer / C_LIMIT_MS) * 12))
-  const yieldRate = totalCount > 0 ? ((passCount / totalCount) * 100).toFixed(1) : "—"
+  const yieldRate = totalCount > 0 ? `${((passCount / totalCount) * 100).toFixed(1)}%` : "—"
   const online = state.camera_status === "ONLINE"
   const frameSrc = (online && state.live_stream_url) || state.latest_evidence_url || evidence[0]?.url
   const cropSrc = online && state.live_crop_url ? String(state.live_crop_url) : undefined
@@ -86,18 +48,18 @@ export function OperatorView({
   const rightGlove = gloveSideState(state.right_grip_active)
 
   const gloveSummary = state.bare_hand_violation
-    ? { tone: "bad", label: "裸手触管违规 · 已闭锁", short: "裸手违规" }
+    ? { tone: "bad", label: "裸手违规", short: "裸手违规" }
     : state.bare_hand_detected
-      ? { tone: "warn", label: "检测到裸手 · 请佩戴白色手套", short: "检测到裸手" }
+      ? { tone: "warn", label: "检测到裸手", short: "裸手警告" }
       : state.glove_compliant
-        ? { tone: "ok", label: "白色防静电手套合规", short: "手套合规" }
-        : { tone: "idle", label: "请佩戴白色防静电手套入画", short: "待核验" }
+        ? { tone: "ok", label: "手套合规", short: "合规" }
+        : { tone: "idle", label: "待核验", short: "待检" }
 
   const labelDisplay = state.bare_hand_violation
-    ? "裸手违规报警"
+    ? "裸手违规"
     : state.label_status && state.label_status !== "unknown"
       ? labelText[state.label_status] || "待判定"
-      : "等待料管入位"
+      : "待入位"
 
   const labelTone =
     state.bare_hand_violation || isAlarmLatched
@@ -108,31 +70,30 @@ export function OperatorView({
           ? "warn"
           : "plain"
 
-  const statsAriaLabel = statsScope === "all" ? "累计周期统计" : "近 30 条周期统计"
-  const totalLabel = statsScope === "all" ? "累计检验" : "近30条检验"
+  const totalLabel = statsScope === "all" ? "累计总数" : "近期总数"
 
   return (
     <div className="op-screen">
       <Andon
         compact
         state={state}
-        guide={operatorGuidanceFor(state)}
+        guide={guidanceFor(state)}
         meta={[
-          { label: "防静电手套", value: gloveSummary.short },
-          { label: "当前料管", value: state.pipe_color ? pipeText(state.pipe_color) : "待入位" },
-          { label: "平均节拍", value: avgTaktTime ? `${avgTaktTime.toFixed(1)} 秒` : "—" },
+          { label: "手套状态", value: gloveSummary.short },
+          { label: "当前料管", value: state.pipe_color ? pipeText(state.pipe_color) : "—" },
+          { label: "平均节拍", value: avgTaktTime ? `${avgTaktTime.toFixed(1)}s` : "—" },
         ]}
       />
 
       <div className="op-stage">
-        {/* 左侧超大固定实时取景框 + 底部 3 栏手套合规指示条（零叠字、完整无裁切） */}
-        <section className="op-hero" aria-label="实时目检取景框">
-          <header className="panel-head op-hero-head">
-            <h2>实时目检画面</h2>
-            <span className="sub">{state.pipe_color ? pipeText(state.pipe_color) : "全景视野"}</span>
-            <div className="right">
+        <section className="op-hero" aria-label="实时目检画面">
+          <header className="op-hero-head">
+            <h2>实时画面</h2>
+            <div className="topbar-status" style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
               <span className={`lamp ${online ? "ok" : "bad"}`} aria-hidden="true" />
-              <span>{online ? "取景就绪" : "相机未连接"}</span>
+              <span style={{ fontSize: 14, color: "var(--ink-2)" }}>
+                {online ? "720P · 25 FPS" : "相机离线"}
+              </span>
             </div>
           </header>
 
@@ -140,15 +101,15 @@ export function OperatorView({
             <CameraFrame
               fill
               src={frameSrc}
-              alt="现场 16:9 全景实时目检画面"
+              alt="16:9 全景实时目检画面"
               shutterKey={shutterKey}
               focusLocked={focusLocked}
               emptyTitle="等待相机画面"
-              errorTitle="相机画面不可用"
+              errorTitle="画面不可用"
             />
           </div>
 
-          <div className="op-glove-bar" aria-label="防静电手套合规指示">
+          <div className="op-glove-bar" aria-label="防静电手套状态">
             <div className="op-glove-cell">
               <span className={`lamp ${leftGlove.lamp}`} aria-hidden="true" />
               <div className="op-glove-cell-text">
@@ -165,99 +126,89 @@ export function OperatorView({
             </div>
             <div className={`op-glove-cell op-glove-rule ${gloveSummary.tone}`}>
               {gloveSummary.tone === "bad" || gloveSummary.tone === "warn" ? (
-                <ShieldAlert size={16} aria-hidden="true" />
+                <ShieldAlert size={18} aria-hidden="true" />
               ) : (
-                <ShieldCheck size={16} aria-hidden="true" />
+                <ShieldCheck size={18} aria-hidden="true" />
               )}
               <div className="op-glove-cell-text">
-                <small>作业规范</small>
+                <small>防静电规范</small>
                 <b>{gloveSummary.label}</b>
               </div>
             </div>
           </div>
         </section>
 
-        {/* 右侧固定 330px 极简动作列 */}
-        <aside className="op-column" aria-label="目检状态与作业操作">
-          <div className="op-section op-crop-section">
-            <div className="op-section-head">
-              <h2 className="op-section-title">标签 4× 特写</h2>
-              <span className={`tag ${labelTone}`}>{labelDisplay}</span>
+        <aside className="op-column" aria-label="标签特写与工位统计">
+          <div className="op-card op-card-grow">
+            <div style={{ display: "grid", gap: 12 }}>
+              <div className="op-section-head">
+                <h2 className="op-section-title">标签特写</h2>
+                <span className={`tag ${labelTone}`}>{labelDisplay}</span>
+              </div>
+              <div className="op-crop-box">
+                <CameraFrame
+                  fill
+                  src={cropSrc}
+                  alt="标签 4 倍特写"
+                  focusLocked={Boolean(focusLocked && cropSrc)}
+                  emptyTitle={online ? "无特写流" : "等待入位"}
+                  errorTitle="特写不可用"
+                />
+              </div>
             </div>
-            <div className="op-crop-box">
-              <CameraFrame
-                fill
-                src={cropSrc}
-                alt="防呆标签 4 倍特写"
-                focusLocked={Boolean(focusLocked && cropSrc)}
-                emptyTitle={online ? "特写画面不可用" : "等待料管入位"}
-                emptyHint={online ? "当前未获取到 4× 标签特写流" : undefined}
-                errorTitle="特写画面不可用"
-              />
-            </div>
-          </div>
 
-          <div className="op-section">
-            <div className="op-section-head">
-              <span className="op-section-title">C 类撕除确认</span>
-              <span className="op-section-meta">{formatCTimerSeconds(cTimer, 2)} / 1.20 秒</span>
+            <div style={{ display: "grid", gap: 8 }}>
+              <div className="op-section-head">
+                <span className="op-section-title">脱落确认</span>
+                <span className="op-section-meta">{formatCTimerSeconds(cTimer, 2)} / 1.20s</span>
+              </div>
+              <div
+                className={`segments ${litSegments >= 12 ? "done" : ""}`}
+                role="progressbar"
+                aria-label="脱落 1.20 秒确认进度"
+                aria-valuemin={0}
+                aria-valuemax={C_LIMIT_MS}
+                aria-valuenow={Math.min(C_LIMIT_MS, Math.round(cTimer))}
+              >
+                {Array.from({ length: 12 }, (_, i) => (
+                  <i key={i} className={i < litSegments ? "on" : ""} />
+                ))}
+              </div>
             </div>
-            <div
-              className={`segments ${litSegments >= 12 ? "done" : ""}`}
-              role="progressbar"
-              aria-label="C 类撕除 1.20 秒确认进度"
-              aria-valuemin={0}
-              aria-valuemax={C_LIMIT_MS}
-              aria-valuenow={Math.min(C_LIMIT_MS, Math.round(cTimer))}
-            >
-              {Array.from({ length: 12 }, (_, i) => (
-                <i key={i} className={i < litSegments ? "on" : ""} />
-              ))}
-            </div>
-          </div>
 
-          <div className="op-section op-actions">
-            {isAlarmLatched && onResetAlarm && (
-              <button type="button" className="btn btn-danger block" onClick={onResetAlarm}>
-                <RotateCcw size={15} aria-hidden="true" />
-                解除报警闭锁并复位
+            <div className="op-actions">
+              {isAlarmLatched && onResetAlarm && (
+                <button type="button" className="btn btn-danger block" onClick={onResetAlarm}>
+                  <RotateCcw size={16} aria-hidden="true" />
+                  报警复位
+                </button>
+              )}
+              <button type="button" className="btn block" onClick={onManualTrigger}>
+                <Camera size={16} aria-hidden="true" />
+                手动抓拍
+                <span className="op-kbd">空格</span>
               </button>
-            )}
-            <button type="button" className="btn block" onClick={onManualTrigger}>
-              <Camera size={15} aria-hidden="true" />
-              手动抓拍并归档
-              <span className="op-kbd">空格</span>
-            </button>
+            </div>
           </div>
 
-          <div className="op-stats" aria-label={statsAriaLabel}>
-            <div className="op-stat">
-              <small>{totalLabel}</small>
-              <b>
-                {totalCount}
-                <em>管</em>
-              </b>
-            </div>
-            <div className="op-stat">
-              <small>放行</small>
-              <b style={{ color: "var(--ok)" }}>
-                {passCount}
-                <em>管</em>
-              </b>
-            </div>
-            <div className="op-stat">
-              <small>报警</small>
-              <b style={{ color: alarmCount ? "var(--bad)" : undefined }}>
-                {alarmCount}
-                <em>管</em>
-              </b>
-            </div>
-            <div className="op-stat">
-              <small>良率</small>
-              <b>
-                {yieldRate}
-                {yieldRate !== "—" && <em>%</em>}
-              </b>
+          <div className="op-card" aria-label="工位检验指标">
+            <div className="op-stats">
+              <div className="op-stat">
+                <b>{totalCount}</b>
+                <span>{totalLabel}</span>
+              </div>
+              <div className="op-stat">
+                <b style={{ color: "var(--ok)" }}>{passCount}</b>
+                <span>放行</span>
+              </div>
+              <div className="op-stat">
+                <b style={{ color: alarmCount ? "var(--bad)" : undefined }}>{alarmCount}</b>
+                <span>报警</span>
+              </div>
+              <div className="op-stat">
+                <b>{yieldRate}</b>
+                <span>良率</span>
+              </div>
             </div>
           </div>
         </aside>

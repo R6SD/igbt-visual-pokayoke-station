@@ -38,26 +38,23 @@ backup/
 *.safetensors
 *.bin
 
-# --- Python Cache, Virtual Environments & Tooling ---
+# --- C++ Build Artifacts & Binaries ---
+cpp_backend/build/
+cmake-build-*/
+*.exe
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.pdb
+*.ilk
+*.exp
+
+# --- Legacy Python Cache (if any host tool runs) ---
 __pycache__/
 *.py[cod]
-*$py.class
-.venv/
-venv/
-ENV/
-env/
-.Python
-*.egg-info/
-.installed.cfg
-*.egg
-build/
-dist/
-.pytest_cache/
 .ruff_cache/
-.mypy_cache/
-.coverage
-coverage.xml
-htmlcov/
 
 # --- Node.js & Frontend Build Artifacts ---
 node_modules/

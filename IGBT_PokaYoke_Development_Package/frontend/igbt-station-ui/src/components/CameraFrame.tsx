@@ -3,23 +3,13 @@ import { useEffect, useState, type ReactNode } from "react"
 interface CameraFrameProps {
   src?: string
   alt: string
-  /** 固定视口自适应铺满模式（保持 16:9 完整无裁切，干净深色背景） */
   fill?: boolean
-  /** 四角说明文字（仅在显式传入时渲染，默认零叠字） */
   captions?: Partial<Record<"tl" | "tr" | "bl" | "br", ReactNode>>
   emptyTitle: string
-  emptyHint?: string
-  /** 图片或视频流加载失败时的标题 */
   errorTitle?: string
-  /** 图片或视频流加载失败时的提示 */
-  errorHint?: string
-  /** 对图片进行中心放大（用于标签特写） */
   zoom?: number
-  /** 手动抓拍触发计数：每次递增播放一次光学快门闪光 */
   shutterKey?: number
-  /** 相机在线且视野有效时启用取景框四角对焦锁定微亮 */
   focusLocked?: boolean
-  /** 是否显示取景框四角标线 */
   showTicks?: boolean
 }
 
@@ -35,20 +25,14 @@ function withRetryParam(src: string, retryTick: number): string {
 function CameraFrameImage({
   src,
   alt,
-  emptyTitle,
-  emptyHint,
   errorTitle,
-  errorHint,
   zoom,
   focusLocked,
   showTicks,
 }: {
   src: string
   alt: string
-  emptyTitle: string
-  emptyHint?: string
   errorTitle?: string
-  errorHint?: string
   zoom?: number
   focusLocked: boolean
   showTicks: boolean
@@ -89,7 +73,6 @@ function CameraFrameImage({
         <div className="frame-empty" role="status">
           <div className="crosshair" aria-hidden="true" />
           <b>{errorTitle || "画面不可用"}</b>
-          <span>{errorHint || emptyHint || `${emptyTitle} · 正在尝试重新连接`}</span>
         </div>
       )}
       {phase !== "error" && (
@@ -115,9 +98,7 @@ export function CameraFrame({
   fill = false,
   captions,
   emptyTitle,
-  emptyHint,
   errorTitle,
-  errorHint,
   zoom,
   shutterKey = 0,
   focusLocked = false,
@@ -134,10 +115,7 @@ export function CameraFrame({
           key={src}
           src={src}
           alt={alt}
-          emptyTitle={emptyTitle}
-          emptyHint={emptyHint}
           errorTitle={errorTitle}
-          errorHint={errorHint}
           zoom={zoom}
           focusLocked={focusLocked}
           showTicks={showTicks}
@@ -147,7 +125,6 @@ export function CameraFrame({
           <div className="frame-empty">
             <div className="crosshair" aria-hidden="true" />
             <b>{emptyTitle}</b>
-            {emptyHint && <span>{emptyHint}</span>}
           </div>
           {showTicks && <div className="ticks" aria-hidden="true" />}
         </>
