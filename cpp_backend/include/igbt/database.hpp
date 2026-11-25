@@ -146,8 +146,14 @@ public:
     std::optional<json> get_model_by_id(const std::string& model_id) const;
     json delete_model(const std::string& model_id, const std::string& active_model_version);
 
-    // Storage Overview
+    // Storage Overview & WAL Maintenance
     json storage_overview(const json& training_stats, const std::string& active_model_version) const;
+    json enforce_evidence_quota(
+        std::uint64_t max_bytes = 50ULL * 1024 * 1024 * 1024,
+        double min_free_ratio = 0.15
+    );
+    void run_wal_checkpoint_truncate();
+    json pragma_diagnostics() const;
 
 private:
     void open_and_initialize();
@@ -189,6 +195,7 @@ private:
     std::optional<double> purge_cutoff_monotonic_;
     std::unordered_set<std::string> deleted_cycles_;
     static constexpr std::size_t kMaxTrackedDeletedCycles = 2048;
+    int write_ops_since_checkpoint_{0};
 };
 
 }  // namespace igbt

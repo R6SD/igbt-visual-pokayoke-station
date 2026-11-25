@@ -1,6 +1,6 @@
 param(
     [int]$Port = 8765,
-    [string]$WorkMode = "debug",
+    [string]$WorkMode = "strict",
     [string]$DataDirectory = (Join-Path (Split-Path -Parent $PSScriptRoot) "data")
 )
 $ErrorActionPreference = "Stop"

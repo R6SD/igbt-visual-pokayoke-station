@@ -13,6 +13,7 @@
 
 #include "igbt/common.hpp"
 #include "igbt/database.hpp"
+#include "igbt/industrial_hal.hpp"
 #include "igbt/training_manager.hpp"
 #include "igbt/vision_engine.hpp"
 
@@ -47,6 +48,8 @@ public:
     void clear_sessions();
     void expire_all_sessions();
     void set_session_ttl_seconds(int ttl_seconds);
+    void set_lockout_policy(int max_attempts, double lockout_seconds);
+    void reset_rate_limit();
 
     // Optional test environment overrides (empty map falls back to process environment)
     void set_env_override(const std::string& key, const std::optional<std::string>& value);
@@ -61,6 +64,10 @@ private:
     std::unordered_map<std::string, double> sessions_;
     std::unordered_map<std::string, std::optional<std::string>> env_overrides_;
     int ttl_seconds_{kDefaultTtlSeconds};
+    int failed_attempts_{0};
+    double lockout_until_mono_{0.0};
+    int max_failed_attempts_{5};
+    double lockout_seconds_{60.0};
 };
 
 struct StationServerOptions {
@@ -70,7 +77,7 @@ struct StationServerOptions {
     std::filesystem::path web_dist_dir;
     std::filesystem::path assets_dir;
     bool enable_live_camera{false};
-    std::string initial_work_mode{"debug"};
+    std::string initial_work_mode{"strict"};
 };
 
 class StationHttpServer {
@@ -101,7 +108,11 @@ public:
 
     EngineerSessionAuth& auth() noexcept { return auth_; }
     const EngineerSessionAuth& auth() const noexcept { return auth_; }
+    const IDioInterlock& interlock() const noexcept { return interlock_; }
+    const IMesClient& mes_client() const noexcept { return mes_client_; }
     httplib::Server& raw_server() noexcept { return svr_; }
+
+    static constexpr int kMaxConcurrentMjpegStreams = 6;
 
     static std::filesystem::path detect_default_package_root();
     static std::filesystem::path detect_default_data_dir();
@@ -130,12 +141,15 @@ private:
     TrainingManager& training_;
     StationServerOptions options_;
     EngineerSessionAuth auth_;
+    ShadowNoopInterlock interlock_;
+    OfflineNoopMesClient mes_client_;
 
     httplib::Server svr_;
     std::thread server_thread_;
     std::atomic<bool> running_{false};
     std::atomic<bool> stopping_{false};
     std::atomic<int> bound_port_{0};
+    std::atomic<int> active_mjpeg_streams_{0};
 
     mutable std::mutex state_mutex_;
     double sim_override_until_mono_{0.0};

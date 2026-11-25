@@ -340,6 +340,10 @@ StationDatabase::StationDatabase(
 StationDatabase::~StationDatabase() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (db_) {
+        try {
+            exec_sql_unlocked("PRAGMA wal_checkpoint(TRUNCATE);");
+        } catch (...) {
+        }
         sqlite3_close_v2(db_);
         db_ = nullptr;
     }
@@ -615,7 +619,9 @@ void StationDatabase::open_and_initialize() {
     sqlite3_busy_timeout(db_, 10000);
     exec_sql_unlocked("PRAGMA journal_mode=WAL;");
     exec_sql_unlocked("PRAGMA foreign_keys=ON;");
-    exec_sql_unlocked("PRAGMA synchronous=NORMAL;");
+    exec_sql_unlocked("PRAGMA synchronous=FULL;");
+    exec_sql_unlocked("PRAGMA journal_size_limit=67108864;");
+    exec_sql_unlocked("PRAGMA wal_autocheckpoint=1000;");
 
     exec_sql_unlocked(R"SQL(
         CREATE TABLE IF NOT EXISTS cycles (
@@ -1654,10 +1660,130 @@ bool StationDatabase::record_live_transition(
 
         tx.commit();
         if (ev_file_guard.has_value()) ev_file_guard->commit();
+        if (++write_ops_since_checkpoint_ >= 100) {
+            write_ops_since_checkpoint_ = 0;
+            try {
+                exec_sql_unlocked("PRAGMA wal_checkpoint(TRUNCATE);");
+            } catch (...) {
+            }
+        }
         return true;
     } catch (...) {
         return false;
     }
+}
+
+void StationDatabase::run_wal_checkpoint_truncate() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (db_) {
+        exec_sql_unlocked("PRAGMA wal_checkpoint(TRUNCATE);");
+        write_ops_since_checkpoint_ = 0;
+    }
+}
+
+json StationDatabase::enforce_evidence_quota(std::uint64_t max_bytes, double min_free_ratio) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::error_code ec;
+    std::uint64_t total_bytes = 0;
+    if (std::filesystem::exists(evidence_root_, ec)) {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(evidence_root_, ec)) {
+            if (entry.is_regular_file(ec)) {
+                const auto fsz = entry.file_size(ec);
+                if (!ec) total_bytes += static_cast<std::uint64_t>(fsz);
+            }
+        }
+    }
+
+    auto current_free_ratio = [&]() -> double {
+        std::error_code sec;
+        const auto sp = std::filesystem::space(evidence_root_, sec);
+        if (sec || sp.capacity == 0) return 1.0;
+        return static_cast<double>(sp.available) / static_cast<double>(sp.capacity);
+    };
+
+    int deleted_count = 0;
+    std::uint64_t freed_bytes = 0;
+    double free_ratio = current_free_ratio();
+
+    while (db_ && (total_bytes > max_bytes || free_ratio < min_free_ratio)) {
+        std::string ev_id;
+        std::string relpath;
+        {
+            StmtGuard sel(
+                db_,
+                "SELECT evidence_id, file_relpath FROM evidence "
+                "ORDER BY (CASE WHEN kind='anomaly' THEN 1 ELSE 0 END) ASC, created_at_utc ASC LIMIT 1;"
+            );
+            if (sqlite3_step(sel.get()) != SQLITE_ROW) {
+                break;
+            }
+            ev_id = col_text(sel.get(), 0);
+            relpath = col_text(sel.get(), 1);
+        }
+
+        const auto full_path = data_root_ / path_from_utf8(relpath);
+        std::uint64_t file_sz = 0;
+        std::error_code fec;
+        if (is_path_within(evidence_root_, full_path) && std::filesystem::is_regular_file(full_path, fec)) {
+            const auto sz = std::filesystem::file_size(full_path, fec);
+            if (!fec) file_sz = static_cast<std::uint64_t>(sz);
+        }
+
+        {
+            TransactionGuard tx(db_);
+            StmtGuard del(db_, "DELETE FROM evidence WHERE evidence_id=?;");
+            bind_text(del.get(), 1, ev_id);
+            sqlite3_step(del.get());
+            tx.commit();
+        }
+
+        if (safe_unlink_evidence_file(relpath) || file_sz == 0) {
+            total_bytes = (total_bytes > file_sz) ? (total_bytes - file_sz) : 0;
+            freed_bytes += file_sz;
+        }
+        ++deleted_count;
+        free_ratio = current_free_ratio();
+    }
+
+    if (deleted_count > 0 && db_) {
+        try {
+            exec_sql_unlocked("PRAGMA wal_checkpoint(TRUNCATE);");
+            write_ops_since_checkpoint_ = 0;
+        } catch (...) {
+        }
+    }
+
+    return json{
+        {"deleted_count", deleted_count},
+        {"freed_bytes", freed_bytes},
+        {"remaining_bytes", total_bytes}
+    };
+}
+
+json StationDatabase::pragma_diagnostics() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    int sync_mode = -1;
+    int64_t journal_limit = -1;
+    std::string journal_mode;
+    if (db_) {
+        {
+            StmtGuard st(db_, "PRAGMA synchronous;");
+            if (sqlite3_step(st.get()) == SQLITE_ROW) sync_mode = sqlite3_column_int(st.get(), 0);
+        }
+        {
+            StmtGuard st(db_, "PRAGMA journal_size_limit;");
+            if (sqlite3_step(st.get()) == SQLITE_ROW) journal_limit = sqlite3_column_int64(st.get(), 0);
+        }
+        {
+            StmtGuard st(db_, "PRAGMA journal_mode;");
+            if (sqlite3_step(st.get()) == SQLITE_ROW) journal_mode = col_text(st.get(), 0);
+        }
+    }
+    return json{
+        {"synchronous", sync_mode},
+        {"journal_size_limit", journal_limit},
+        {"journal_mode", journal_mode}
+    };
 }
 
 json StationDatabase::save_manual_capture(

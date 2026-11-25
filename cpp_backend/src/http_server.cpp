@@ -482,6 +482,18 @@ void EngineerSessionAuth::set_session_ttl_seconds(int ttl_seconds) {
     ttl_seconds_ = std::max(1, ttl_seconds);
 }
 
+void EngineerSessionAuth::set_lockout_policy(int max_attempts, double lockout_seconds) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    max_failed_attempts_ = std::max(1, max_attempts);
+    lockout_seconds_ = std::max(1.0, lockout_seconds);
+}
+
+void EngineerSessionAuth::reset_rate_limit() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    failed_attempts_ = 0;
+    lockout_until_mono_ = 0.0;
+}
+
 json EngineerSessionAuth::status_json() const {
     const bool pin_configured = !get_env_value("IGBT_ENGINEER_PIN").empty();
     const bool admin_token_configured = !get_env_value("IGBT_ADMIN_TOKEN").empty();
@@ -498,6 +510,12 @@ json EngineerSessionAuth::verify_passcode(const std::string& passcode) {
     if (passcode.size() > 256) {
         throw DatabaseHttpError(422, "PASSCODE_TOO_LONG");
     }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (monotonic_seconds() < lockout_until_mono_) {
+            throw DatabaseHttpError(429, "AUTH_RATE_LIMITED");
+        }
+    }
     const std::string configured_admin = get_env_value("IGBT_ADMIN_TOKEN");
     const std::string configured_pin = get_env_value("IGBT_ENGINEER_PIN");
     if (configured_admin.empty() && configured_pin.empty()) {
@@ -507,12 +525,20 @@ json EngineerSessionAuth::verify_passcode(const std::string& passcode) {
     const bool matches_admin = !configured_admin.empty() && constant_time_equals(passcode, configured_admin);
     const bool matches_pin = !configured_pin.empty() && constant_time_equals(passcode, configured_pin);
     if (!(matches_admin || matches_pin)) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++failed_attempts_;
+        if (max_failed_attempts_ > 0 && failed_attempts_ >= max_failed_attempts_) {
+            lockout_until_mono_ = monotonic_seconds() + lockout_seconds_;
+            throw DatabaseHttpError(429, "AUTH_RATE_LIMITED");
+        }
         throw DatabaseHttpError(401, "工程师口令错误，请重试");
     }
 
     int ttl = kDefaultTtlSeconds;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        failed_attempts_ = 0;
+        lockout_until_mono_ = 0.0;
         ttl = ttl_seconds_;
     }
     const std::string session_token = mint_session(ttl);
@@ -655,6 +681,7 @@ StationHttpServer::StationHttpServer(
     }
 
     // Wire LiveCameraEngine configuration loader & cycle persistence callback
+    camera_.set_evidence_root(db_.evidence_root());
     camera_.set_config_loader([this]() { return db_.get_config(); });
     camera_.update_config(db_.get_config());
     camera_.set_cycle_callback(
@@ -691,6 +718,7 @@ StationHttpServer::StationHttpServer(
         camera_.set_work_mode(options_.initial_work_mode);
     }
 
+    svr_.new_task_queue = [] { return new httplib::ThreadPool(24); };
     svr_.set_payload_max_length(kMaxOnnxUploadBytes);
     svr_.set_read_timeout(15, 0);
     svr_.set_write_timeout(15, 0);
@@ -972,12 +1000,14 @@ void StationHttpServer::register_routes() {
     };
 
     // 1. Health & Auth
-    svr_.Get("/api/health", wrap([](const httplib::Request&, httplib::Response& res) {
+    svr_.Get("/api/health", wrap([this](const httplib::Request&, httplib::Response& res) {
         send_json(res, 200, json{
             {"status", "ok"},
             {"host_policy", "loopback_only"},
             {"mode", "shadow"},
             {"interlock_output_enabled", false},
+            {"interlock_backend", interlock_.backend_name()},
+            {"mes_connected", mes_client_.is_connected()},
             {"engine", "cpp20"}
         });
     }));
@@ -1001,15 +1031,36 @@ void StationHttpServer::register_routes() {
 
     auto make_mjpeg_handler = [this](bool is_crop) -> httplib::Server::Handler {
         return [this, is_crop](const httplib::Request&, httplib::Response& res) {
+            int cur = active_mjpeg_streams_.load();
+            while (true) {
+                if (cur >= kMaxConcurrentMjpegStreams) {
+                    res.status = 503;
+                    res.set_header("Retry-After", "2");
+                    res.set_content(R"({"detail":"MJPEG_STREAM_LIMIT_REACHED"})", "application/json");
+                    return;
+                }
+                if (active_mjpeg_streams_.compare_exchange_weak(cur, cur + 1)) {
+                    break;
+                }
+            }
+
+            struct StreamSlotGuard {
+                std::atomic<int>& counter;
+                explicit StreamSlotGuard(std::atomic<int>& c) : counter(c) {}
+                ~StreamSlotGuard() { counter.fetch_sub(1); }
+            };
+
             res.status = 200;
             res.set_header("Cache-Control", "no-store");
 
             struct StreamState {
+                std::shared_ptr<StreamSlotGuard> slot_guard;
                 uint64_t last_seq{0};
                 double no_frame_since{-1.0};
                 double last_new_frame_at{-1.0};
             };
             auto st = std::make_shared<StreamState>();
+            st->slot_guard = std::make_shared<StreamSlotGuard>(active_mjpeg_streams_);
 
             res.set_chunked_content_provider(
                 "multipart/x-mixed-replace; boundary=frame",
@@ -1090,7 +1141,8 @@ void StationHttpServer::register_routes() {
         res.set_content(reinterpret_cast<const char*>(jpg.data()), jpg.size(), "image/jpeg");
     }));
 
-    svr_.Post("/api/camera/capture", wrap([this](const httplib::Request&, httplib::Response& res) {
+    svr_.Post("/api/camera/capture", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
         auto snap = camera_.get_atomic_capture(std::nullopt, true);
         if (!snap.has_frame() || snap.frame_jpeg.empty()) {
             throw DatabaseHttpError(503, "当前未获取到实时摄像头画面");
@@ -1105,6 +1157,7 @@ void StationHttpServer::register_routes() {
 
     // 3. Camera Runtime Controls
     svr_.Post("/api/camera/auxiliary_rois", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
         const json body = parse_json_body_or_throw(req);
         if (!body.is_object() || body.size() != 1 || !body.contains("show") || !body["show"].is_boolean()) {
             throw DatabaseHttpError(422, "INVALID_AUXILIARY_ROIS_PAYLOAD");
@@ -1114,6 +1167,7 @@ void StationHttpServer::register_routes() {
     }));
 
     svr_.Post("/api/camera/mirror", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
         const json body = parse_json_body_or_throw(req);
         if (!body.is_object() || body.size() != 1 || !body.contains("mirror") || !body["mirror"].is_boolean()) {
             throw DatabaseHttpError(422, "INVALID_MIRROR_PAYLOAD");
@@ -1137,6 +1191,7 @@ void StationHttpServer::register_routes() {
 
     // 4. Simulation & Station Snapshot
     svr_.Post("/api/runtime/simulate/:scenario", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
         const std::string scenario = req.path_params.at("scenario");
         static const std::set<std::string> kScenarios = {
             "a_pass", "b_pass", "c_pass", "alarm", "initial_alarm",
@@ -1147,7 +1202,6 @@ void StationHttpServer::register_routes() {
         }
 
         if (camera_.camera_online() && scenario == "reset") {
-            auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
             {
                 std::lock_guard<std::mutex> lk(state_mutex_);
                 sim_override_until_mono_ = 0.0;
@@ -1622,6 +1676,16 @@ void StationHttpServer::register_routes() {
             if (m < 1 || m > 10000) throw DatabaseHttpError(422, "MAX_SAMPLES_OUT_OF_RANGE");
             cfg.max_samples = m;
         }
+        if (body.contains("min_diff_mad") && !body["min_diff_mad"].is_null()) {
+            if (!body["min_diff_mad"].is_number() || body["min_diff_mad"].is_boolean()) {
+                throw DatabaseHttpError(422, "INVALID_MIN_DIFF_MAD");
+            }
+            double mad = body["min_diff_mad"].get<double>();
+            if (!std::isfinite(mad) || mad < 0.0 || mad > 255.0) {
+                throw DatabaseHttpError(422, "MIN_DIFF_MAD_OUT_OF_RANGE");
+            }
+            cfg.min_diff_mad = mad;
+        }
         if (cfg.enabled && body.value("reset_count", true)) {
             cfg.captured_count = 0;
         }
@@ -1686,6 +1750,7 @@ void StationHttpServer::register_routes() {
     }));
 
     svr_.Post("/api/dataset/capture", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
         const json body = parse_json_body_or_throw(req);
         if (!body.is_object() || !body.contains("label") || !body["label"].is_string()) {
             throw DatabaseHttpError(422, "INVALID_DATASET_CAPTURE_PAYLOAD");
@@ -1767,7 +1832,8 @@ void StationHttpServer::register_routes() {
         send_json(res, 200, sample);
     }));
 
-    svr_.Post("/api/dataset/bootstrap", wrap([this](const httplib::Request&, httplib::Response& res) {
+    svr_.Post("/api/dataset/bootstrap", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
         cv::Mat live_crop = camera_.get_tracked_crop_bgr();
         std::optional<cv::Mat> opt_crop;
         if (!live_crop.empty()) opt_crop = live_crop;
@@ -1907,6 +1973,7 @@ void StationHttpServer::register_routes() {
     }));
 
     svr_.Post("/api/training/start", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
         json body = req.body.empty() ? json::object() : parse_json_body_or_throw(req);
         if (!body.is_object()) throw DatabaseHttpError(422, "INVALID_TRAINING_PAYLOAD");
         static const std::set<std::string> kAllowed = {
