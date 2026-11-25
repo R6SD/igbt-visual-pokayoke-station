@@ -72,6 +72,7 @@ struct AutoCaptureConfig {
     std::string physical_tube_id{"UNGROUPED"};
     int max_samples{200};
     int captured_count{0};
+    double min_diff_mad{0.0};
 
     json to_json() const {
         return json{
@@ -82,6 +83,7 @@ struct AutoCaptureConfig {
             {"physical_tube_id", physical_tube_id},
             {"max_samples", max_samples},
             {"captured_count", captured_count},
+            {"min_diff_mad", min_diff_mad},
         };
     }
 };

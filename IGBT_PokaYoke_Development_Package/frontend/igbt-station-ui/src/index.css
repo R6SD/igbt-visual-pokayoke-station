@@ -332,6 +332,8 @@ summary:focus-visible,
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  padding: 5px;
+  margin: -5px;
   min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;

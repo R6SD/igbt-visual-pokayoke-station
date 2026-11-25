@@ -1,5 +1,6 @@
 #pragma once
 
+#include <igbt/async_evidence_writer.hpp>
 #include <igbt/common.hpp>
 #include <igbt/fsm.hpp>
 
@@ -301,10 +302,13 @@ public:
     );
     void clear_loaded_model();
 
-    // Skip-Frame Auto-Capture (A3)
+    // Skip-Frame Auto-Capture (A3) & Async Pre-Trigger Ring Buffer
     AutoCaptureConfig set_auto_capture(const AutoCaptureConfig& cfg);
     AutoCaptureConfig get_auto_capture() const;
     void set_auto_sample_callback(AutoSampleCallback cb);
+    void set_evidence_root(const std::filesystem::path& root);
+    json async_evidence_stats() const;
+    void stop_async_writer();
 
     // Thread-safe state, atomic capture & MJPEG streaming
     json get_state_json() const;
@@ -461,9 +465,11 @@ private:
     uint64_t mirror_generation_{0};
     uint64_t applied_mirror_generation_{0};
     bool pending_tracker_reset_{false};
-    std::string work_mode_{"debug"};
+    std::string work_mode_{"strict"};
     uint64_t work_mode_generation_{0};
     uint64_t cycle_generation_{0};
+    bool hardware_3a_locked_{true};
+    json hardware_3a_status_{{"locked", true}, {"source", "not_opened"}};
 
     cv::Mat raw_frame_;
     std::optional<Box> raw_frame_label_box_;
@@ -518,6 +524,12 @@ private:
     InspectionFSM fsm_;
     ContactCandidateTracker contact_tracker_;
     json state_;
+
+    SkipFrameRingBuffer pre_trigger_ring_{25, 5};
+    AsyncEvidenceWriter async_evidence_writer_;
+    cv::Mat last_auto_capture_gray_small_;
+    std::optional<std::pair<double, double>> active_cycle_tube_center_;
+    std::string active_cycle_pipe_color_;
 };
 
 }  // namespace igbt

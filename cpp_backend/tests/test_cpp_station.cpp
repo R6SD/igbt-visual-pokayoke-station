@@ -564,6 +564,8 @@ void test_http_server_auth_autocapture_training_and_mjpeg() {
     json health_j = json::parse(health_res->body);
     REQUIRE_EQ(health_j.value("status", ""), "ok");
     REQUIRE_EQ(health_j.value("host_policy", ""), "loopback_only");
+    REQUIRE_EQ(health_j.value("interlock_backend", ""), "shadow_noop");
+    REQUIRE_EQ(health_j.value("mes_connected", true), false);
 
     auto spa_res = cli.Get("/showcase");
     REQUIRE(spa_res != nullptr);
@@ -608,6 +610,13 @@ void test_http_server_auth_autocapture_training_and_mjpeg() {
     // Unauthenticated protected mutations MUST return 401; read-only auto_capture status is public (200)
     REQUIRE_EQ(cli.Post("/api/cycles/purge", R"({"scope":"simulated_only","confirm":true})", "application/json")->status, 401);
     REQUIRE_EQ(cli.Post("/api/dataset/clear", "", "application/json")->status, 401);
+    REQUIRE_EQ(cli.Post("/api/runtime/simulate/a_pass", "", "application/json")->status, 401);
+    REQUIRE_EQ(cli.Post("/api/camera/capture", "", "application/json")->status, 401);
+    REQUIRE_EQ(cli.Post("/api/camera/mirror", R"({"mirror":true})", "application/json")->status, 401);
+    REQUIRE_EQ(cli.Post("/api/camera/auxiliary_rois", R"({"show":false})", "application/json")->status, 401);
+    REQUIRE_EQ(cli.Post("/api/dataset/capture", R"({"label":"complete"})", "application/json")->status, 401);
+    REQUIRE_EQ(cli.Post("/api/dataset/bootstrap", "", "application/json")->status, 401);
+    REQUIRE_EQ(cli.Post("/api/training/start", "{}", "application/json")->status, 401);
     REQUIRE_EQ(cli.Get("/api/dataset/auto_capture")->status, 200);
     REQUIRE_EQ(cli.Post("/api/dataset/auto_capture", R"({"enabled":true})", "application/json")->status, 401);
 
@@ -748,6 +757,235 @@ void test_http_server_auth_autocapture_training_and_mjpeg() {
     server.stop();
 }
 
+// ----------------------------------------------------------------------------
+// Test 5: Wave 1 & Wave 2 Hardening (Strict Default, Auth Rate Limit, SQLite FULL, HAL)
+// ----------------------------------------------------------------------------
+void test_wave1_wave2_hardening() {
+    // 5A. Default work_mode MUST be strict in both StationServerOptions and LiveCameraEngine
+    StationServerOptions default_opts;
+    REQUIRE_EQ(default_opts.initial_work_mode, "strict");
+    LiveCameraEngine default_cam(0);
+    REQUIRE_EQ(default_cam.get_work_mode(), "strict");
+
+    // 5B. HAL stub defaults
+    ShadowNoopInterlock noop_dio;
+    REQUIRE(!noop_dio.is_hardware_ready());
+    REQUIRE(noop_dio.is_esd_ground_ok());
+    REQUIRE_EQ(noop_dio.backend_name(), "shadow_noop");
+    OfflineNoopMesClient noop_mes;
+    REQUIRE(!noop_mes.is_connected());
+    REQUIRE(!noop_mes.active_work_order().has_value());
+    REQUIRE_EQ(noop_mes.backend_name(), "offline_noop");
+
+    // 5C. SQLite synchronous=FULL (2), journal_size_limit=67108864 & checkpoint
+    ScopedTempDir tmp;
+    StationDatabase db(tmp.path());
+    db.run_wal_checkpoint_truncate();
+    const json pragmas = db.pragma_diagnostics();
+    REQUIRE_EQ(pragmas.value("journal_mode", ""), "wal");
+    REQUIRE_EQ(pragmas.value("synchronous", -1), 2);
+    REQUIRE_EQ(pragmas.value("journal_size_limit", int64_t{-1}), int64_t{67108864});
+
+    // 5D. Strict optical quality gate enforces underexposure and strict defaults
+    json cfg = StationDatabase::default_config();
+    cfg["config_version"] = 1;
+    cfg["roi_config_version"] = "ROI_V001";
+    cfg["calibrated_at_utc"] = utc_now_iso();
+    cfg["rois"] = json{
+        {"tube_roi", {0.16, 0.42, 0.84, 0.58}},
+        {"label_roi", {0.43, 0.45, 0.57, 0.55}},
+        {"label_contact_roi", {0.40, 0.38, 0.60, 0.62}},
+        {"left_grip_zone", {0.16, 0.34, 0.31, 0.82}},
+        {"right_grip_zone", {0.69, 0.34, 0.84, 0.82}}
+    };
+    cfg["thresholds"] = json::object();  // force strict code-level defaults
+    default_cam.update_config(cfg);
+    cv::Mat dark_frame(720, 1280, CV_8UC3, cv::Scalar(10, 10, 10));
+    REQUIRE(default_cam.process_injected_frame(dark_frame, 50.0));
+    json dark_st = default_cam.get_state_json();
+    REQUIRE_EQ(dark_st.value("quality_ok", true), false);
+    REQUIRE_EQ(dark_st.value("view_valid", true), false);
+
+    // 5E. PIN brute-force rate limit (5 bad attempts -> 429 lockout even for valid PIN)
+    const auto web_dir = tmp.path() / "web_dist";
+    std::filesystem::create_directories(web_dir);
+    const std::string html = "<!doctype html><html><body>OK</body></html>";
+    REQUIRE(write_file_bytes_atomic(web_dir / "index.html", html.data(), html.size()));
+
+    TrainingManager training(tmp.path());
+    StationServerOptions opts;
+    opts.host = "127.0.0.1";
+    opts.port = 0;
+    opts.data_dir = tmp.path();
+    opts.web_dist_dir = web_dir;
+    opts.enable_live_camera = false;
+
+    StationHttpServer server(db, default_cam, training, opts);
+    server.auth().set_env_override("IGBT_ENGINEER_PIN", "642819");
+    server.auth().set_lockout_policy(5, 30.0);
+    const int port = server.start_background();
+    REQUIRE(port > 0);
+
+    httplib::Client cli("127.0.0.1", port);
+    for (int i = 0; i < 4; ++i) {
+        auto res = cli.Post("/api/auth/verify", R"({"passcode":"000000"})", "application/json");
+        REQUIRE(res != nullptr);
+        REQUIRE_EQ(res->status, 401);
+    }
+    auto res5 = cli.Post("/api/auth/verify", R"({"passcode":"000000"})", "application/json");
+    REQUIRE(res5 != nullptr);
+    REQUIRE_EQ(res5->status, 429);
+
+    auto res_locked = cli.Post("/api/auth/verify", R"({"passcode":"642819"})", "application/json");
+    REQUIRE(res_locked != nullptr);
+    REQUIRE_EQ(res_locked->status, 429);
+
+    server.auth().reset_rate_limit();
+    auto res_ok = cli.Post("/api/auth/verify", R"({"passcode":"642819"})", "application/json");
+    REQUIRE(res_ok != nullptr);
+    REQUIRE_EQ(res_ok->status, 200);
+
+    server.stop();
+}
+
+// ----------------------------------------------------------------------------
+// Test 6: Skip-Frame Ring Buffer, Async Burst Writer, Diff-Gated Capture & Quota
+// ----------------------------------------------------------------------------
+void test_skip_frame_storage_and_diff_gate() {
+    // 6A. SkipFrameRingBuffer (stride=5, capacity=4 -> keeps latest 4 at 5,10,15,20,25,30)
+    SkipFrameRingBuffer ring(4, 5);
+    cv::Mat sample_img(120, 160, CV_8UC3, cv::Scalar(40, 80, 120));
+    int due_pushes = 0;
+    for (int fid = 1; fid <= 30; ++fid) {
+        if (ring.push_if_due(fid, fid * 0.04, sample_img)) {
+            ++due_pushes;
+        }
+    }
+    REQUIRE_EQ(due_pushes, 6);
+    auto snap = ring.snapshot_ordered();
+    REQUIRE_EQ(snap.size(), 4u);
+    REQUIRE_EQ(snap[0].frame_id, int64_t{15});
+    REQUIRE_EQ(snap[1].frame_id, int64_t{20});
+    REQUIRE_EQ(snap[2].frame_id, int64_t{25});
+    REQUIRE_EQ(snap[3].frame_id, int64_t{30});
+
+    // 6B. AsyncEvidenceWriter burst flush + 10s coalescing window
+    ScopedTempDir tmp;
+    const auto ev_root = tmp.path() / "evidence";
+    {
+        AsyncEvidenceWriter writer(ev_root, 8, 10.0);
+        REQUIRE(writer.enqueue_burst("CYC_BURST_01", "TUBE_SWAP_SUSPECTED", snap, 100.0));
+        REQUIRE(!writer.enqueue_burst("CYC_BURST_01", "TUBE_SWAP_SUSPECTED", snap, 102.0));
+        writer.stop_and_drain();
+        json st = writer.stats_json();
+        REQUIRE_EQ(st.value("written_bursts", uint64_t{0}), uint64_t{1});
+        REQUIRE_EQ(st.value("written_frames", uint64_t{0}), uint64_t{4});
+        REQUIRE_EQ(st.value("coalesced_bursts", uint64_t{0}), uint64_t{1});
+    }
+    const auto burst_dir = ev_root / "bursts" / "CYC_BURST_01";
+    REQUIRE(std::filesystem::is_directory(burst_dir));
+    int jpg_cnt = 0;
+    int manifest_cnt = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(burst_dir)) {
+        const auto ext = entry.path().extension().string();
+        if (ext == ".jpg") ++jpg_cnt;
+        if (ext == ".json") ++manifest_cnt;
+    }
+    REQUIRE_EQ(jpg_cnt, 4);
+    REQUIRE_EQ(manifest_cnt, 1);
+
+    // 6C. Visual-diff gated skip-frame AutoCapture (bypassed for unknown_challenge)
+    TrainingManager tm(tmp.path());
+    LiveCameraEngine cam(0);
+    cam.set_auto_sample_callback(
+        [&](const cv::Mat& fb,
+            const cv::Mat& cb,
+            const std::string& lbl,
+            const std::string& pc,
+            const std::string& tid,
+            const std::string& bid,
+            std::optional<Box> box) {
+            tm.capture_sample(fb, cb, lbl, pc, tid, bid, box);
+        }
+    );
+    AutoCaptureConfig ac{};
+    ac.enabled = true;
+    ac.every_n_frames = 2;
+    ac.label = "complete";
+    ac.max_samples = 10;
+    ac.min_diff_mad = 4.0;
+    cam.set_auto_capture(ac);
+
+    cv::Mat f_complete = make_synthetic_station_frame(1280, 720, "complete", false, false);
+    cv::Mat f_crossed = make_synthetic_station_frame(1280, 720, "crossed_out", false, false);
+    double ts = 10.0;
+    for (int i = 0; i < 6; ++i) {
+        ts += 0.04;
+        REQUIRE(cam.process_injected_frame(f_complete, ts));
+    }
+    REQUIRE_EQ(cam.get_auto_capture().captured_count, 1);
+
+    ts += 0.04;
+    REQUIRE(cam.process_injected_frame(f_crossed, ts));
+    ts += 0.04;
+    REQUIRE(cam.process_injected_frame(f_crossed, ts));
+    REQUIRE_EQ(cam.get_auto_capture().captured_count, 2);
+
+    AutoCaptureConfig ac_chal{};
+    ac_chal.enabled = true;
+    ac_chal.every_n_frames = 1;
+    ac_chal.label = "unknown_challenge";
+    ac_chal.max_samples = 5;
+    ac_chal.min_diff_mad = 20.0;
+    cam.set_auto_capture(ac_chal);
+    for (int i = 0; i < 2; ++i) {
+        ts += 0.04;
+        REQUIRE(cam.process_injected_frame(f_complete, ts));
+    }
+    REQUIRE_EQ(cam.get_auto_capture().captured_count, 2);
+
+    // 6D. Evidence FIFO quota prunes non-anomaly PASS/initial evidence before anomaly evidence
+    StationDatabase db(tmp.path() / "quota_db");
+    std::vector<uint8_t> jpg_bytes;
+    REQUIRE(cv::imencode(".jpg", f_complete, jpg_bytes));
+    REQUIRE(jpg_bytes.size() > 1024);
+
+    db.upload_evidence_bytes(
+        "CYC_QUOTA_PASS",
+        "initial",
+        jpg_bytes,
+        "image/jpeg",
+        1,
+        10.0,
+        std::string("yellow"),
+        std::string("PASS_KEYFRAME"),
+        std::string("OP_STATION_01"),
+        json::object(),
+        std::string("complete"),
+        "2026-11-25T10:00:00.000Z"
+    );
+    db.upload_evidence_bytes(
+        "CYC_QUOTA_ALM",
+        "anomaly",
+        jpg_bytes,
+        "image/jpeg",
+        2,
+        11.0,
+        std::string("yellow"),
+        std::string("ALARM_CAPTURE"),
+        std::string("OP_STATION_01"),
+        json::object(),
+        std::string("crossed_out"),
+        "2026-11-25T10:00:01.000Z"
+    );
+
+    json quota_res = db.enforce_evidence_quota(static_cast<std::uint64_t>(jpg_bytes.size() + 256), 0.0);
+    REQUIRE_EQ(quota_res.value("deleted_count", 0), 1);
+    json rem = db.list_evidence(10);
+    REQUIRE_EQ(rem.size(), 1u);
+    REQUIRE_EQ(rem[0].value("kind", ""), "anomaly");
+}
+
 }  // namespace
 
 int main() {
@@ -762,6 +1000,8 @@ int main() {
         {"2. Vision 720p@25fps Pacer, Occlusion/Glare & Bare-Hand Gate", test_vision_720p_25fps_and_pokayoke},
         {"3. SQLite3 WAL Storage, Legacy Migration, Purge & 409 Model Guard", test_sqlite_storage_and_migration},
         {"4. HTTP Loopback Server, Zero-Default Auth, Skip-Frame Auto-Capture, ANN_MLP/ONNX & MJPEG", test_http_server_auth_autocapture_training_and_mjpeg},
+        {"5. Wave 1 & Wave 2 Hardening (Strict Default, Auth Rate Limit, SQLite FULL, HAL)", test_wave1_wave2_hardening},
+        {"6. Skip-Frame Ring Buffer, Async Burst Writer, Diff-Gated Capture & Evidence Quota", test_skip_frame_storage_and_diff_gate},
     };
 
     int passed = 0;

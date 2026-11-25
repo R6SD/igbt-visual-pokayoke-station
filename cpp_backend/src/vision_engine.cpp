@@ -6,10 +6,16 @@
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
+#include <iostream>
+#include <memory>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 
 namespace igbt {
 
@@ -1213,7 +1219,8 @@ LiveCameraEngine::LiveCameraEngine(
         {"inference_ms", 0.0},
         {"show_auxiliary_rois", false},
         {"mirror_horizontal", true},
-        {"work_mode", "debug"},
+        {"work_mode", "strict"},
+        {"hardware_3a", hardware_3a_status_},
         {"tracked_objects", json::array()},
         {"tracked_label_box", nullptr},
         {"config_version", "ROI_V001"},
@@ -1226,6 +1233,7 @@ LiveCameraEngine::LiveCameraEngine(
 
 LiveCameraEngine::~LiveCameraEngine() {
     stop(3000);
+    async_evidence_writer_.stop_and_drain();
 }
 
 std::string LiveCameraEngine::generate_live_cycle_id() {
@@ -1400,6 +1408,8 @@ json LiveCameraEngine::trigger_new_cycle(const std::string& pipe_color) {
     latched_reason_.reset();
     latched_cycle_id_.reset();
     pass_target_lost_since_.reset();
+    active_cycle_tube_center_.reset();
+    active_cycle_pipe_color_.clear();
     pending_tracker_reset_ = true;
     ++cycle_generation_;
     last_emitted_dedup_key_.clear();
@@ -1636,6 +1646,9 @@ AutoCaptureConfig LiveCameraEngine::set_auto_capture(const AutoCaptureConfig& cf
     AutoCaptureConfig sanitized = cfg;
     sanitized.every_n_frames = std::clamp(cfg.every_n_frames, 1, 1000);
     sanitized.max_samples = std::clamp(cfg.max_samples, 1, 10000);
+    sanitized.min_diff_mad = std::isfinite(cfg.min_diff_mad)
+                                 ? std::clamp(cfg.min_diff_mad, 0.0, 255.0)
+                                 : 0.0;
     if (std::find(kLabelClasses.begin(), kLabelClasses.end(), sanitized.label) == kLabelClasses.end() &&
         sanitized.label != "unknown_challenge") {
         sanitized.label = "complete";
@@ -1654,7 +1667,10 @@ AutoCaptureConfig LiveCameraEngine::set_auto_capture(const AutoCaptureConfig& cf
         if (sanitized.captured_count >= sanitized.max_samples) {
             sanitized.captured_count = 0;
         }
-    } else if (!sanitized.enabled) {
+        last_auto_capture_gray_small_.release();
+    } else if (sanitized.enabled) {
+        last_auto_capture_gray_small_.release();
+    } else {
         sanitized.captured_count = auto_capture_.captured_count;
     }
     auto_capture_ = sanitized;
@@ -1670,6 +1686,23 @@ AutoCaptureConfig LiveCameraEngine::get_auto_capture() const {
 void LiveCameraEngine::set_auto_sample_callback(AutoSampleCallback cb) {
     std::lock_guard<std::mutex> lk(mutex_);
     auto_sample_callback_ = std::move(cb);
+}
+
+void LiveCameraEngine::set_evidence_root(const std::filesystem::path& root) {
+    async_evidence_writer_.set_evidence_root(root);
+}
+
+json LiveCameraEngine::async_evidence_stats() const {
+    return json{
+        {"ring_buffered", pre_trigger_ring_.size()},
+        {"ring_capacity", pre_trigger_ring_.capacity()},
+        {"ring_stride", pre_trigger_ring_.stride()},
+        {"writer", async_evidence_writer_.stats_json()}
+    };
+}
+
+void LiveCameraEngine::stop_async_writer() {
+    async_evidence_writer_.stop_and_drain();
 }
 
 // ============================================================================
@@ -1849,14 +1882,67 @@ void LiveCameraEngine::capture_loop() {
         }
     };
 
+    class HighResWaitableTimer {
+    public:
+        HighResWaitableTimer() {
+            handle_ = CreateWaitableTimerExW(
+                nullptr,
+                nullptr,
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS
+            );
+        }
+        ~HighResWaitableTimer() {
+            if (handle_ != nullptr) {
+                CloseHandle(handle_);
+                handle_ = nullptr;
+            }
+        }
+        HighResWaitableTimer(const HighResWaitableTimer&) = delete;
+        HighResWaitableTimer& operator=(const HighResWaitableTimer&) = delete;
+
+        void wait_until(
+            std::chrono::steady_clock::time_point deadline,
+            const std::atomic<bool>& stop_req
+        ) const {
+            while (!stop_req.load()) {
+                const auto now_tp = std::chrono::steady_clock::now();
+                if (now_tp >= deadline) break;
+                const auto rem = deadline - now_tp;
+                if (handle_ != nullptr) {
+                    const auto slice = std::min<std::chrono::microseconds>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(rem),
+                        std::chrono::microseconds(50000)
+                    );
+                    if (slice.count() <= 0) break;
+                    LARGE_INTEGER due_time{};
+                    due_time.QuadPart = -static_cast<LONGLONG>(slice.count()) * 10LL;
+                    if (SetWaitableTimer(handle_, &due_time, 0, nullptr, nullptr, FALSE)) {
+                        WaitForSingleObject(handle_, INFINITE);
+                        continue;
+                    }
+                }
+                const auto fallback_ms = std::chrono::duration_cast<std::chrono::milliseconds>(rem);
+                std::this_thread::sleep_for(
+                    std::clamp(fallback_ms, std::chrono::milliseconds(1), std::chrono::milliseconds(15))
+                );
+            }
+        }
+
+    private:
+        HANDLE handle_{nullptr};
+    };
+
+    HighResWaitableTimer pacer_timer;
+
     while (!stop_requested_.load()) {
-        cv::VideoCapture cap(device_index_, cv::CAP_DSHOW);
+        auto cap = std::make_shared<cv::VideoCapture>(device_index_, cv::CAP_DSHOW);
         std::string opened_backend = "DSHOW";
-        if (!cap.isOpened()) {
-            cap.open(device_index_, cv::CAP_ANY);
+        if (!cap->isOpened()) {
+            cap->open(device_index_, cv::CAP_ANY);
             opened_backend = "ANY";
         }
-        if (!cap.isOpened()) {
+        if (!cap->isOpened()) {
             mark_camera_unavailable("CAMERA_NOT_CONNECTED");
             interruptible_sleep(std::chrono::milliseconds(1200));
             continue;
@@ -1864,16 +1950,34 @@ void LiveCameraEngine::capture_loop() {
 
         // Strict property sequence: buffer -> 1280x720 -> 30.0 FPS (UVC MJPG native) -> FOURCC('M','J','P','G') LAST!
         // Requesting 25.0 FPS on Logitech C920 DirectShow rounds down to 15.0 FPS because UVC only lists 30.0.
-        cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
-        cap.set(cv::CAP_PROP_FRAME_WIDTH, kDefaultCameraWidth);
-        cap.set(cv::CAP_PROP_FRAME_HEIGHT, kDefaultCameraHeight);
-        cap.set(cv::CAP_PROP_FPS, 30.0);
-        cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+        cap->set(cv::CAP_PROP_BUFFERSIZE, 1);
+        cap->set(cv::CAP_PROP_FRAME_WIDTH, kDefaultCameraWidth);
+        cap->set(cv::CAP_PROP_FRAME_HEIGHT, kDefaultCameraHeight);
+        cap->set(cv::CAP_PROP_FPS, 30.0);
+        cap->set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+
+        // Attempt DirectShow 3A hardware locking + readback (AF / AE / AWB)
+        const bool af_ok = cap->set(cv::CAP_PROP_AUTOFOCUS, 0.0);
+        const bool ae_ok = cap->set(cv::CAP_PROP_AUTO_EXPOSURE, 0.25);
+        const bool awb_ok = cap->set(cv::CAP_PROP_AUTO_WB, 0.0);
+        const double af_val = cap->get(cv::CAP_PROP_AUTOFOCUS);
+        const double ae_val = cap->get(cv::CAP_PROP_AUTO_EXPOSURE);
+        const double awb_val = cap->get(cv::CAP_PROP_AUTO_WB);
+        const bool hw_3a_ok = af_ok && ae_ok && awb_ok;
+        const json hw_3a_json{
+            {"locked", hw_3a_ok},
+            {"autofocus", {{"set_ok", af_ok}, {"value", std::isfinite(af_val) ? json(af_val) : json(nullptr)}}},
+            {"auto_exposure", {{"set_ok", ae_ok}, {"value", std::isfinite(ae_val) ? json(ae_val) : json(nullptr)}}},
+            {"auto_wb", {{"set_ok", awb_ok}, {"value", std::isfinite(awb_val) ? json(awb_val) : json(nullptr)}}}
+        };
 
         {
             std::lock_guard<std::mutex> lk(mutex_);
             backend_ = opened_backend;
             fps_times_.clear();
+            hardware_3a_locked_ = hw_3a_ok;
+            hardware_3a_status_ = hw_3a_json;
+            state_["hardware_3a"] = hardware_3a_status_;
         }
 
         // Decouple blocking UVC cap.read() from the 40.0 ms (25.0 FPS) consumer pacer to eliminate
@@ -1886,57 +1990,74 @@ void LiveCameraEngine::capture_loop() {
             std::chrono::steady_clock::time_point last_frame_tp{};
             bool grab_failed{false};
             std::atomic<bool> stop{false};
-        } grab_state;
+        };
+        auto grab_state = std::make_shared<GrabberState>();
 
-        std::thread grabber([&]() {
-            while (!stop_requested_.load() && !grab_state.stop.load()) {
+        std::thread grabber([cap, grab_state]() {
+            while (!grab_state->stop.load()) {
                 cv::Mat raw;
-                const bool ok = cap.read(raw);
+                const bool ok = cap->read(raw);
                 const auto grabbed_tp = std::chrono::steady_clock::now();
                 if (!ok || raw.empty()) {
                     {
-                        std::lock_guard<std::mutex> glk(grab_state.mtx);
-                        grab_state.grab_failed = true;
+                        std::lock_guard<std::mutex> glk(grab_state->mtx);
+                        grab_state->grab_failed = true;
                     }
-                    grab_state.cv.notify_all();
+                    grab_state->cv.notify_all();
                     break;
                 }
                 {
-                    std::lock_guard<std::mutex> glk(grab_state.mtx);
-                    grab_state.latest_frame = std::move(raw);
-                    ++grab_state.latest_seq;
-                    grab_state.last_frame_tp = grabbed_tp;
+                    std::lock_guard<std::mutex> glk(grab_state->mtx);
+                    grab_state->latest_frame = std::move(raw);
+                    ++grab_state->latest_seq;
+                    grab_state->last_frame_tp = grabbed_tp;
                 }
-                grab_state.cv.notify_all();
+                grab_state->cv.notify_all();
             }
         });
+
+        auto stop_grabber_safely = [&]() {
+            grab_state->stop.store(true);
+            grab_state->cv.notify_all();
+            try {
+                cap->release();
+            } catch (...) {
+            }
+            if (grabber.joinable()) {
+                HANDLE hThread = reinterpret_cast<HANDLE>(grabber.native_handle());
+                const DWORD wait_rc = (hThread != nullptr) ? WaitForSingleObject(hThread, 800) : WAIT_TIMEOUT;
+                if (wait_rc == WAIT_OBJECT_0) {
+                    grabber.join();
+                } else {
+                    std::cerr << "[IGBT-C++20] Warning: DirectShow grabber thread hung after cap.release(); detaching."
+                              << std::endl;
+                    grabber.detach();
+                }
+            }
+        };
 
         constexpr auto kHardwareStallTimeout = std::chrono::milliseconds(1500);
         const auto first_wait_deadline = std::chrono::steady_clock::now() + kHardwareStallTimeout;
         bool first_frame_ready = false;
         {
-            std::unique_lock<std::mutex> glk(grab_state.mtx);
-            while (!stop_requested_.load() && !grab_state.grab_failed && grab_state.latest_seq == 0) {
+            std::unique_lock<std::mutex> glk(grab_state->mtx);
+            while (!stop_requested_.load() && !grab_state->grab_failed && grab_state->latest_seq == 0) {
                 const auto now_tp = std::chrono::steady_clock::now();
                 if (now_tp >= first_wait_deadline) break;
                 const auto step = std::min<std::chrono::milliseconds>(
                     std::chrono::milliseconds(50),
                     std::chrono::duration_cast<std::chrono::milliseconds>(first_wait_deadline - now_tp)
                 );
-                grab_state.cv.wait_for(glk, std::max(std::chrono::milliseconds(1), step));
+                grab_state->cv.wait_for(glk, std::max(std::chrono::milliseconds(1), step));
             }
-            first_frame_ready = (grab_state.latest_seq > 0 && !grab_state.grab_failed);
+            first_frame_ready = (grab_state->latest_seq > 0 && !grab_state->grab_failed);
         }
 
         if (!first_frame_ready) {
             if (!stop_requested_.load()) {
                 mark_camera_unavailable("CAMERA_FEED_LOST");
             }
-            grab_state.stop.store(true);
-            if (grabber.joinable()) {
-                grabber.join();
-            }
-            cap.release();
+            stop_grabber_safely();
             if (!stop_requested_.load()) {
                 interruptible_sleep(std::chrono::milliseconds(400));
             }
@@ -1947,34 +2068,21 @@ void LiveCameraEngine::capture_loop() {
 
         while (!stop_requested_.load()) {
             deadline = next_pacer_deadline(deadline, std::chrono::steady_clock::now(), kFrameInterval);
-
-            // Account for Windows default 15.625 ms timer resolution: only sleep_for(1ms)
-            // while > 17 ms remain, then yield() for the final < 17 ms so wakeup hits
-            // the 40.0 ms pacer boundary within < 0.2 ms.
-            while (!stop_requested_.load()) {
-                const auto now_tp = std::chrono::steady_clock::now();
-                if (now_tp >= deadline) break;
-                const auto rem = deadline - now_tp;
-                if (rem > std::chrono::milliseconds(17)) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                } else {
-                    std::this_thread::yield();
-                }
-            }
+            pacer_timer.wait_until(deadline, stop_requested_);
             if (stop_requested_.load()) break;
 
             cv::Mat frame;
             bool failed = false;
             bool stalled = false;
             {
-                std::lock_guard<std::mutex> glk(grab_state.mtx);
-                failed = grab_state.grab_failed;
-                if (!failed && grab_state.latest_seq > 0) {
-                    const auto age = std::chrono::steady_clock::now() - grab_state.last_frame_tp;
+                std::lock_guard<std::mutex> glk(grab_state->mtx);
+                failed = grab_state->grab_failed;
+                if (!failed && grab_state->latest_seq > 0) {
+                    const auto age = std::chrono::steady_clock::now() - grab_state->last_frame_tp;
                     if (age > kHardwareStallTimeout) {
                         stalled = true;
                     } else {
-                        frame = grab_state.latest_frame.clone();
+                        frame = grab_state->latest_frame.clone();
                     }
                 }
             }
@@ -2000,11 +2108,7 @@ void LiveCameraEngine::capture_loop() {
             process_frame_internal(frame, capture_ts);
         }
 
-        grab_state.stop.store(true);
-        if (grabber.joinable()) {
-            grabber.join();
-        }
-        cap.release();
+        stop_grabber_safely();
         if (!stop_requested_.load()) {
             interruptible_sleep(std::chrono::milliseconds(400));
         }
@@ -3264,7 +3368,7 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
 
     bool mirror_now = true;
     uint64_t mirror_gen = 0;
-    std::string work_mode_now = "debug";
+    std::string work_mode_now = "strict";
     uint64_t work_mode_gen = 0;
     uint64_t frame_cycle_gen = 0;
     bool show_aux_now = false;
@@ -3328,10 +3432,13 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
     const Box eval_box = (tr.target_locked && tr.label_box.has_value()) ? *tr.label_box : rois.label_roi;
     const auto quality = measure_label_quality(frame, eval_box);
 
-    const double min_lap = threshold_double(thresholds, "min_laplacian_variance", 12.0);
-    const double min_lum = threshold_double(thresholds, "min_brightness", 25.0);
-    const double max_lum = threshold_double(thresholds, "max_brightness", 242.0);
-    const double max_glare = threshold_double(thresholds, "max_overexposed_fraction", 0.18);
+    const bool strict_mode = (work_mode_now == "strict");
+    const double min_lap = threshold_double(thresholds, "min_laplacian_variance", strict_mode ? 120.0 : 12.0);
+    const double min_lum = threshold_double(thresholds, "min_brightness", strict_mode ? 55.0 : 25.0);
+    const double max_lum = threshold_double(thresholds, "max_brightness", strict_mode ? 225.0 : 242.0);
+    const double max_glare = threshold_double(thresholds, "max_overexposed_fraction", strict_mode ? 0.08 : 0.18);
+    const double max_underexp = threshold_double(thresholds, "max_underexposed_fraction", strict_mode ? 0.15 : 0.35);
+    const double max_label_offset = threshold_double(thresholds, "max_label_roi_offset_norm", 0.08);
 
     const std::optional<double> bare_cx = tr.bare_hand.has_value()
                                               ? std::optional<double>(((*tr.bare_hand)[0] + (*tr.bare_hand)[2]) * 0.5)
@@ -3359,6 +3466,19 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
         if (quality->brightness_mean < min_lum) reasons.push_back("LOW_BRIGHTNESS");
         else if (quality->brightness_mean > max_lum) reasons.push_back("HIGH_BRIGHTNESS");
         if (quality->overexposed_fraction > max_glare) reasons.push_back("OVEREXPOSED");
+        if (quality->underexposed_fraction > max_underexp) reasons.push_back("UNDEREXPOSED");
+    }
+
+    bool label_roi_drift_exceeded = false;
+    if (strict_mode && config_match && tr.target_locked && tr.label_box.has_value()) {
+        const double cal_cx = (rois.label_roi[0] + rois.label_roi[2]) * 0.5;
+        const double cal_cy = (rois.label_roi[1] + rois.label_roi[3]) * 0.5;
+        const double cur_cx = ((*tr.label_box)[0] + (*tr.label_box)[2]) * 0.5;
+        const double cur_cy = ((*tr.label_box)[1] + (*tr.label_box)[3]) * 0.5;
+        if (std::hypot(cur_cx - cal_cx, cur_cy - cal_cy) > max_label_offset) {
+            label_roi_drift_exceeded = true;
+            reasons.push_back("LABEL_ROI_DRIFT_EXCEEDED");
+        }
     }
 
     ContactCandidate tracked{};
@@ -3387,10 +3507,11 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
     const bool quality_ok = quality.has_value() &&
         std::none_of(reasons.begin(), reasons.end(), [](const std::string& r) {
             return r == "LOW_SHARPNESS" || r == "LOW_BRIGHTNESS" ||
-                   r == "HIGH_BRIGHTNESS" || r == "OVEREXPOSED";
+                   r == "HIGH_BRIGHTNESS" || r == "OVEREXPOSED" ||
+                   r == "UNDEREXPOSED";
         });
     bool view_valid = tr.target_locked && quality_ok && config_match && camera_settings_locked &&
-                      !tracked.hand_contact_candidate && !tr.bare_hand_touching_part;
+                      !label_roi_drift_exceeded && !tracked.hand_contact_candidate && !tr.bare_hand_touching_part;
     if (tracked.hand_contact_candidate) {
         reasons.push_back("HAND_IN_CONTACT_ROI");
     }
@@ -3409,10 +3530,15 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
     bool hud_bare_violation = false;
     bool hud_alarm_latched = false;
 
-    // Auto-capture snapshot variables executed outside mutex_
+    // Auto-capture & async burst snapshot variables executed outside mutex_
     bool fire_auto_capture = false;
     AutoCaptureConfig auto_cfg_snapshot{};
     AutoSampleCallback auto_cb;
+    bool trigger_burst = false;
+    std::string burst_cid;
+    std::string burst_reason;
+
+    pre_trigger_ring_.push_if_due(current_frame_id, capture_ts, frame);
 
     {
         std::lock_guard<std::mutex> lk(mutex_);
@@ -3432,18 +3558,41 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
         fps_ = round_to(measured_fps, 1);
         inference_ms_ = cls.infer_ms;
 
-        // Evaluate Skip-Frame Auto-Capture (A3)
+        // Evaluate Skip-Frame Auto-Capture (A3) with optional visual-diff gate (bypassed for unknown_challenge)
         if (auto_capture_.enabled && auto_sample_callback_) {
             if (auto_capture_.captured_count >= auto_capture_.max_samples) {
                 auto_capture_.enabled = false;
             } else if (current_frame_id % std::max(1, auto_capture_.every_n_frames) == 0) {
-                ++auto_capture_.captured_count;
-                if (auto_capture_.captured_count >= auto_capture_.max_samples) {
-                    auto_capture_.enabled = false;
+                bool should_fire = true;
+                cv::Mat cur_small_gray;
+                const bool use_diff_gate =
+                    (auto_capture_.min_diff_mad > 0.0) &&
+                    (auto_capture_.label != "unknown_challenge") &&
+                    !label_crop_for_cls.empty();
+                if (use_diff_gate) {
+                    cv::Mat small_bgr;
+                    cv::resize(label_crop_for_cls, small_bgr, cv::Size(64, 48), 0, 0, cv::INTER_AREA);
+                    cv::cvtColor(small_bgr, cur_small_gray, cv::COLOR_BGR2GRAY);
+                    if (!last_auto_capture_gray_small_.empty() &&
+                        last_auto_capture_gray_small_.size() == cur_small_gray.size()) {
+                        cv::Mat diff;
+                        cv::absdiff(cur_small_gray, last_auto_capture_gray_small_, diff);
+                        const double mad = cv::mean(diff)[0];
+                        should_fire = (mad >= auto_capture_.min_diff_mad);
+                    }
                 }
-                fire_auto_capture = true;
-                auto_cfg_snapshot = auto_capture_;
-                auto_cb = auto_sample_callback_;
+                if (should_fire) {
+                    ++auto_capture_.captured_count;
+                    if (auto_capture_.captured_count >= auto_capture_.max_samples) {
+                        auto_capture_.enabled = false;
+                    }
+                    if (!cur_small_gray.empty()) {
+                        last_auto_capture_gray_small_ = cur_small_gray;
+                    }
+                    fire_auto_capture = true;
+                    auto_cfg_snapshot = auto_capture_;
+                    auto_cb = auto_sample_callback_;
+                }
             }
         }
 
@@ -3480,6 +3629,7 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
             {"show_auxiliary_rois", show_aux_now},
             {"mirror_horizontal", mirror_now},
             {"work_mode", work_mode_now},
+            {"hardware_3a", hardware_3a_status_},
             {"tracked_objects", tr.tracked_objects},
             {"tracked_label_box", (tr.target_locked && tr.label_box.has_value()) ? box_to_json(tr.label_box) : json(nullptr)},
             {"config_version", roi_ver},
@@ -3529,6 +3679,8 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                             fsm_ = InspectionFSM(live_fsm_config());
                             ++cycle_generation_;
                             pass_target_lost_since_.reset();
+                            active_cycle_tube_center_.reset();
+                            active_cycle_pipe_color_.clear();
                             last_emitted_dedup_key_.clear();
                             changed = true;
                         }
@@ -3539,6 +3691,8 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                         changed = true;
                     } else if (fsm_.state() != FSMState::WAIT_PART) {
                         fsm_ = InspectionFSM(live_fsm_config());
+                        active_cycle_tube_center_.reset();
+                        active_cycle_pipe_color_.clear();
                         ++cycle_generation_;
                     }
 
@@ -3561,6 +3715,8 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                 } else {
                     pass_target_lost_since_.reset();
                     if (fsm_.state() == FSMState::WAIT_PART) {
+                        active_cycle_tube_center_.reset();
+                        active_cycle_pipe_color_.clear();
                         FSMEvent nc{};
                         nc.kind = "new_cycle";
                         nc.cycle_id = generate_live_cycle_id();
@@ -3570,49 +3726,100 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                         fsm_.process(nc, fsm_now);
                     }
 
-                    FSMEvent obs_ev{};
-                    obs_ev.kind = "observation";
-                    obs_ev.cycle_id = fsm_.cycle_id();
-                    obs_ev.capture_monotonic_s = capture_ts;
-                    obs_ev.frame_id = current_frame_id;
-                    obs_ev.label_class = cls.label_status;
-                    obs_ev.view_valid = view_valid;
-                    obs_ev.quality_ok = quality_ok;
-                    obs_ev.camera_healthy = true;
-                    obs_ev.camera_settings_locked = camera_settings_locked;
-                    obs_ev.config_match = config_match;
-                    obs_ev.tube_present = tr.target_locked;
-                    obs_ev.label_window_present = tr.target_locked;
-                    obs_ev.label_roi_clear = !tracked.hand_contact_candidate;
-                    obs_ev.hand_occluded = tracked.hand_contact_candidate;
-                    obs_ev.hand_contact_candidate = tracked.hand_contact_candidate;
-                    obs_ev.hand_detection_valid = glove_compliant;
-                    obs_ev.hand_in_contact_roi = tracked.hand_contact_candidate;
-                    obs_ev.hand_in_label_contact_roi = tracked.hand_contact_candidate;
-                    obs_ev.hand_in_left_grip_zone = tracked.hand_contact_candidate ? false : left_active;
-                    obs_ev.hand_in_right_grip_zone = tracked.hand_contact_candidate ? false : right_active;
-                    obs_ev.pipe_color = cls.pipe_color;
-                    obs_ev.operator_anon_id = "OP_STATION_01";
-                    fsm_.process(obs_ev, fsm_now);
-
-                    if (fsm_.state() == FSMState::READY) {
-                        FSMEvent si{};
-                        si.kind = "start_inspection";
-                        si.capture_monotonic_s = capture_ts;
-                        si.frame_id = current_frame_id;
-                        fsm_.process(si, fsm_now);
+                    std::optional<std::pair<double, double>> cur_tube_center;
+                    if (tr.tube_box.has_value()) {
+                        cur_tube_center = std::make_pair(
+                            ((*tr.tube_box)[0] + (*tr.tube_box)[2]) * 0.5,
+                            ((*tr.tube_box)[1] + (*tr.tube_box)[3]) * 0.5
+                        );
                     }
-                    if (fsm_.state() == FSMState::ALARM) {
+                    const FSMState pre_obs_state = fsm_.state();
+                    const bool in_swap_watch =
+                        (pre_obs_state == FSMState::INSPECTING ||
+                         pre_obs_state == FSMState::PROCESSING ||
+                         pre_obs_state == FSMState::VERIFY_C_ABSENT);
+
+                    bool swap_suspected = false;
+                    if (work_mode_now == "strict" && in_swap_watch) {
+                        if ((active_cycle_pipe_color_ == "yellow" || active_cycle_pipe_color_ == "blue") &&
+                            (cls.pipe_color == "yellow" || cls.pipe_color == "blue") &&
+                            cls.pipe_color != active_cycle_pipe_color_) {
+                            swap_suspected = true;
+                        }
+                        if (active_cycle_tube_center_.has_value() && cur_tube_center.has_value()) {
+                            const double jump = std::hypot(
+                                cur_tube_center->first - active_cycle_tube_center_->first,
+                                cur_tube_center->second - active_cycle_tube_center_->second
+                            );
+                            if (jump > 0.25) {
+                                swap_suspected = true;
+                            }
+                        }
+                    }
+
+                    if (swap_suspected) {
                         alarm_latched_ = true;
-                        latched_reason_ = fsm_.result_reason();
-                        latched_cycle_id_ = fsm_.cycle_id();
-                    }
+                        latched_reason_ = "TUBE_SWAP_SUSPECTED";
+                        latched_cycle_id_ = fsm_.cycle_id().value_or(generate_live_cycle_id());
+                        active_fsm_state = "ALARM";
+                        active_outcome = "ALARM";
+                        active_reason = latched_reason_;
+                        active_cycle_id = latched_cycle_id_;
+                        changed = (prev_fsm != "ALARM");
+                    } else {
+                        FSMEvent obs_ev{};
+                        obs_ev.kind = "observation";
+                        obs_ev.cycle_id = fsm_.cycle_id();
+                        obs_ev.capture_monotonic_s = capture_ts;
+                        obs_ev.frame_id = current_frame_id;
+                        obs_ev.label_class = cls.label_status;
+                        obs_ev.view_valid = view_valid;
+                        obs_ev.quality_ok = quality_ok;
+                        obs_ev.camera_healthy = true;
+                        obs_ev.camera_settings_locked = camera_settings_locked;
+                        obs_ev.config_match = config_match;
+                        obs_ev.tube_present = tr.target_locked;
+                        obs_ev.label_window_present = tr.target_locked;
+                        obs_ev.label_roi_clear = !tracked.hand_contact_candidate;
+                        obs_ev.hand_occluded = tracked.hand_contact_candidate;
+                        obs_ev.hand_contact_candidate = tracked.hand_contact_candidate;
+                        obs_ev.hand_detection_valid = glove_compliant;
+                        obs_ev.hand_in_contact_roi = tracked.hand_contact_candidate;
+                        obs_ev.hand_in_label_contact_roi = tracked.hand_contact_candidate;
+                        obs_ev.hand_in_left_grip_zone = tracked.hand_contact_candidate ? false : left_active;
+                        obs_ev.hand_in_right_grip_zone = tracked.hand_contact_candidate ? false : right_active;
+                        obs_ev.pipe_color = cls.pipe_color;
+                        obs_ev.operator_anon_id = "OP_STATION_01";
+                        fsm_.process(obs_ev, fsm_now);
 
-                    active_fsm_state = fsm_.state_str();
-                    active_outcome = fsm_.outcome();
-                    active_reason = fsm_.result_reason();
-                    active_cycle_id = fsm_.cycle_id();
-                    changed = (prev_fsm != active_fsm_state);
+                        if (fsm_.state() == FSMState::READY) {
+                            FSMEvent si{};
+                            si.kind = "start_inspection";
+                            si.capture_monotonic_s = capture_ts;
+                            si.frame_id = current_frame_id;
+                            fsm_.process(si, fsm_now);
+                        }
+                        if (fsm_.state() == FSMState::ALARM) {
+                            alarm_latched_ = true;
+                            latched_reason_ = fsm_.result_reason();
+                            latched_cycle_id_ = fsm_.cycle_id();
+                        } else if (fsm_.state() == FSMState::INSPECTING ||
+                                   fsm_.state() == FSMState::PROCESSING ||
+                                   fsm_.state() == FSMState::VERIFY_C_ABSENT) {
+                            if (cur_tube_center.has_value()) {
+                                active_cycle_tube_center_ = cur_tube_center;
+                            }
+                            if (cls.pipe_color == "yellow" || cls.pipe_color == "blue") {
+                                active_cycle_pipe_color_ = cls.pipe_color;
+                            }
+                        }
+
+                        active_fsm_state = fsm_.state_str();
+                        active_outcome = fsm_.outcome();
+                        active_reason = fsm_.result_reason();
+                        active_cycle_id = fsm_.cycle_id();
+                        changed = (prev_fsm != active_fsm_state);
+                    }
                 }
             }
 
@@ -3684,6 +3891,12 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                     }
                 }
             }
+
+            if (active_outcome == "ALARM" && changed) {
+                trigger_burst = true;
+                burst_cid = active_cycle_id.value_or("LIVE_ALARM");
+                burst_reason = active_reason.value_or("ALARM");
+            }
         } else {
             raw_frame_state_ = state_;
             for (auto it = frame_meta.begin(); it != frame_meta.end(); ++it) {
@@ -3694,6 +3907,15 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
         hud_bare_violation = tr.bare_hand_touching_part ||
                              (latched_reason_.value_or("") == "BARE_HAND_VIOLATION");
         hud_alarm_latched = alarm_latched_;
+    }
+
+    if (trigger_burst) {
+        async_evidence_writer_.enqueue_burst(
+            burst_cid,
+            burst_reason,
+            pre_trigger_ring_.snapshot_ordered(),
+            fsm_now
+        );
     }
 
     // Invoke skip-frame auto-sample callback outside mutex_ so dataset I/O never stalls streams

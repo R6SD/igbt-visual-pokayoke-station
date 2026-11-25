@@ -686,6 +686,7 @@ ReasonExplanationZh explain_reason_zh(
         {"B_COVERED", {"放行通过（B类·标签已遮挡）", "B类遮挡状态连续稳定达标，防呆判定通过"}},
         {"C_REMOVED", {"放行通过（C类·标签已移除满 1.2s）", "接触候选后手部离开且标签连续缺失满 1200 ms，判定通过"}},
         {"BARE_HAND_VIOLATION", {"违规报警：检测到裸手触碰料管！请立即佩戴防静电手套并由工程师复位", "车间严格模式下触发裸手接触料管/标签 SOP 闭锁报警"}},
+        {"TUBE_SWAP_SUSPECTED", {"防呆闭锁：检测到中途疑似掉包或更换料管！请核查后由工程师复位", "活跃检测周期内检出料管颜色突变或质心非连续跳变，触发防掉包闭锁"}},
         {"BARE_HAND_WARNING_NO_GLOVE", {"提示：检测到未佩戴防静电手套，请穿戴合规手套后再持管作业", "视野内检出裸手皮肤区域，尚未触碰料管"}},
         {"INITIAL_LABEL_ABSENT", {"异常闭锁：入位料管缺失初始标签，禁止作业，请呼叫工程师复核", "VERIFY_INITIAL 阶段检出 absent，触发初始缺标报警"}},
         {"INITIAL_LABEL_NOT_COMPLETE", {"异常闭锁：初始标签状态不完整，请核查来料标签后复位", "VERIFY_INITIAL 阶段标签非 complete，触发来料异常报警"}},
