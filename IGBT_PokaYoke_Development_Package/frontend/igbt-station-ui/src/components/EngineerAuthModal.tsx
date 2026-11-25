@@ -76,9 +76,18 @@ function EngineerAuthDialogContent({
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState("")
   const [authConfigured, setAuthConfigured] = useState<boolean | null>(null)
+  const [lockoutSeconds, setLockoutSeconds] = useState(0)
 
   const inputRef = useRef<HTMLInputElement | null>(null)
   const unmountedRef = useRef(false)
+
+  useEffect(() => {
+    if (lockoutSeconds <= 0) return
+    const timer = window.setInterval(() => {
+      setLockoutSeconds((prev) => (prev <= 1 ? 0 : prev - 1))
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [lockoutSeconds])
 
   useEffect(() => {
     authenticatedRef.current = false
@@ -106,6 +115,9 @@ function EngineerAuthDialogContent({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (lockoutSeconds > 0) {
+      return
+    }
     const trimmed = passcode.trim()
     if (!trimmed) {
       setError("请输入口令")
@@ -154,6 +166,16 @@ function EngineerAuthDialogContent({
       if (controller.signal.aborted) return
 
       if (!response.ok) {
+        if (response.status === 429) {
+          const retryHeader = Number(response.headers.get("Retry-After"))
+          const waitSec =
+            Number.isFinite(retryHeader) && retryHeader > 0
+              ? Math.ceil(retryHeader)
+              : 60
+          setLockoutSeconds(waitSec)
+          setError("")
+          return
+        }
         const detail = typeof data.detail === "string" && data.detail ? data.detail : "口令错误"
         setError(detail)
         window.requestAnimationFrame(() => {
@@ -197,6 +219,11 @@ function EngineerAuthDialogContent({
       }
     }
   }
+
+  const activeError =
+    lockoutSeconds > 0
+      ? `尝试次数过多，请等待 ${lockoutSeconds} 秒后重试`
+      : error
 
   return (
     <Dialog.Portal>
@@ -253,8 +280,8 @@ function EngineerAuthDialogContent({
                 }}
                 autoComplete="current-password"
                 placeholder="输入口令"
-                aria-invalid={error ? "true" : "false"}
-                aria-describedby={error ? "engineer-auth-error" : undefined}
+                aria-invalid={activeError ? "true" : "false"}
+                aria-describedby={activeError ? "engineer-auth-error" : undefined}
                 disabled={submitting}
               />
               <button
@@ -269,10 +296,10 @@ function EngineerAuthDialogContent({
             </div>
           </div>
 
-          {error && (
+          {activeError && (
             <div id="engineer-auth-error" className="auth-error" role="alert">
               <AlertCircle size={16} aria-hidden="true" />
-              <span>{error}</span>
+              <span>{activeError}</span>
             </div>
           )}
 
@@ -280,8 +307,16 @@ function EngineerAuthDialogContent({
             <button type="button" className="btn ghost" onClick={onCancel}>
               取消
             </button>
-            <button type="submit" className="btn" disabled={submitting}>
-              {submitting ? "验证中…" : "登录"}
+            <button
+              type="submit"
+              className="btn"
+              disabled={submitting || lockoutSeconds > 0}
+            >
+              {submitting
+                ? "验证中…"
+                : lockoutSeconds > 0
+                  ? `锁定中 (${lockoutSeconds}s)`
+                  : "登录"}
             </button>
           </div>
         </form>

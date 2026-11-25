@@ -1761,6 +1761,20 @@ function LiveStudioWorkspace({
   const [label, setLabel] = useState("complete")
   const [submitting, setSubmitting] = useState(false)
 
+  // 硬件光学 3A 与防反光控制
+  const [opticsBusy, setOpticsBusy] = useState(false)
+  const [draftOptics, setDraftOptics] = useState<{ exposure?: number; gain?: number; focus?: number }>({})
+  const opticsCommitTimerRef = useRef<number | null>(null)
+  const opticsPendingPatchRef = useRef<{ exposure?: number; gain?: number; focus?: number }>({})
+
+  useEffect(() => {
+    return () => {
+      if (opticsCommitTimerRef.current !== null) {
+        window.clearTimeout(opticsCommitTimerRef.current)
+      }
+    }
+  }, [])
+
   const recentSamplesRef = useRef<Data[]>([])
   useEffect(() => {
     recentSamplesRef.current = Array.isArray(datasetSummary.recent_samples) ? datasetSummary.recent_samples : []
@@ -2187,6 +2201,86 @@ function LiveStudioWorkspace({
     })
   }
 
+  const submitOpticsPatch = useCallback(
+    async (patch: Record<string, unknown>, quiet = false) => {
+      if (!token) {
+        flash("请先解锁工程师权限")
+        return
+      }
+      setOpticsBusy(true)
+      try {
+        await api<Data>(
+          "/api/camera/optics",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(patch),
+          },
+          token
+        )
+        if (!quiet) flash("光学参数已应用并锁定")
+        await onRefresh()
+      } catch (err) {
+        flash(`光学参数设置失败：${err instanceof Error ? err.message : err}`)
+      } finally {
+        setOpticsBusy(false)
+      }
+    },
+    [token, flash, onRefresh]
+  )
+
+  const queueOpticsSliderPatch = useCallback(
+    (key: "exposure" | "gain" | "focus", val: number) => {
+      setDraftOptics((prev) => ({ ...prev, [key]: val }))
+      opticsPendingPatchRef.current = { ...opticsPendingPatchRef.current, [key]: val }
+      if (opticsCommitTimerRef.current !== null) {
+        window.clearTimeout(opticsCommitTimerRef.current)
+      }
+      opticsCommitTimerRef.current = window.setTimeout(() => {
+        const pending = { ...opticsPendingPatchRef.current }
+        opticsPendingPatchRef.current = {}
+        opticsCommitTimerRef.current = null
+        if (Object.keys(pending).length > 0) {
+          void submitOpticsPatch({ ...pending, lock_3a: true }, true).finally(() => {
+            setDraftOptics({})
+          })
+        }
+      }, 180)
+    },
+    [submitOpticsPatch]
+  )
+
+  const flushOpticsSliderPatch = useCallback(() => {
+    if (opticsCommitTimerRef.current !== null) {
+      window.clearTimeout(opticsCommitTimerRef.current)
+      opticsCommitTimerRef.current = null
+    }
+    const pending = { ...opticsPendingPatchRef.current }
+    opticsPendingPatchRef.current = {}
+    if (Object.keys(pending).length > 0) {
+      void submitOpticsPatch({ ...pending, lock_3a: true }, true).finally(() => {
+        setDraftOptics({})
+      })
+    }
+  }, [submitOpticsPatch])
+
+  const handleAutoCalibrate = useCallback(async () => {
+    if (!token) {
+      flash("请先解锁工程师权限")
+      return
+    }
+    setOpticsBusy(true)
+    try {
+      await api<Data>("/api/camera/optics/auto_calibrate", { method: "POST" }, token)
+      flash("已启动闭环防反光校准…")
+      await onRefresh()
+    } catch (err) {
+      flash(`启动防反光校准失败：${err instanceof Error ? err.message : err}`)
+    } finally {
+      setOpticsBusy(false)
+    }
+  }, [token, flash, onRefresh])
+
   const submitManualEvidence = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!file) return flash("请选择图片")
@@ -2531,6 +2625,163 @@ function LiveStudioWorkspace({
                     maxBrightness={config.thresholds?.max_brightness}
                     viewValid={state.view_valid}
                   />
+                  {(() => {
+                    const optics: Data =
+                      state.camera_optics && typeof state.camera_optics === "object" ? state.camera_optics : {}
+                    const hw3a: Data =
+                      state.hardware_3a && typeof state.hardware_3a === "object" ? state.hardware_3a : {}
+                    const autoCalibrating = Boolean(optics.auto_calibrating ?? hw3a.auto_calibrating)
+                    const lock3a = optics.lock_3a !== false
+                    const backlightOff = Number(optics.backlight_comp ?? 0) === 0
+                    const liveExp =
+                      typeof hw3a.exposure?.value === "number"
+                        ? Number(hw3a.exposure.value)
+                        : Number(optics.exposure ?? -7)
+                    const liveGain =
+                      typeof hw3a.gain?.value === "number"
+                        ? Number(hw3a.gain.value)
+                        : Number(optics.gain ?? 0)
+                    const liveFocusRaw =
+                      typeof hw3a.focus?.value === "number"
+                        ? Number(hw3a.focus.value)
+                        : Number(optics.focus ?? 35)
+                    const liveFocus = liveFocusRaw >= 0 ? liveFocusRaw : 35
+                    const expVal =
+                      draftOptics.exposure ??
+                      (Number.isFinite(Number(optics.exposure)) ? Number(optics.exposure) : liveExp)
+                    const gainVal =
+                      draftOptics.gain ??
+                      (Number.isFinite(Number(optics.gain)) ? Number(optics.gain) : liveGain)
+                    const focusVal =
+                      draftOptics.focus ??
+                      (Number.isFinite(Number(optics.focus)) && Number(optics.focus) >= 0
+                        ? Number(optics.focus)
+                        : liveFocus)
+                    return (
+                      <div className="optics-panel">
+                        <div className="optics-meta">
+                          <span className="mono">
+                            {`曝光 ${liveExp.toFixed(0)} EV · 增益 ${liveGain.toFixed(0)} · 焦距 ${liveFocus.toFixed(0)}`}
+                          </span>
+                          <span className={`tag ${autoCalibrating ? "warn" : lock3a ? "pass" : "plain"}`}>
+                            {autoCalibrating ? "校准中…" : lock3a ? "已锁 3A" : "自动 3A"}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          className="btn sm block"
+                          disabled={opticsBusy || autoCalibrating}
+                          onClick={() => void handleAutoCalibrate()}
+                        >
+                          <Sparkles size={16} aria-hidden="true" />
+                          {autoCalibrating ? "防反光校准中…" : "一键防反光校准"}
+                        </button>
+                        <details className="optics-details">
+                          <summary>
+                            <span>硬件 3A 参数微调</span>
+                            <span>{lock3a ? "手动锁定" : "自动模式"}</span>
+                          </summary>
+                          <div className="optics-details-body">
+                            <div className="toggle-row">
+                              <div className="toggle-copy">
+                                <b>手动锁死 3A</b>
+                              </div>
+                              <button
+                                type="button"
+                                role="switch"
+                                aria-checked={lock3a}
+                                aria-label="手动锁死 3A 开关"
+                                disabled={opticsBusy}
+                                className={`studio-switch ${lock3a ? "on" : ""}`}
+                                onClick={() => void submitOpticsPatch({ lock_3a: !lock3a })}
+                              >
+                                <span className="studio-switch-thumb" />
+                              </button>
+                            </div>
+                            <div className="toggle-row">
+                              <div className="toggle-copy">
+                                <b>关闭背光补偿</b>
+                              </div>
+                              <button
+                                type="button"
+                                role="switch"
+                                aria-checked={backlightOff}
+                                aria-label="关闭背光补偿开关"
+                                disabled={opticsBusy}
+                                className={`studio-switch ${backlightOff ? "on" : ""}`}
+                                onClick={() =>
+                                  void submitOpticsPatch({ backlight_comp: backlightOff ? 1 : 0 })
+                                }
+                              >
+                                <span className="studio-switch-thumb" />
+                              </button>
+                            </div>
+                            {lock3a && (
+                              <div className="optics-sliders">
+                                <div className="optics-slider-row">
+                                  <div className="optics-slider-head">
+                                    <label htmlFor="optics-exposure">曝光 (EV)</label>
+                                    <span className="mono">{expVal.toFixed(0)}</span>
+                                  </div>
+                                  <input
+                                    id="optics-exposure"
+                                    type="range"
+                                    min={-11}
+                                    max={-2}
+                                    step={1}
+                                    value={Math.max(-11, Math.min(-2, Math.round(expVal)))}
+                                    className="optics-range"
+                                    onChange={(e) => queueOpticsSliderPatch("exposure", Number(e.target.value))}
+                                    onPointerUp={flushOpticsSliderPatch}
+                                    onKeyUp={flushOpticsSliderPatch}
+                                    onBlur={flushOpticsSliderPatch}
+                                  />
+                                </div>
+                                <div className="optics-slider-row">
+                                  <div className="optics-slider-head">
+                                    <label htmlFor="optics-gain">增益</label>
+                                    <span className="mono">{gainVal.toFixed(0)}</span>
+                                  </div>
+                                  <input
+                                    id="optics-gain"
+                                    type="range"
+                                    min={0}
+                                    max={255}
+                                    step={8}
+                                    value={Math.max(0, Math.min(255, Math.round(gainVal)))}
+                                    className="optics-range"
+                                    onChange={(e) => queueOpticsSliderPatch("gain", Number(e.target.value))}
+                                    onPointerUp={flushOpticsSliderPatch}
+                                    onKeyUp={flushOpticsSliderPatch}
+                                    onBlur={flushOpticsSliderPatch}
+                                  />
+                                </div>
+                                <div className="optics-slider-row">
+                                  <div className="optics-slider-head">
+                                    <label htmlFor="optics-focus">焦距</label>
+                                    <span className="mono">{focusVal.toFixed(0)}</span>
+                                  </div>
+                                  <input
+                                    id="optics-focus"
+                                    type="range"
+                                    min={0}
+                                    max={255}
+                                    step={5}
+                                    value={Math.max(0, Math.min(255, Math.round(focusVal)))}
+                                    className="optics-range"
+                                    onChange={(e) => queueOpticsSliderPatch("focus", Number(e.target.value))}
+                                    onPointerUp={flushOpticsSliderPatch}
+                                    onKeyUp={flushOpticsSliderPatch}
+                                    onBlur={flushOpticsSliderPatch}
+                                  />
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </details>
+                      </div>
+                    )
+                  })()}
                 </section>
 
                 <section className="inspector-section">

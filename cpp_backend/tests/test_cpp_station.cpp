@@ -986,6 +986,407 @@ void test_skip_frame_storage_and_diff_gate() {
     REQUIRE_EQ(rem[0].value("kind", ""), "anomaly");
 }
 
+// ----------------------------------------------------------------------------
+// Test 7: v4.2.0 Hardening (bursts/ FIFO Quota, 429 Retry-After, /api/diagnostics/runtime,
+//         Bare-Hand Zone & 3-Frame Debounce, Post-Trigger Burst Flush)
+// ----------------------------------------------------------------------------
+void test_v42_hardening_and_diagnostics() {
+    ScopedTempDir tmp;
+    StationDatabase db(tmp.path());
+
+    // 7A. Orphan bursts/ directories are FIFO-pruned by enforce_evidence_quota
+    const auto bursts_root = db.evidence_root() / "bursts";
+    const auto old_dir = bursts_root / "CYC_BURST_01_OLD";
+    const auto new_dir = bursts_root / "CYC_BURST_02_NEW";
+    std::filesystem::create_directories(old_dir);
+
+    const std::vector<uint8_t> payload(2048, static_cast<uint8_t>('B'));
+    const auto old_file = old_dir / "frame_001.jpg";
+    REQUIRE(write_file_bytes_atomic(old_file, payload.data(), payload.size()));
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+    std::filesystem::create_directories(new_dir);
+    const auto new_file = new_dir / "frame_001.jpg";
+    REQUIRE(write_file_bytes_atomic(new_file, payload.data(), payload.size()));
+
+    json quota_res = db.enforce_evidence_quota(2500, 0.0);
+    REQUIRE_EQ(quota_res.value("deleted_burst_dirs", 0), 1);
+    REQUIRE(!std::filesystem::exists(old_dir));
+    REQUIRE(std::filesystem::exists(new_dir));
+
+    // 7B. GET /api/diagnostics/runtime & 429 Retry-After: 60 header
+    const auto web_dir = tmp.path() / "web_dist";
+    std::filesystem::create_directories(web_dir);
+    const std::string html = "<!doctype html><html><body>v4.2 OK</body></html>";
+    REQUIRE(write_file_bytes_atomic(web_dir / "index.html", html.data(), html.size()));
+
+    LiveCameraEngine cam_srv(0);
+    TrainingManager training(tmp.path());
+    StationServerOptions opts;
+    opts.host = "127.0.0.1";
+    opts.port = 0;
+    opts.data_dir = tmp.path();
+    opts.web_dist_dir = web_dir;
+    opts.enable_live_camera = false;
+
+    StationHttpServer server(db, cam_srv, training, opts);
+    server.auth().set_env_override("IGBT_ENGINEER_PIN", "314159");
+    server.auth().set_lockout_policy(2, 60.0);
+    const int port = server.start_background();
+    REQUIRE(port > 0);
+
+    httplib::Client cli("127.0.0.1", port);
+    auto diag_res = cli.Get("/api/diagnostics/runtime");
+    REQUIRE(diag_res != nullptr);
+    REQUIRE_EQ(diag_res->status, 200);
+    json diag_j = json::parse(diag_res->body);
+    REQUIRE(diag_j.contains("async_evidence") && diag_j["async_evidence"].is_object());
+    REQUIRE(diag_j.contains("db_pragmas") && diag_j["db_pragmas"].is_object());
+    REQUIRE_EQ(diag_j["db_pragmas"].value("synchronous", 0), 2);
+    REQUIRE_EQ(diag_j["db_pragmas"].value("journal_mode", ""), "wal");
+    REQUIRE(diag_j.contains("hardware_3a") && diag_j["hardware_3a"].is_object());
+
+    auto auth_fail1 = cli.Post("/api/auth/verify", R"({"passcode":"000000"})", "application/json");
+    REQUIRE(auth_fail1 != nullptr);
+    REQUIRE_EQ(auth_fail1->status, 401);
+
+    auto auth_fail2 = cli.Post("/api/auth/verify", R"({"passcode":"000000"})", "application/json");
+    REQUIRE(auth_fail2 != nullptr);
+    REQUIRE_EQ(auth_fail2->status, 429);
+    REQUIRE(auth_fail2->has_header("Retry-After"));
+    REQUIRE_EQ(auth_fail2->get_header_value("Retry-After"), "60");
+    server.stop();
+
+    // 7C. Bare-hand work-zone filter (cy < 0.22 ignored) & 3-frame streak debounce + Post-trigger burst
+    auto make_empty_bg = []() {
+        cv::Mat bg(kDefaultCameraHeight, kDefaultCameraWidth, CV_8UC3, cv::Scalar(48, 52, 56));
+        for (int y = 0; y < bg.rows; y += 8) {
+            cv::line(bg, cv::Point(0, y), cv::Point(bg.cols, y), cv::Scalar(58, 62, 66), 1);
+        }
+        return bg;
+    };
+    auto make_tube_scene = [&](bool top_skin, bool bare_hand_on_tube) {
+        cv::Mat img = make_empty_bg();
+        // Continuous bright yellow tube (`>= 0.29` contiguous span) + high-contrast white label
+        const cv::Rect tube_r(
+            static_cast<int>(0.15 * kDefaultCameraWidth),
+            static_cast<int>(0.44 * kDefaultCameraHeight),
+            static_cast<int>(0.70 * kDefaultCameraWidth),
+            static_cast<int>(0.12 * kDefaultCameraHeight)
+        );
+        cv::rectangle(img, tube_r, cv::Scalar(35, 195, 235), cv::FILLED);
+        cv::rectangle(img, tube_r, cv::Scalar(20, 120, 165), 4);
+
+        const cv::Rect lbl_r(
+            static_cast<int>(0.43 * kDefaultCameraWidth),
+            static_cast<int>(0.44 * kDefaultCameraHeight),
+            static_cast<int>(0.14 * kDefaultCameraWidth),
+            static_cast<int>(0.12 * kDefaultCameraHeight)
+        );
+        cv::rectangle(img, lbl_r, cv::Scalar(242, 244, 246), cv::FILLED);
+        cv::rectangle(img, lbl_r, cv::Scalar(40, 42, 45), 4);
+        cv::rectangle(
+            img,
+            cv::Rect(lbl_r.x + 28, lbl_r.y + 18, lbl_r.width - 56, lbl_r.height - 36),
+            cv::Scalar(50, 52, 55),
+            3
+        );
+
+        if (top_skin) {
+            cv::rectangle(
+                img,
+                cv::Rect(static_cast<int>(0.18 * kDefaultCameraWidth), 12, static_cast<int>(0.11 * kDefaultCameraWidth), 115),
+                cv::Scalar(115, 150, 215),
+                cv::FILLED
+            );
+        }
+        if (bare_hand_on_tube) {
+            cv::rectangle(
+                img,
+                cv::Rect(
+                    static_cast<int>(0.18 * kDefaultCameraWidth),
+                    static_cast<int>(0.38 * kDefaultCameraHeight),
+                    static_cast<int>(0.12 * kDefaultCameraWidth),
+                    static_cast<int>(0.36 * kDefaultCameraHeight)
+                ),
+                cv::Scalar(115, 150, 215),
+                cv::FILLED
+            );
+        }
+        return img;
+    };
+    const cv::Mat empty_bg = make_empty_bg();
+
+    LiveCameraEngine cam(0);
+    const auto cam_ev_dir = tmp.path() / "cam_ev";
+    cam.set_evidence_root(cam_ev_dir);
+    double ts = 1.0;
+    for (int i = 0; i < 4; ++i) {
+        ts += 0.04;
+        REQUIRE(cam.process_injected_frame(empty_bg, ts));
+    }
+
+    // Warm skin-colored box outside work-zone (cy < 0.22) must NOT trigger BARE_HAND_VIOLATION
+    const cv::Mat f_top_skin = make_tube_scene(true, false);
+    for (int i = 0; i < 5; ++i) {
+        ts += 0.04;
+        REQUIRE(cam.process_injected_frame(f_top_skin, ts));
+        const json st = cam.get_state_json();
+        REQUIRE_EQ(st.value("bare_hand_violation", true), false);
+        REQUIRE_EQ(st.value("alarm_latched", true), false);
+    }
+
+    // In-work-zone bare skin touching tube requires 3 consecutive frames before latching ALARM
+    const cv::Mat f_bare = make_tube_scene(false, true);
+    ts += 0.04;
+    REQUIRE(cam.process_injected_frame(f_bare, ts));
+    REQUIRE_EQ(cam.get_state_json().value("alarm_latched", true), false);
+
+    ts += 0.04;
+    REQUIRE(cam.process_injected_frame(f_bare, ts));
+    REQUIRE_EQ(cam.get_state_json().value("alarm_latched", true), false);
+
+    ts += 0.04;
+    REQUIRE(cam.process_injected_frame(f_bare, ts));
+    {
+        const json st3 = cam.get_state_json();
+        REQUIRE_EQ(st3.value("alarm_latched", false), true);
+        REQUIRE_EQ(st3.value("bare_hand_violation", false), true);
+        REQUIRE_EQ(st3.value("result_reason", ""), "BARE_HAND_VIOLATION");
+    }
+
+    // Feed 52 more frames so all 10 post-trigger 5-FPS frames finish and flush cleanly
+    for (int i = 0; i < 52; ++i) {
+        ts += 0.04;
+        REQUIRE(cam.process_injected_frame(f_bare, ts));
+    }
+    cam.stop_async_writer();
+    {
+        const json stats = cam.async_evidence_stats();
+        const json writer = stats.value("writer", json::object());
+        REQUIRE(writer.value("written_bursts", uint64_t{0}) >= 1);
+        REQUIRE(writer.value("written_frames", uint64_t{0}) >= 10);
+    }
+
+    // 7D. Stopping engine mid-burst still flushes pending post-trigger frames safely
+    LiveCameraEngine cam_early(0);
+    const auto early_ev_dir = tmp.path() / "cam_ev_early";
+    cam_early.set_evidence_root(early_ev_dir);
+    double ets = 10.0;
+    for (int i = 0; i < 4; ++i) {
+        ets += 0.04;
+        REQUIRE(cam_early.process_injected_frame(empty_bg, ets));
+    }
+    const cv::Mat f_tube_clean = make_tube_scene(false, false);
+    for (int i = 0; i < 2; ++i) {
+        ets += 0.04;
+        REQUIRE(cam_early.process_injected_frame(f_tube_clean, ets));
+    }
+    for (int i = 0; i < 3; ++i) {
+        ets += 0.04;
+        REQUIRE(cam_early.process_injected_frame(f_bare, ets));
+    }
+    REQUIRE_EQ(cam_early.get_state_json().value("alarm_latched", false), true);
+    cam_early.stop();
+    cam_early.stop_async_writer();
+    REQUIRE(cam_early.async_evidence_stats().value("writer", json::object()).value("written_bursts", uint64_t{0}) >= 1);
+}
+
+// ----------------------------------------------------------------------------
+// Test 8: Camera Optics Persistence, Closed-Loop Anti-Glare Stepper & Specular Resistance
+// ----------------------------------------------------------------------------
+void test_camera_optics_and_anti_glare() {
+    ScopedTempDir tmp;
+
+    // 8A. SQLite camera_optics defaults, clamping & validation
+    {
+        StationDatabase db(tmp.path());
+        const json def_opt = db.get_camera_optics();
+        REQUIRE_EQ(def_opt.value("lock_3a", false), true);
+        REQUIRE_EQ(def_opt.value("calibrated", true), false);
+        REQUIRE(std::abs(def_opt.value("exposure", 0.0) - (-7.0)) < 1e-6);
+
+        bool rejected_extra = false;
+        try {
+            db.save_camera_optics(json{{"unknown_knob", 1}}, "tester");
+        } catch (const DatabaseHttpError& err) {
+            REQUIRE_EQ(err.status_code(), 422);
+            rejected_extra = true;
+        }
+        REQUIRE(rejected_extra);
+
+        const json saved = db.save_camera_optics(
+            json{{"lock_3a", true}, {"exposure", -20.0}, {"gain", 999.0}, {"focus", 42}, {"backlight_comp", 0}},
+            "eng-op"
+        );
+        REQUIRE(std::abs(saved.value("exposure", 0.0) - (-13.0)) < 1e-6);
+        REQUIRE(std::abs(saved.value("gain", 0.0) - 255.0) < 1e-6);
+        REQUIRE_EQ(saved.value("focus", -1), 42);
+        REQUIRE_EQ(saved.value("calibrated", false), true);
+        REQUIRE_EQ(saved.value("changed_by", ""), "eng-op");
+    }
+
+    // Reopen DB and verify optics persisted across restarts
+    StationDatabase db(tmp.path());
+    {
+        const json reloaded = db.get_camera_optics();
+        REQUIRE(std::abs(reloaded.value("exposure", 0.0) - (-13.0)) < 1e-6);
+        REQUIRE_EQ(reloaded.value("focus", -1), 42);
+        REQUIRE_EQ(reloaded.value("calibrated", false), true);
+    }
+
+    // 8B. HTTP /api/camera/optics & /api/camera/optics/auto_calibrate & /api/diagnostics/runtime
+    const auto web_dir = tmp.path() / "web_dist";
+    std::filesystem::create_directories(web_dir);
+    const std::string html = "<!doctype html><html><body>optics OK</body></html>";
+    REQUIRE(write_file_bytes_atomic(web_dir / "index.html", html.data(), html.size()));
+
+    LiveCameraEngine cam_srv(0);
+    TrainingManager training(tmp.path());
+    StationServerOptions opts;
+    opts.host = "127.0.0.1";
+    opts.port = 0;
+    opts.data_dir = tmp.path();
+    opts.web_dist_dir = web_dir;
+    opts.enable_live_camera = false;
+
+    StationHttpServer server(db, cam_srv, training, opts);
+    server.auth().set_env_override("IGBT_ADMIN_TOKEN", "optics-admin-secret");
+    const int port = server.start_background();
+    REQUIRE(port > 0);
+
+    httplib::Client cli("127.0.0.1", port);
+    {
+        auto g = cli.Get("/api/camera/optics");
+        REQUIRE(g != nullptr);
+        REQUIRE_EQ(g->status, 200);
+        const json gj = json::parse(g->body);
+        REQUIRE_EQ(gj.value("focus", -1), 42);
+        REQUIRE_EQ(gj.value("calibrated", false), true);
+    }
+    {
+        auto unauth = cli.Post("/api/camera/optics", R"({"exposure":-8})", "application/json");
+        REQUIRE(unauth != nullptr);
+        REQUIRE_EQ(unauth->status, 401);
+    }
+    {
+        httplib::Headers hdr{{"X-Admin-Token", "optics-admin-secret"}};
+        auto bad = cli.Post("/api/camera/optics", hdr, R"({"bogus":1})", "application/json");
+        REQUIRE(bad != nullptr);
+        REQUIRE_EQ(bad->status, 422);
+
+        auto ok = cli.Post(
+            "/api/camera/optics",
+            hdr,
+            R"({"lock_3a":true,"exposure":-8,"gain":16,"focus":38,"backlight_comp":0})",
+            "application/json"
+        );
+        REQUIRE(ok != nullptr);
+        REQUIRE_EQ(ok->status, 200);
+        const json okj = json::parse(ok->body);
+        REQUIRE(std::abs(okj.value("exposure", 0.0) - (-8.0)) < 1e-6);
+        REQUIRE(std::abs(okj.value("gain", 0.0) - 16.0) < 1e-6);
+        REQUIRE_EQ(okj.value("focus", -1), 38);
+
+        auto cal = cli.Post("/api/camera/optics/auto_calibrate", hdr, "", "application/json");
+        REQUIRE(cal != nullptr);
+        REQUIRE_EQ(cal->status, 200);
+        const json calj = json::parse(cal->body);
+        REQUIRE_EQ(calj.value("triggered", false), true);
+        REQUIRE_EQ(calj["optics"].value("auto_calibrating", false), true);
+
+        auto diag = cli.Get("/api/diagnostics/runtime");
+        REQUIRE(diag != nullptr);
+        REQUIRE_EQ(diag->status, 200);
+        const json dj = json::parse(diag->body);
+        REQUIRE(dj.contains("camera_optics") && dj["camera_optics"].is_object());
+        REQUIRE_EQ(dj["camera_optics"].value("auto_calibrating", false), true);
+    }
+    server.stop();
+
+    // 8C. Closed-loop anti-glare stepper determinism (highlight-protected)
+    {
+        const auto blown = LiveCameraEngine::next_anti_glare_step(-6.0, 0.0, 245.0, 0.85, 255.0);
+        REQUIRE(!blown.converged);
+        REQUIRE(blown.next_exposure < -6.0);
+
+        const auto clipped_mid = LiveCameraEngine::next_anti_glare_step(-5.0, 0.0, 110.0, 0.04, 248.0);
+        REQUIRE(!clipped_mid.converged);
+        REQUIRE(clipped_mid.next_exposure < -5.0);
+
+        const auto dim_cap = LiveCameraEngine::next_anti_glare_step(-5.0, 0.0, 50.0, 0.0, 195.0);
+        REQUIRE(dim_cap.converged);
+        REQUIRE(std::abs(dim_cap.next_exposure - (-5.0)) < 1e-6);
+        REQUIRE(std::abs(dim_cap.next_gain - 0.0) < 1e-6);
+
+        const auto dim = LiveCameraEngine::next_anti_glare_step(-8.0, 0.0, 45.0, 0.0, 90.0);
+        REQUIRE(!dim.converged);
+        REQUIRE(dim.next_exposure > -8.0);
+
+        const auto good = LiveCameraEngine::next_anti_glare_step(-6.0, 0.0, 115.0, 0.005, 195.0);
+        REQUIRE(good.converged);
+    }
+
+    // 8D. Specular glare resistance: pure white glare strips must NOT spoof ESD glove or complete label,
+    //     while measure_label_quality() continues flagging OVEREXPOSED accurately.
+    LiveCameraEngine cam_spec(0);
+    cam_spec.set_work_mode("debug");
+    cv::Mat dark_bg(kDefaultCameraHeight, kDefaultCameraWidth, CV_8UC3, cv::Scalar(42, 46, 50));
+    double ts = 20.0;
+    for (int i = 0; i < 4; ++i) {
+        ts += 0.04;
+        REQUIRE(cam_spec.process_injected_frame(dark_bg, ts));
+    }
+
+    cv::Mat glare_scene = dark_bg.clone();
+    // Dark empty tube with NO label + clipped pure-white BGR(255,255,255) specular glare strips
+    cv::rectangle(
+        glare_scene,
+        cv::Rect(
+            static_cast<int>(0.18 * kDefaultCameraWidth),
+            static_cast<int>(0.44 * kDefaultCameraHeight),
+            static_cast<int>(0.64 * kDefaultCameraWidth),
+            static_cast<int>(0.12 * kDefaultCameraHeight)
+        ),
+        cv::Scalar(30, 120, 145),
+        cv::FILLED
+    );
+    cv::rectangle(
+        glare_scene,
+        cv::Rect(
+            static_cast<int>(0.43 * kDefaultCameraWidth),
+            static_cast<int>(0.46 * kDefaultCameraHeight),
+            static_cast<int>(0.14 * kDefaultCameraWidth),
+            static_cast<int>(0.07 * kDefaultCameraHeight)
+        ),
+        cv::Scalar(255, 255, 255),
+        cv::FILLED
+    );
+    cv::rectangle(
+        glare_scene,
+        cv::Rect(
+            static_cast<int>(0.21 * kDefaultCameraWidth),
+            static_cast<int>(0.42 * kDefaultCameraHeight),
+            static_cast<int>(0.09 * kDefaultCameraWidth),
+            static_cast<int>(0.24 * kDefaultCameraHeight)
+        ),
+        cv::Scalar(255, 255, 255),
+        cv::FILLED
+    );
+
+    for (int i = 0; i < 3; ++i) {
+        ts += 0.04;
+        REQUIRE(cam_spec.process_injected_frame(glare_scene, ts));
+    }
+    const json st_spec = cam_spec.get_state_json();
+    REQUIRE_EQ(st_spec.value("glove_compliant", true), false);
+    REQUIRE(st_spec.value("label_status", "") != "complete");
+
+    const auto q = measure_label_quality(glare_scene, Box{0.42, 0.44, 0.58, 0.56});
+    REQUIRE(q.has_value());
+    REQUIRE(q->overexposed_fraction > 0.08);
+}
+
 }  // namespace
 
 int main() {
@@ -1002,6 +1403,8 @@ int main() {
         {"4. HTTP Loopback Server, Zero-Default Auth, Skip-Frame Auto-Capture, ANN_MLP/ONNX & MJPEG", test_http_server_auth_autocapture_training_and_mjpeg},
         {"5. Wave 1 & Wave 2 Hardening (Strict Default, Auth Rate Limit, SQLite FULL, HAL)", test_wave1_wave2_hardening},
         {"6. Skip-Frame Ring Buffer, Async Burst Writer, Diff-Gated Capture & Evidence Quota", test_skip_frame_storage_and_diff_gate},
+        {"7. v4.2.0 Hardening (bursts/ Quota, 429 Retry-After, /api/diagnostics/runtime, Debounce & Post-Burst)", test_v42_hardening_and_diagnostics},
+        {"8. Hardware Camera Optics Persistence, Anti-Glare Stepper & Specular Resistance", test_camera_optics_and_anti_glare},
     };
 
     int passed = 0;

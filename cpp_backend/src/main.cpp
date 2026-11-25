@@ -1,17 +1,107 @@
 #include "igbt/http_server.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#include <dbghelp.h>
+#endif
 
 namespace {
 
 std::atomic<bool> g_shutdown_requested{false};
+#ifdef _WIN32
+wchar_t g_dump_dir_w[1024] = {0};
+
+void prune_old_dumps(const std::filesystem::path& dumps_dir) {
+    struct DumpFile {
+        std::filesystem::file_time_type mtime{};
+        std::filesystem::path path;
+    };
+    std::vector<DumpFile> files;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(dumps_dir, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code fec;
+        if (!it->is_regular_file(fec)) continue;
+        if (it->path().extension() != L".dmp") continue;
+        files.push_back(DumpFile{it->last_write_time(fec), it->path()});
+    }
+    if (files.size() <= 5) return;
+    std::sort(files.begin(), files.end(), [](const DumpFile& a, const DumpFile& b) {
+        return a.mtime > b.mtime;
+    });
+    for (std::size_t i = 5; i < files.size(); ++i) {
+        std::error_code rme;
+        std::filesystem::remove(files[i].path, rme);
+    }
+}
+
+LONG WINAPI unhandled_exception_filter(EXCEPTION_POINTERS* exc_info) {
+    if (g_dump_dir_w[0] != L'\0') {
+        FILETIME ft{};
+        GetSystemTimeAsFileTime(&ft);
+        ULARGE_INTEGER uli{};
+        uli.LowPart = ft.dwLowDateTime;
+        uli.HighPart = ft.dwHighDateTime;
+        // Convert Windows 100ns FILETIME ticks (since 1601) to Unix epoch milliseconds
+        const unsigned long long epoch_ms =
+            (uli.QuadPart >= 116444736000000000ULL)
+                ? ((uli.QuadPart - 116444736000000000ULL) / 10000ULL)
+                : 0ULL;
+
+        wchar_t dump_path[1280] = {0};
+        std::swprintf(
+            dump_path,
+            sizeof(dump_path) / sizeof(dump_path[0]),
+            L"%ls\\crash_%lu_%llu.dmp",
+            g_dump_dir_w,
+            static_cast<unsigned long>(GetCurrentProcessId()),
+            epoch_ms
+        );
+
+        HANDLE hFile = CreateFileW(
+            dump_path,
+            GENERIC_WRITE,
+            FILE_SHARE_READ,
+            nullptr,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr
+        );
+        if (hFile != INVALID_HANDLE_VALUE) {
+            MINIDUMP_EXCEPTION_INFORMATION mei{};
+            mei.ThreadId = GetCurrentThreadId();
+            mei.ExceptionPointers = exc_info;
+            mei.ClientPointers = FALSE;
+            MiniDumpWriteDump(
+                GetCurrentProcess(),
+                GetCurrentProcessId(),
+                hFile,
+                MiniDumpWithIndirectlyReferencedMemory,
+                exc_info ? &mei : nullptr,
+                nullptr,
+                nullptr
+            );
+            CloseHandle(hFile);
+            try {
+                prune_old_dumps(std::filesystem::path(g_dump_dir_w));
+            } catch (...) {
+            }
+        }
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
 
 std::string env_or_default(const wchar_t* name, const std::string& fallback) {
     if (const wchar_t* val = _wgetenv(name); val != nullptr && val[0] != L'\0') {
@@ -82,6 +172,19 @@ int main() {
         const auto data_dir = igbt::StationHttpServer::detect_default_data_dir();
         const auto web_dist_dir = igbt::StationHttpServer::detect_default_web_dist_dir();
         const auto assets_dir = igbt::StationHttpServer::detect_default_assets_dir();
+
+#ifdef _WIN32
+        {
+            std::error_code dec;
+            const auto dumps_dir = data_dir / "dumps";
+            std::filesystem::create_directories(dumps_dir, dec);
+            const std::wstring wdir = dumps_dir.wstring();
+            if (!wdir.empty() && wdir.size() < (sizeof(g_dump_dir_w) / sizeof(g_dump_dir_w[0]))) {
+                std::wmemcpy(g_dump_dir_w, wdir.c_str(), wdir.size() + 1);
+                SetUnhandledExceptionFilter(unhandled_exception_filter);
+            }
+        }
+#endif
 
         igbt::StationDatabase db(data_dir);
         igbt::LiveCameraEngine camera(cam_index);

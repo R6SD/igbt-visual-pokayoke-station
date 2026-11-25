@@ -45,6 +45,12 @@ target_link_libraries(igbt_core PUBLIC
     bcrypt
     crypt32
 )
+if (WIN32)
+    target_link_libraries(igbt_core PUBLIC
+        ole32
+        dbghelp
+    )
+endif()
 
 add_executable(igbt_station_server src/main.cpp)
 target_link_libraries(igbt_station_server PRIVATE igbt_core)

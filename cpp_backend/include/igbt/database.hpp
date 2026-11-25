@@ -77,6 +77,10 @@ public:
     json update_config(const json& payload, const std::string& actor);
     json list_config_history(int limit = 50) const;
 
+    // Hardware Camera Optics CRUD (camera_optics singleton)
+    json get_camera_optics() const;
+    json save_camera_optics(const json& payload, const std::string& actor);
+
     // Cycles & Events CRUD
     json list_cycles(int limit = 100) const;
     json list_cycle_events(const std::string& cycle_id, int limit = 200) const;

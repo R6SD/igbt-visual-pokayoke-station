@@ -122,6 +122,11 @@ const reasonText: Record<string, string> = {
   OVEREXPOSED_FRACTION_EXCEEDED: "反光面积超限",
   PART_REMOVED: "料管已移出",
   AUTHORIZED_RESET: "工位已复位",
+  TUBE_SWAP_SUSPECTED: "疑似途中换管/掉头异常，已触发告警闭锁",
+  UNDEREXPOSED: "标签 ROI 曝光不足，请检查照明",
+  LABEL_ROI_DRIFT_EXCEEDED: "标签定位框漂移超限",
+  OPTICAL_DRIFT: "相机光学参数/亮度漂移告警",
+  CAMERA_HANDLE_LOCKED_RESTART_REQUIRED: "相机采集句柄锁死，请重启工位服务或检查 USB 连接",
 }
 
 export const reasonOf = (code?: string) => (code ? reasonText[code] || fsmText[code] || code.replaceAll("_", " ") : "")

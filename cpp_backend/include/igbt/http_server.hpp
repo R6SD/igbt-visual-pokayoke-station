@@ -18,6 +18,7 @@
 #include "igbt/vision_engine.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <filesystem>
 #include <mutex>
 #include <optional>
@@ -144,8 +145,14 @@ private:
     ShadowNoopInterlock interlock_;
     OfflineNoopMesClient mes_client_;
 
+    void start_maintenance_thread();
+    void stop_maintenance_thread();
+
     httplib::Server svr_;
     std::thread server_thread_;
+    std::thread maintenance_thread_;
+    std::mutex maintenance_mutex_;
+    std::condition_variable maintenance_cv_;
     std::atomic<bool> running_{false};
     std::atomic<bool> stopping_{false};
     std::atomic<int> bound_port_{0};

@@ -13,6 +13,10 @@
 #include <stdexcept>
 #include <unordered_set>
 
+#ifdef _WIN32
+#include <objbase.h>
+#endif
+
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
@@ -20,6 +24,27 @@
 namespace igbt {
 
 namespace {
+
+struct ScopedComInit {
+    bool initialized{false};
+    ScopedComInit() {
+#ifdef _WIN32
+        const HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (hr == S_OK || hr == S_FALSE) {
+            initialized = true;
+        }
+#endif
+    }
+    ~ScopedComInit() {
+#ifdef _WIN32
+        if (initialized) {
+            CoUninitialize();
+        }
+#endif
+    }
+    ScopedComInit(const ScopedComInit&) = delete;
+    ScopedComInit& operator=(const ScopedComInit&) = delete;
+};
 
 double round_to(double v, int decimals) {
     const double scale = std::pow(10.0, decimals);
@@ -1155,6 +1180,66 @@ SimulationRunResult run_simulation_scenario(
 }
 
 // ============================================================================
+// Camera Optics Configuration Serialization
+// ============================================================================
+
+json camera_optics_to_json(const CameraOpticsConfig& cfg) {
+    return json{
+        {"lock_3a", cfg.lock_3a},
+        {"exposure", std::clamp(cfg.exposure, -13.0, -1.0)},
+        {"gain", std::clamp(cfg.gain, 0.0, 255.0)},
+        {"focus", cfg.focus < 0 ? -1 : std::clamp(cfg.focus, 0, 255)},
+        {"wb_temperature", cfg.wb_temperature < 0 ? -1 : std::clamp(cfg.wb_temperature, 2000, 10000)},
+        {"backlight_comp", cfg.backlight_comp != 0 ? 1 : 0},
+        {"calibrated", cfg.calibrated}
+    };
+}
+
+CameraOpticsConfig camera_optics_from_json(const json& j, const CameraOpticsConfig& base) {
+    CameraOpticsConfig out = base;
+    if (!j.is_object()) {
+        return out;
+    }
+    if (j.contains("lock_3a") && j["lock_3a"].is_boolean()) {
+        out.lock_3a = j["lock_3a"].get<bool>();
+    }
+    if (j.contains("exposure") && j["exposure"].is_number() && !j["exposure"].is_boolean()) {
+        const double v = j["exposure"].get<double>();
+        if (std::isfinite(v)) out.exposure = std::clamp(v, -13.0, -1.0);
+    }
+    if (j.contains("gain") && j["gain"].is_number() && !j["gain"].is_boolean()) {
+        const double v = j["gain"].get<double>();
+        if (std::isfinite(v)) out.gain = std::clamp(v, 0.0, 255.0);
+    }
+    if (j.contains("focus") && j["focus"].is_number() && !j["focus"].is_boolean()) {
+        const double v = j["focus"].get<double>();
+        if (std::isfinite(v)) {
+            const int iv = static_cast<int>(std::lround(v));
+            out.focus = (iv < 0) ? -1 : std::clamp(iv, 0, 255);
+        }
+    }
+    if (j.contains("wb_temperature") && j["wb_temperature"].is_number() && !j["wb_temperature"].is_boolean()) {
+        const double v = j["wb_temperature"].get<double>();
+        if (std::isfinite(v)) {
+            const int iv = static_cast<int>(std::lround(v));
+            out.wb_temperature = (iv < 0) ? -1 : std::clamp(iv, 2000, 10000);
+        }
+    }
+    if (j.contains("backlight_comp") && j["backlight_comp"].is_number() && !j["backlight_comp"].is_boolean()) {
+        const double v = j["backlight_comp"].get<double>();
+        if (std::isfinite(v)) {
+            out.backlight_comp = (std::lround(v) != 0) ? 1 : 0;
+        }
+    } else if (j.contains("backlight_comp") && j["backlight_comp"].is_boolean()) {
+        out.backlight_comp = j["backlight_comp"].get<bool>() ? 1 : 0;
+    }
+    if (j.contains("calibrated") && j["calibrated"].is_boolean()) {
+        out.calibrated = j["calibrated"].get<bool>();
+    }
+    return out;
+}
+
+// ============================================================================
 // LiveCameraEngine (720P @ 25.0 FPS Pacer, Dual Model Inference, Auto-Capture)
 // ============================================================================
 
@@ -1221,6 +1306,7 @@ LiveCameraEngine::LiveCameraEngine(
         {"mirror_horizontal", true},
         {"work_mode", "strict"},
         {"hardware_3a", hardware_3a_status_},
+        {"camera_optics", camera_optics_to_json(optics_config_)},
         {"tracked_objects", json::array()},
         {"tracked_label_box", nullptr},
         {"config_version", "ROI_V001"},
@@ -1275,6 +1361,7 @@ bool LiveCameraEngine::start() {
         }
         worker_thread_.join();
     }
+    consecutive_detach_count_ = 0;
     stop_requested_.store(false);
     running_.store(true);
     worker_thread_ = std::thread(&LiveCameraEngine::capture_loop, this);
@@ -1290,9 +1377,29 @@ bool LiveCameraEngine::stop(int timeout_ms) {
     }
     frame_cv_.notify_all();
 
-    std::lock_guard<std::mutex> lk(lifecycle_mutex_);
-    if (worker_thread_.joinable()) {
-        worker_thread_.join();
+    {
+        std::lock_guard<std::mutex> lk(lifecycle_mutex_);
+        if (worker_thread_.joinable()) {
+            worker_thread_.join();
+        }
+    }
+
+    std::string flush_cid;
+    std::string flush_reason;
+    double flush_mono{0.0};
+    std::vector<BufferedFrame> flush_frames;
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (active_burst_.active && !active_burst_.frames.empty()) {
+            flush_cid = std::move(active_burst_.cycle_id);
+            flush_reason = std::move(active_burst_.reason);
+            flush_mono = active_burst_.trigger_mono;
+            flush_frames = std::move(active_burst_.frames);
+        }
+        active_burst_ = ActiveBurstCapture{};
+    }
+    if (!flush_frames.empty()) {
+        async_evidence_writer_.enqueue_burst(flush_cid, flush_reason, std::move(flush_frames), flush_mono);
     }
     return true;
 }
@@ -1359,6 +1466,7 @@ std::string LiveCameraEngine::set_work_mode(const std::string& mode) {
     if (normalized == "debug") {
         alarm_latched_ = false;
         latched_reason_.reset();
+        bare_hand_violation_streak_ = 0;
         state_["alarm_latched"] = false;
         state_["bare_hand_violation"] = false;
     } else if (prev_mode != "strict") {
@@ -1367,6 +1475,10 @@ std::string LiveCameraEngine::set_work_mode(const std::string& mode) {
             fsm_ = InspectionFSM(live_fsm_config());
             contact_tracker_.reset();
             pass_target_lost_since_.reset();
+            active_cycle_tube_center_.reset();
+            active_cycle_pipe_color_.clear();
+            active_cycle_end_asymmetry_.reset();
+            bare_hand_violation_streak_ = 0;
             ++cycle_generation_;
             pending_tracker_reset_ = true;
             const auto zh = explain_reason_zh(std::string("STRICT_MODE_REVERIFY_REQUIRED"), "WAITING");
@@ -1400,6 +1512,92 @@ bool LiveCameraEngine::get_show_auxiliary_rois() const {
     return show_auxiliary_rois_;
 }
 
+LiveCameraEngine::AntiGlareStepResult LiveCameraEngine::next_anti_glare_step(
+    double cur_exposure,
+    double cur_gain,
+    double mean_lum,
+    double over_frac,
+    double p95_lum
+) {
+    AntiGlareStepResult res{};
+    res.next_exposure = std::clamp(cur_exposure, -13.0, -1.0);
+    res.next_gain = std::clamp(cur_gain, 0.0, 255.0);
+    res.penalty = over_frac * 1200.0 +
+                  std::max(0.0, p95_lum - 210.0) * 3.0 +
+                  std::max(0.0, 130.0 - p95_lum) * 0.8 +
+                  std::abs(mean_lum - 105.0) * 0.25;
+
+    if (over_frac > 0.015 || p95_lum > 218.0 || mean_lum > 155.0) {
+        if (res.next_gain > 0.0) {
+            res.next_gain = std::max(0.0, res.next_gain - 32.0);
+        } else if (res.next_exposure > -11.0) {
+            res.next_exposure = std::max(-11.0, res.next_exposure - 1.0);
+        } else {
+            res.converged = true;
+        }
+    } else if (mean_lum < 55.0 && p95_lum < 170.0 && over_frac < 0.002) {
+        if (res.next_exposure < -5.0) {
+            res.next_exposure = std::min(-5.0, res.next_exposure + 1.0);
+        } else if (res.next_gain < 48.0) {
+            res.next_gain = std::min(48.0, res.next_gain + 16.0);
+        } else {
+            res.converged = true;
+        }
+    } else {
+        res.converged = true;
+    }
+    return res;
+}
+
+void LiveCameraEngine::set_optics_persist_callback(OpticsPersistCallback cb) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    optics_persist_callback_ = std::move(cb);
+}
+
+json LiveCameraEngine::set_camera_optics(const CameraOpticsConfig& cfg, bool mark_calibrated) {
+    CameraOpticsConfig sanitized = cfg;
+    sanitized.exposure = std::isfinite(cfg.exposure) ? std::clamp(cfg.exposure, -13.0, -1.0) : -7.0;
+    sanitized.gain = std::isfinite(cfg.gain) ? std::clamp(cfg.gain, 0.0, 255.0) : 0.0;
+    sanitized.focus = (cfg.focus < 0) ? -1 : std::clamp(cfg.focus, 0, 255);
+    sanitized.wb_temperature = (cfg.wb_temperature < 0) ? -1 : std::clamp(cfg.wb_temperature, 2000, 10000);
+    sanitized.backlight_comp = (cfg.backlight_comp != 0) ? 1 : 0;
+    sanitized.calibrated = mark_calibrated || cfg.calibrated;
+
+    std::lock_guard<std::mutex> lk(mutex_);
+    optics_config_ = sanitized;
+    auto_calibrating_ = false;
+    calibration_status_ = sanitized.lock_3a ? "manual_locked" : "auto_3a";
+    ++optics_generation_;
+    json out = camera_optics_to_json(optics_config_);
+    out["auto_calibrating"] = auto_calibrating_;
+    out["calibration_status"] = calibration_status_;
+    state_["camera_optics"] = out;
+    out["hardware_3a"] = hardware_3a_status_;
+    return out;
+}
+
+json LiveCameraEngine::get_camera_optics_json() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    json out = camera_optics_to_json(optics_config_);
+    out["auto_calibrating"] = auto_calibrating_;
+    out["calibration_status"] = calibration_status_;
+    out["hardware_3a"] = hardware_3a_status_;
+    return out;
+}
+
+json LiveCameraEngine::trigger_anti_glare_calibration() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    ++anti_glare_calibrate_generation_;
+    auto_calibrating_ = true;
+    calibration_status_ = "calibrating";
+    json out = camera_optics_to_json(optics_config_);
+    out["auto_calibrating"] = true;
+    out["calibration_status"] = calibration_status_;
+    state_["camera_optics"] = out;
+    out["hardware_3a"] = hardware_3a_status_;
+    return out;
+}
+
 json LiveCameraEngine::trigger_new_cycle(const std::string& pipe_color) {
     const double now = monotonic_seconds();
     std::lock_guard<std::mutex> lk(mutex_);
@@ -1410,6 +1608,8 @@ json LiveCameraEngine::trigger_new_cycle(const std::string& pipe_color) {
     pass_target_lost_since_.reset();
     active_cycle_tube_center_.reset();
     active_cycle_pipe_color_.clear();
+    active_cycle_end_asymmetry_.reset();
+    bare_hand_violation_streak_ = 0;
     pending_tracker_reset_ = true;
     ++cycle_generation_;
     last_emitted_dedup_key_.clear();
@@ -1715,6 +1915,11 @@ json LiveCameraEngine::get_state_json() const {
     copy["auto_capture"] = auto_capture_.to_json();
     copy["online"] = camera_online_;
     copy["camera_online"] = camera_online_;
+    json optics_json = camera_optics_to_json(optics_config_);
+    optics_json["auto_calibrating"] = auto_calibrating_;
+    optics_json["calibration_status"] = calibration_status_;
+    copy["camera_optics"] = std::move(optics_json);
+    copy["hardware_3a"] = hardware_3a_status_;
     return copy;
 }
 
@@ -1835,6 +2040,174 @@ WaitJpegResult LiveCameraEngine::wait_for_jpeg(uint64_t last_seq, int timeout_ms
 // Camera Capture Loop & 720P @ 25.0 FPS Pacer
 // ============================================================================
 
+namespace {
+
+void measure_workzone_exposure(
+    const cv::Mat& bgr,
+    double& mean_lum,
+    double& over_frac,
+    double& p95_lum
+) {
+    mean_lum = 0.0;
+    over_frac = 0.0;
+    p95_lum = 0.0;
+    if (bgr.empty()) return;
+
+    auto eval_region = [&](double rx1, double ry1, double rx2, double ry2,
+                           double& out_mean, double& out_over, double& out_p95) {
+        const int x1 = std::clamp(static_cast<int>(bgr.cols * rx1), 0, std::max(0, bgr.cols - 4));
+        const int y1 = std::clamp(static_cast<int>(bgr.rows * ry1), 0, std::max(0, bgr.rows - 4));
+        const int x2 = std::clamp(static_cast<int>(bgr.cols * rx2), x1 + 4, bgr.cols);
+        const int y2 = std::clamp(static_cast<int>(bgr.rows * ry2), y1 + 4, bgr.rows);
+        cv::Mat roi = bgr(cv::Rect(x1, y1, x2 - x1, y2 - y1));
+        cv::Mat small_bgr, gray;
+        cv::resize(roi, small_bgr, cv::Size(320, 180), 0, 0, cv::INTER_AREA);
+        cv::cvtColor(small_bgr, gray, cv::COLOR_BGR2GRAY);
+
+        out_mean = cv::mean(gray)[0];
+        cv::Mat over_mask;
+        cv::compare(gray, 245, over_mask, cv::CMP_GE);
+        const int total = gray.rows * gray.cols;
+        out_over = (total > 0)
+                       ? (static_cast<double>(cv::countNonZero(over_mask)) / static_cast<double>(total))
+                       : 0.0;
+
+        std::array<int, 256> hist{};
+        for (int y = 0; y < gray.rows; ++y) {
+            const uint8_t* gp = gray.ptr<uint8_t>(y);
+            for (int x = 0; x < gray.cols; ++x) {
+                ++hist[gp[x]];
+            }
+        }
+        const int target = static_cast<int>(std::ceil(static_cast<double>(total) * 0.95));
+        int acc = 0;
+        out_p95 = 0.0;
+        for (int b = 0; b < 256; ++b) {
+            acc += hist[b];
+            if (acc >= target) {
+                out_p95 = static_cast<double>(b);
+                break;
+            }
+        }
+    };
+
+    double wz_mean = 0.0, wz_over = 0.0, wz_p95 = 0.0;
+    double center_mean = 0.0, center_over = 0.0, center_p95 = 0.0;
+    eval_region(0.15, 0.20, 0.85, 0.90, wz_mean, wz_over, wz_p95);
+    eval_region(0.25, 0.30, 0.75, 0.80, center_mean, center_over, center_p95);
+    mean_lum = wz_mean;
+    over_frac = std::max(wz_over, center_over);
+    p95_lum = std::max(wz_p95, center_p95);
+}
+
+json safe_prop_json(double v) {
+    return std::isfinite(v) ? json(v) : json(nullptr);
+}
+
+}  // namespace
+
+json LiveCameraEngine::read_camera_optics_hardware(
+    cv::VideoCapture& cap,
+    const CameraOpticsConfig& optics,
+    bool auto_calibrating,
+    const std::string& status_label
+) {
+    const double af_val = cap.get(cv::CAP_PROP_AUTOFOCUS);
+    const double ae_val = cap.get(cv::CAP_PROP_AUTO_EXPOSURE);
+    const double awb_val = cap.get(cv::CAP_PROP_AUTO_WB);
+    const double exp_val = cap.get(cv::CAP_PROP_EXPOSURE);
+    const double gain_val = cap.get(cv::CAP_PROP_GAIN);
+    const double focus_val = cap.get(cv::CAP_PROP_FOCUS);
+    const double wb_val = cap.get(cv::CAP_PROP_WB_TEMPERATURE);
+    const double bl_val = cap.get(cv::CAP_PROP_BACKLIGHT);
+    return json{
+        {"locked", optics.lock_3a && !auto_calibrating},
+        {"auto_calibrating", auto_calibrating},
+        {"calibration_status", status_label},
+        {"autofocus", {{"set_ok", true}, {"value", safe_prop_json(af_val)}}},
+        {"auto_exposure", {{"set_ok", true}, {"value", safe_prop_json(ae_val)}}},
+        {"auto_wb", {{"set_ok", true}, {"value", safe_prop_json(awb_val)}}},
+        {"exposure", {{"set_ok", true}, {"value", safe_prop_json(exp_val)}}},
+        {"gain", {{"set_ok", true}, {"value", safe_prop_json(gain_val)}}},
+        {"focus", {{"set_ok", true}, {"value", safe_prop_json(focus_val)}}},
+        {"wb_temperature", {{"set_ok", true}, {"value", safe_prop_json(wb_val)}}},
+        {"backlight", {{"set_ok", true}, {"value", safe_prop_json(bl_val)}}}
+    };
+}
+
+json LiveCameraEngine::apply_camera_optics(
+    cv::VideoCapture& cap,
+    CameraOpticsConfig& optics,
+    bool allow_converge_readback,
+    const std::string& status_label
+) {
+    optics.exposure = std::isfinite(optics.exposure) ? std::clamp(optics.exposure, -13.0, -1.0) : -7.0;
+    optics.gain = std::isfinite(optics.gain) ? std::clamp(optics.gain, 0.0, 255.0) : 0.0;
+    optics.focus = (optics.focus < 0) ? -1 : std::clamp(optics.focus, 0, 255);
+    optics.wb_temperature = (optics.wb_temperature < 0) ? -1 : std::clamp(optics.wb_temperature, 2000, 10000);
+    optics.backlight_comp = (optics.backlight_comp != 0) ? 1 : 0;
+
+    const bool bl_ok = cap.set(cv::CAP_PROP_BACKLIGHT, static_cast<double>(optics.backlight_comp));
+    bool ae_ok = false;
+    bool exp_ok = true;
+    bool gain_ok = true;
+    bool af_ok = false;
+    bool focus_ok = true;
+    bool awb_ok = false;
+    bool wb_ok = true;
+
+    if (optics.lock_3a) {
+        // DirectShow UVC requires explicit CAP_PROP_EXPOSURE & CAP_PROP_GAIN right after manual AE (0.25),
+        // otherwise Logitech C920 slams exposure to max (whiteout) and resets focus to 0 (infinity blur).
+        ae_ok = cap.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.25);
+        exp_ok = cap.set(cv::CAP_PROP_EXPOSURE, optics.exposure);
+        gain_ok = cap.set(cv::CAP_PROP_GAIN, optics.gain);
+
+        if (optics.focus < 0 && allow_converge_readback) {
+            const double cf = cap.get(cv::CAP_PROP_FOCUS);
+            optics.focus = (std::isfinite(cf) && cf > 0.0 && cf <= 255.0)
+                               ? static_cast<int>(std::lround(cf))
+                               : 35;
+        }
+        if (optics.focus >= 0) {
+            af_ok = cap.set(cv::CAP_PROP_AUTOFOCUS, 0.0);
+            focus_ok = cap.set(cv::CAP_PROP_FOCUS, static_cast<double>(optics.focus));
+        } else {
+            af_ok = cap.set(cv::CAP_PROP_AUTOFOCUS, 1.0);
+        }
+
+        if (optics.wb_temperature < 0 && allow_converge_readback) {
+            const double cwb = cap.get(cv::CAP_PROP_WB_TEMPERATURE);
+            optics.wb_temperature = (std::isfinite(cwb) && cwb >= 2000.0 && cwb <= 10000.0)
+                                        ? static_cast<int>(std::lround(cwb))
+                                        : 4500;
+        }
+        if (optics.wb_temperature >= 2000) {
+            awb_ok = cap.set(cv::CAP_PROP_AUTO_WB, 0.0);
+            wb_ok = cap.set(cv::CAP_PROP_WB_TEMPERATURE, static_cast<double>(optics.wb_temperature));
+        } else {
+            awb_ok = cap.set(cv::CAP_PROP_AUTO_WB, 1.0);
+        }
+    } else {
+        ae_ok = cap.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.75);
+        af_ok = cap.set(cv::CAP_PROP_AUTOFOCUS, 1.0);
+        awb_ok = cap.set(cv::CAP_PROP_AUTO_WB, 1.0);
+    }
+
+    const bool auto_cal = (status_label == "calibrating");
+    json hw = read_camera_optics_hardware(cap, optics, auto_cal, status_label);
+    hw["locked"] = optics.lock_3a && !auto_cal && ae_ok && exp_ok;
+    hw["autofocus"]["set_ok"] = af_ok;
+    hw["auto_exposure"]["set_ok"] = ae_ok;
+    hw["auto_wb"]["set_ok"] = awb_ok;
+    hw["exposure"]["set_ok"] = exp_ok;
+    hw["gain"]["set_ok"] = gain_ok;
+    hw["focus"]["set_ok"] = focus_ok;
+    hw["wb_temperature"]["set_ok"] = wb_ok;
+    hw["backlight"]["set_ok"] = bl_ok;
+    return hw;
+}
+
 void LiveCameraEngine::mark_camera_unavailable(const std::string& reason) {
     {
         std::lock_guard<std::mutex> lk(mutex_);
@@ -1867,6 +2240,7 @@ void LiveCameraEngine::mark_camera_unavailable(const std::string& reason) {
 }
 
 void LiveCameraEngine::capture_loop() {
+    ScopedComInit com_guard;
     constexpr auto kFrameInterval = std::chrono::microseconds(40000);  // 25.0 FPS = 40.0 ms
 
     auto interruptible_sleep = [&](std::chrono::milliseconds dur) {
@@ -1956,20 +2330,30 @@ void LiveCameraEngine::capture_loop() {
         cap->set(cv::CAP_PROP_FPS, 30.0);
         cap->set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
 
-        // Attempt DirectShow 3A hardware locking + readback (AF / AE / AWB)
-        const bool af_ok = cap->set(cv::CAP_PROP_AUTOFOCUS, 0.0);
-        const bool ae_ok = cap->set(cv::CAP_PROP_AUTO_EXPOSURE, 0.25);
-        const bool awb_ok = cap->set(cv::CAP_PROP_AUTO_WB, 0.0);
-        const double af_val = cap->get(cv::CAP_PROP_AUTOFOCUS);
-        const double ae_val = cap->get(cv::CAP_PROP_AUTO_EXPOSURE);
-        const double awb_val = cap->get(cv::CAP_PROP_AUTO_WB);
-        const bool hw_3a_ok = af_ok && ae_ok && awb_ok;
-        const json hw_3a_json{
-            {"locked", hw_3a_ok},
-            {"autofocus", {{"set_ok", af_ok}, {"value", std::isfinite(af_val) ? json(af_val) : json(nullptr)}}},
-            {"auto_exposure", {{"set_ok", ae_ok}, {"value", std::isfinite(ae_val) ? json(ae_val) : json(nullptr)}}},
-            {"auto_wb", {{"set_ok", awb_ok}, {"value", std::isfinite(awb_val) ? json(awb_val) : json(nullptr)}}}
-        };
+        CameraOpticsConfig init_optics{};
+        uint64_t init_opt_gen = 0;
+        uint64_t init_cal_gen = 0;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            init_optics = optics_config_;
+            init_opt_gen = optics_generation_;
+            init_cal_gen = anti_glare_calibrate_generation_;
+        }
+
+        const bool start_auto_cal = (!init_optics.calibrated && init_optics.lock_3a);
+        CameraOpticsConfig open_optics = init_optics;
+        std::string open_status = start_auto_cal
+                                      ? "calibrating"
+                                      : (init_optics.lock_3a ? "manual_locked" : "auto_3a");
+        if (start_auto_cal) {
+            open_optics.exposure = -6.0;
+            open_optics.gain = 0.0;
+            open_optics.focus = -1;
+            open_optics.wb_temperature = -1;
+            open_optics.backlight_comp = 0;
+        }
+        const json hw_3a_json = apply_camera_optics(*cap, open_optics, false, open_status);
+        const bool hw_3a_ok = hw_3a_json.value("locked", false);
 
         {
             std::lock_guard<std::mutex> lk(mutex_);
@@ -1977,7 +2361,13 @@ void LiveCameraEngine::capture_loop() {
             fps_times_.clear();
             hardware_3a_locked_ = hw_3a_ok;
             hardware_3a_status_ = hw_3a_json;
+            auto_calibrating_ = start_auto_cal;
+            calibration_status_ = open_status;
             state_["hardware_3a"] = hardware_3a_status_;
+            json ojson = camera_optics_to_json(optics_config_);
+            ojson["auto_calibrating"] = auto_calibrating_;
+            ojson["calibration_status"] = calibration_status_;
+            state_["camera_optics"] = std::move(ojson);
         }
 
         // Decouple blocking UVC cap.read() from the 40.0 ms (25.0 FPS) consumer pacer to eliminate
@@ -1988,13 +2378,121 @@ void LiveCameraEngine::capture_loop() {
             cv::Mat latest_frame;
             uint64_t latest_seq{0};
             std::chrono::steady_clock::time_point last_frame_tp{};
+            CameraOpticsConfig target_optics{};
+            uint64_t cmd_optics_gen{0};
+            uint64_t cmd_cal_gen{0};
+            bool start_auto_cal{false};
+            std::optional<json> pending_3a;
+            std::optional<CameraOpticsConfig> converged_optics;
+            bool pending_persist{false};
+            bool has_cal_status{false};
+            bool report_auto_calibrating{false};
+            std::string report_cal_status{"idle"};
             bool grab_failed{false};
             std::atomic<bool> stop{false};
         };
         auto grab_state = std::make_shared<GrabberState>();
+        grab_state->target_optics = open_optics;
+        grab_state->cmd_optics_gen = init_opt_gen;
+        grab_state->cmd_cal_gen = init_cal_gen;
+        grab_state->start_auto_cal = start_auto_cal;
 
         std::thread grabber([cap, grab_state]() {
+            ScopedComInit grabber_com;
+            struct AutoCalMachine {
+                enum class Phase { WARMUP, TUNE };
+                bool active{false};
+                Phase phase{Phase::WARMUP};
+                int warmup_left{12};
+                int settle_left{5};
+                int step{0};
+                double best_penalty{1e9};
+                double best_exp{-6.0};
+                double best_gain{0.0};
+            };
+
+            CameraOpticsConfig cur_optics{};
+            uint64_t local_opt_gen = 0;
+            uint64_t local_cal_gen = 0;
+            AutoCalMachine auto_cal{};
+            std::string cur_status = "idle";
+            {
+                std::lock_guard<std::mutex> glk(grab_state->mtx);
+                cur_optics = grab_state->target_optics;
+                local_opt_gen = grab_state->cmd_optics_gen;
+                local_cal_gen = grab_state->cmd_cal_gen;
+                if (grab_state->start_auto_cal) {
+                    auto_cal.active = true;
+                    auto_cal.phase = AutoCalMachine::Phase::WARMUP;
+                    auto_cal.warmup_left = 12;
+                    cur_status = "calibrating";
+                } else {
+                    cur_status = cur_optics.lock_3a ? "manual_locked" : "auto_3a";
+                }
+            }
+
+            uint64_t grab_frames = 0;
+            auto last_3a_tp = std::chrono::steady_clock::now();
             while (!grab_state->stop.load()) {
+                bool cmd_opt_changed = false;
+                bool cmd_cal_changed = false;
+                CameraOpticsConfig next_target{};
+                {
+                    std::lock_guard<std::mutex> glk(grab_state->mtx);
+                    if (grab_state->cmd_optics_gen != local_opt_gen) {
+                        local_opt_gen = grab_state->cmd_optics_gen;
+                        local_cal_gen = grab_state->cmd_cal_gen;
+                        next_target = grab_state->target_optics;
+                        cmd_opt_changed = true;
+                    } else if (grab_state->cmd_cal_gen != local_cal_gen) {
+                        local_cal_gen = grab_state->cmd_cal_gen;
+                        cmd_cal_changed = true;
+                    }
+                }
+
+                if (cmd_opt_changed) {
+                    auto_cal.active = false;
+                    cur_optics = next_target;
+                    const bool need_readback =
+                        cur_optics.lock_3a && (cur_optics.focus < 0 || cur_optics.wb_temperature < 0);
+                    cur_status = cur_optics.lock_3a ? "manual_locked" : "auto_3a";
+                    json hw = LiveCameraEngine::apply_camera_optics(
+                        *cap, cur_optics, need_readback, cur_status
+                    );
+                    last_3a_tp = std::chrono::steady_clock::now();
+                    std::lock_guard<std::mutex> glk(grab_state->mtx);
+                    grab_state->pending_3a = std::move(hw);
+                    grab_state->has_cal_status = true;
+                    grab_state->report_auto_calibrating = false;
+                    grab_state->report_cal_status = cur_status;
+                    if (need_readback) {
+                        grab_state->converged_optics = cur_optics;
+                        grab_state->pending_persist = true;
+                    }
+                } else if (cmd_cal_changed) {
+                    cur_optics.lock_3a = true;
+                    cur_optics.exposure = -6.0;
+                    cur_optics.gain = 0.0;
+                    cur_optics.focus = -1;
+                    cur_optics.wb_temperature = -1;
+                    cur_optics.backlight_comp = 0;
+                    cur_optics.calibrated = false;
+                    cur_status = "calibrating";
+                    json hw = LiveCameraEngine::apply_camera_optics(
+                        *cap, cur_optics, false, cur_status
+                    );
+                    auto_cal = AutoCalMachine{};
+                    auto_cal.active = true;
+                    auto_cal.phase = AutoCalMachine::Phase::WARMUP;
+                    auto_cal.warmup_left = 12;
+                    last_3a_tp = std::chrono::steady_clock::now();
+                    std::lock_guard<std::mutex> glk(grab_state->mtx);
+                    grab_state->pending_3a = std::move(hw);
+                    grab_state->has_cal_status = true;
+                    grab_state->report_auto_calibrating = true;
+                    grab_state->report_cal_status = cur_status;
+                }
+
                 cv::Mat raw;
                 const bool ok = cap->read(raw);
                 const auto grabbed_tp = std::chrono::steady_clock::now();
@@ -2006,11 +2504,132 @@ void LiveCameraEngine::capture_loop() {
                     grab_state->cv.notify_all();
                     break;
                 }
+                ++grab_frames;
+
+                std::optional<json> updated_3a;
+                std::optional<CameraOpticsConfig> finished_optics;
+                bool persist_flag = false;
+                bool status_changed = false;
+                bool rep_auto_cal = auto_cal.active;
+                std::string rep_status = cur_status;
+
+                if (auto_cal.active) {
+                    if (auto_cal.phase == AutoCalMachine::Phase::WARMUP) {
+                        --auto_cal.warmup_left;
+                        if (auto_cal.warmup_left <= 0) {
+                            updated_3a = LiveCameraEngine::apply_camera_optics(
+                                *cap, cur_optics, true, "calibrating"
+                            );
+                            auto_cal.phase = AutoCalMachine::Phase::TUNE;
+                            auto_cal.settle_left = 5;
+                            auto_cal.step = 0;
+                            auto_cal.best_penalty = 1e9;
+                            auto_cal.best_exp = cur_optics.exposure;
+                            auto_cal.best_gain = cur_optics.gain;
+                            status_changed = true;
+                            rep_auto_cal = true;
+                            rep_status = "calibrating";
+                            last_3a_tp = grabbed_tp;
+                        }
+                    } else {
+                        if (auto_cal.settle_left > 0) {
+                            --auto_cal.settle_left;
+                        } else {
+                            double mean_lum = 0.0;
+                            double over_frac = 0.0;
+                            double p95_lum = 0.0;
+                            measure_workzone_exposure(raw, mean_lum, over_frac, p95_lum);
+                            const auto step_res = LiveCameraEngine::next_anti_glare_step(
+                                cur_optics.exposure, cur_optics.gain, mean_lum, over_frac, p95_lum
+                            );
+                            if (step_res.penalty < auto_cal.best_penalty) {
+                                auto_cal.best_penalty = step_res.penalty;
+                                auto_cal.best_exp = cur_optics.exposure;
+                                auto_cal.best_gain = cur_optics.gain;
+                            }
+                            const bool no_move =
+                                std::abs(step_res.next_exposure - cur_optics.exposure) < 1e-6 &&
+                                std::abs(step_res.next_gain - cur_optics.gain) < 1e-6;
+                            if (step_res.converged || auto_cal.step >= 8 || no_move) {
+                                cur_optics.exposure = auto_cal.best_exp;
+                                cur_optics.gain = auto_cal.best_gain;
+                                cur_optics.lock_3a = true;
+                                cur_optics.backlight_comp = 0;
+                                cur_optics.calibrated = true;
+                                cur_status = "converged";
+                                updated_3a = LiveCameraEngine::apply_camera_optics(
+                                    *cap, cur_optics, false, cur_status
+                                );
+                                finished_optics = cur_optics;
+                                persist_flag = true;
+                                auto_cal.active = false;
+                                status_changed = true;
+                                rep_auto_cal = false;
+                                rep_status = cur_status;
+                                last_3a_tp = grabbed_tp;
+                            } else {
+                                cur_optics.exposure = step_res.next_exposure;
+                                cur_optics.gain = step_res.next_gain;
+                                updated_3a = LiveCameraEngine::apply_camera_optics(
+                                    *cap, cur_optics, false, "calibrating"
+                                );
+                                auto_cal.settle_left = 5;
+                                ++auto_cal.step;
+                                status_changed = true;
+                                rep_auto_cal = true;
+                                rep_status = "calibrating";
+                                last_3a_tp = grabbed_tp;
+                            }
+                        }
+                    }
+                } else if (grab_frames == 5) {
+                    updated_3a = LiveCameraEngine::apply_camera_optics(
+                        *cap, cur_optics, false, cur_status
+                    );
+                    last_3a_tp = grabbed_tp;
+                } else if ((grabbed_tp - last_3a_tp) >= std::chrono::seconds(30)) {
+                    last_3a_tp = grabbed_tp;
+                    if (cur_optics.lock_3a) {
+                        const double cur_exp = cap->get(cv::CAP_PROP_EXPOSURE);
+                        const double cur_focus = cap->get(cv::CAP_PROP_FOCUS);
+                        const bool exp_drifted =
+                            std::isfinite(cur_exp) && std::abs(cur_exp - cur_optics.exposure) > 0.5;
+                        const bool focus_drifted =
+                            cur_optics.focus >= 0 && std::isfinite(cur_focus) &&
+                            std::abs(cur_focus - static_cast<double>(cur_optics.focus)) > 2.0;
+                        if (exp_drifted || focus_drifted) {
+                            updated_3a = LiveCameraEngine::apply_camera_optics(
+                                *cap, cur_optics, false, cur_status
+                            );
+                        } else {
+                            updated_3a = LiveCameraEngine::read_camera_optics_hardware(
+                                *cap, cur_optics, false, cur_status
+                            );
+                        }
+                    } else {
+                        updated_3a = LiveCameraEngine::read_camera_optics_hardware(
+                            *cap, cur_optics, false, "auto_3a"
+                        );
+                    }
+                }
+
                 {
                     std::lock_guard<std::mutex> glk(grab_state->mtx);
                     grab_state->latest_frame = std::move(raw);
                     ++grab_state->latest_seq;
                     grab_state->last_frame_tp = grabbed_tp;
+                    if (updated_3a.has_value()) {
+                        grab_state->pending_3a = std::move(updated_3a);
+                    }
+                    if (finished_optics.has_value()) {
+                        grab_state->converged_optics = finished_optics;
+                        grab_state->pending_persist = grab_state->pending_persist || persist_flag;
+                    }
+                    if (status_changed) {
+                        grab_state->has_cal_status = true;
+                        grab_state->report_auto_calibrating = rep_auto_cal;
+                        grab_state->report_cal_status = rep_status;
+                    }
                 }
                 grab_state->cv.notify_all();
             }
@@ -2028,8 +2647,11 @@ void LiveCameraEngine::capture_loop() {
                 const DWORD wait_rc = (hThread != nullptr) ? WaitForSingleObject(hThread, 800) : WAIT_TIMEOUT;
                 if (wait_rc == WAIT_OBJECT_0) {
                     grabber.join();
+                    consecutive_detach_count_ = 0;
                 } else {
+                    ++consecutive_detach_count_;
                     std::cerr << "[IGBT-C++20] Warning: DirectShow grabber thread hung after cap.release(); detaching."
+                              << " consecutive=" << consecutive_detach_count_
                               << std::endl;
                     grabber.detach();
                 }
@@ -2058,6 +2680,10 @@ void LiveCameraEngine::capture_loop() {
                 mark_camera_unavailable("CAMERA_FEED_LOST");
             }
             stop_grabber_safely();
+            if (consecutive_detach_count_ >= 2 && !stop_requested_.load()) {
+                mark_camera_unavailable("CAMERA_HANDLE_LOCKED_RESTART_REQUIRED");
+                break;
+            }
             if (!stop_requested_.load()) {
                 interruptible_sleep(std::chrono::milliseconds(400));
             }
@@ -2074,9 +2700,49 @@ void LiveCameraEngine::capture_loop() {
             cv::Mat frame;
             bool failed = false;
             bool stalled = false;
+            std::optional<json> refreshed_3a;
+            std::optional<CameraOpticsConfig> converged_opt;
+            bool should_persist_opt = false;
+            bool has_cal_st = false;
+            bool rep_auto_cal = false;
+            std::string rep_cal_st;
+
+            CameraOpticsConfig desired_opt{};
+            uint64_t desired_opt_gen = 0;
+            uint64_t desired_cal_gen = 0;
+            {
+                std::lock_guard<std::mutex> lk(mutex_);
+                desired_opt = optics_config_;
+                desired_opt_gen = optics_generation_;
+                desired_cal_gen = anti_glare_calibrate_generation_;
+            }
+
             {
                 std::lock_guard<std::mutex> glk(grab_state->mtx);
+                if (desired_opt_gen != grab_state->cmd_optics_gen) {
+                    grab_state->target_optics = desired_opt;
+                    grab_state->cmd_optics_gen = desired_opt_gen;
+                }
+                if (desired_cal_gen != grab_state->cmd_cal_gen) {
+                    grab_state->cmd_cal_gen = desired_cal_gen;
+                }
                 failed = grab_state->grab_failed;
+                if (grab_state->pending_3a.has_value()) {
+                    refreshed_3a = std::move(grab_state->pending_3a);
+                    grab_state->pending_3a.reset();
+                }
+                if (grab_state->converged_optics.has_value()) {
+                    converged_opt = std::move(grab_state->converged_optics);
+                    grab_state->converged_optics.reset();
+                    should_persist_opt = grab_state->pending_persist;
+                    grab_state->pending_persist = false;
+                }
+                if (grab_state->has_cal_status) {
+                    has_cal_st = true;
+                    rep_auto_cal = grab_state->report_auto_calibrating;
+                    rep_cal_st = grab_state->report_cal_status;
+                    grab_state->has_cal_status = false;
+                }
                 if (!failed && grab_state->latest_seq > 0) {
                     const auto age = std::chrono::steady_clock::now() - grab_state->last_frame_tp;
                     if (age > kHardwareStallTimeout) {
@@ -2084,6 +2750,45 @@ void LiveCameraEngine::capture_loop() {
                     } else {
                         frame = grab_state->latest_frame.clone();
                     }
+                }
+            }
+
+            OpticsPersistCallback persist_cb;
+            CameraOpticsConfig persist_cfg{};
+            bool call_persist = false;
+            if (refreshed_3a.has_value() || converged_opt.has_value() || has_cal_st) {
+                std::lock_guard<std::mutex> lk(mutex_);
+                const bool stale_cmd =
+                    (optics_generation_ != desired_opt_gen) ||
+                    (anti_glare_calibrate_generation_ != desired_cal_gen);
+                if (refreshed_3a.has_value()) {
+                    hardware_3a_locked_ = refreshed_3a->value("locked", false);
+                    hardware_3a_status_ = *refreshed_3a;
+                    state_["hardware_3a"] = hardware_3a_status_;
+                }
+                if (!stale_cmd) {
+                    if (converged_opt.has_value()) {
+                        optics_config_ = *converged_opt;
+                        if (should_persist_opt && optics_persist_callback_) {
+                            persist_cb = optics_persist_callback_;
+                            persist_cfg = optics_config_;
+                            call_persist = true;
+                        }
+                    }
+                    if (has_cal_st) {
+                        auto_calibrating_ = rep_auto_cal;
+                        calibration_status_ = rep_cal_st;
+                    }
+                    json ojson = camera_optics_to_json(optics_config_);
+                    ojson["auto_calibrating"] = auto_calibrating_;
+                    ojson["calibration_status"] = calibration_status_;
+                    state_["camera_optics"] = std::move(ojson);
+                }
+            }
+            if (call_persist && persist_cb) {
+                try {
+                    persist_cb(persist_cfg);
+                } catch (...) {
                 }
             }
             const double capture_ts = monotonic_seconds();
@@ -2109,12 +2814,18 @@ void LiveCameraEngine::capture_loop() {
         }
 
         stop_grabber_safely();
+        if (consecutive_detach_count_ >= 2 && !stop_requested_.load()) {
+            mark_camera_unavailable("CAMERA_HANDLE_LOCKED_RESTART_REQUIRED");
+            break;
+        }
         if (!stop_requested_.load()) {
             interruptible_sleep(std::chrono::milliseconds(400));
         }
     }
 
-    mark_camera_unavailable("CAMERA_NOT_CONNECTED");
+    if (consecutive_detach_count_ < 2) {
+        mark_camera_unavailable("CAMERA_NOT_CONNECTED");
+    }
 }
 
 bool LiveCameraEngine::process_injected_frame(
@@ -2514,6 +3225,23 @@ LiveCameraEngine::TrackResult LiveCameraEngine::track_dynamic_targets(
     const double min_hand_area = sw * sh * 0.010;
     const double max_hand_area = sw * sh * 0.11;
 
+    // Specular glare isolation (pure white clipped highlights V>=250, S<=15)
+    cv::Mat specular_mask = cv::Mat::zeros(sh, sw, CV_8U);
+    cv::Mat clipped_mask = cv::Mat::zeros(sh, sw, CV_8U);
+    for (int y = 0; y < sh; ++y) {
+        const auto* hp = hsv.ptr<cv::Vec3b>(y);
+        uint8_t* sp = specular_mask.ptr<uint8_t>(y);
+        uint8_t* cp = clipped_mask.ptr<uint8_t>(y);
+        for (int x = 0; x < sw; ++x) {
+            if (hp[x][2] >= 250 && hp[x][1] <= 15) {
+                sp[x] = 255;
+            }
+            if (hp[x][2] >= 248 && hp[x][1] <= 18) {
+                cp[x] = 255;
+            }
+        }
+    }
+
     // A. Compliant White / Light-Gray ESD Gloves
     cv::Mat glove_raw = cv::Mat::zeros(sh, sw, CV_8U);
     for (int y = 0; y < sh; ++y) {
@@ -2521,9 +3249,11 @@ LiveCameraEngine::TrackResult LiveCameraEngine::track_dynamic_targets(
         const float* mp = motion_diff.ptr<float>(y);
         const float* fp = fg_diff.ptr<float>(y);
         const uint8_t* pp = person_exclusion.ptr<uint8_t>(y);
+        const uint8_t* sp = specular_mask.ptr<uint8_t>(y);
         uint8_t* gp = glove_raw.ptr<uint8_t>(y);
         for (int x = 0; x < sw; ++x) {
-            if (pp[x] == 0 && hp[x][2] >= 178 && hp[x][1] <= 42 && (mp[x] > 7.5f || fp[x] > 20.0f)) {
+            if (pp[x] == 0 && sp[x] == 0 && hp[x][2] >= 178 && hp[x][1] <= 42 &&
+                (mp[x] > 7.5f || fp[x] > 20.0f)) {
                 gp[x] = 255;
             }
         }
@@ -2548,8 +3278,11 @@ LiveCameraEngine::TrackResult LiveCameraEngine::track_dynamic_targets(
             static_cast<double>(r.height) / sh > 0.40) {
             continue;
         }
-        const double mot = static_cast<double>(cv::countNonZero(mot_gt_65(r))) /
-                           static_cast<double>(r.width * r.height);
+        const double r_area = static_cast<double>(r.width * r.height);
+        if (static_cast<double>(cv::countNonZero(clipped_mask(r))) / r_area > 0.55) {
+            continue;
+        }
+        const double mot = static_cast<double>(cv::countNonZero(mot_gt_65(r))) / r_area;
         if (mot < 0.12) continue;
         const Box b{
             std::max(0.01, static_cast<double>(r.x) / sw),
@@ -2603,8 +3336,10 @@ LiveCameraEngine::TrackResult LiveCameraEngine::track_dynamic_targets(
         if (area < min_hand_area || area > max_hand_area) continue;
         const cv::Rect r = cv::boundingRect(cnt);
         const double cx = (r.x + r.width * 0.5) / sw;
+        const double cy = (r.y + r.height * 0.5) / sh;
         if (r.y <= 4 && cx > 0.22 && cx < 0.78) continue;
         if (static_cast<double>(r.y) / sh >= 0.82) continue;
+        if (cy < 0.22 || cy > 0.88) continue;
         const double denom = static_cast<double>(r.width * r.height);
         const double hand_fg = static_cast<double>(cv::countNonZero(fg_gt_14(r))) / denom;
         const double hand_mot = static_cast<double>(cv::countNonZero(mot_gt_55(r))) / denom;
@@ -2643,7 +3378,7 @@ LiveCameraEngine::TrackResult LiveCameraEngine::track_dynamic_targets(
         const uint8_t* pp = person_exclusion.ptr<uint8_t>(y);
         uint8_t* bp = bright_patch.ptr<uint8_t>(y);
         for (int x = 0; x < sw; ++x) {
-            if (pp[x] == 0 && hp[x][2] > 175 && hp[x][1] < 55) {
+            if (pp[x] == 0 && !(hp[x][2] >= 252 && hp[x][1] <= 12) && hp[x][2] > 175 && hp[x][1] < 55) {
                 bp[x] = 255;
             }
         }
@@ -2680,6 +3415,9 @@ LiveCameraEngine::TrackResult LiveCameraEngine::track_dynamic_targets(
         }
 
         const double denom = static_cast<double>(r.width * r.height);
+        if (static_cast<double>(cv::countNonZero(specular_mask(r))) / denom > 0.45) {
+            continue;
+        }
         const double patch_bright = static_cast<double>(cv::countNonZero(bright_patch(r))) / denom;
         const double patch_edge = static_cast<double>(cv::countNonZero(edges(r))) / denom;
         const double patch_motion = static_cast<double>(cv::countNonZero(mot_gt_75(r))) / denom;
@@ -2979,23 +3717,35 @@ LiveCameraEngine::ClassificationResult LiveCameraEngine::classify_live_label_roi
         }
     }
 
-    int white_cnt = 0;
+    cv::Mat spec_mask = cv::Mat::zeros(small.rows, small.cols, CV_8U);
+    int specular_cnt = 0;
+    int matte_white_cnt = 0;
     int dark_cnt = 0;
     for (int y = 0; y < small.rows; ++y) {
         const auto* hp = hsv.ptr<cv::Vec3b>(y);
         const uint8_t* gp = gray.ptr<uint8_t>(y);
+        uint8_t* sp = spec_mask.ptr<uint8_t>(y);
         for (int x = 0; x < small.cols; ++x) {
-            if (hp[x][2] > 180 && hp[x][1] < 55) ++white_cnt;
+            if (hp[x][2] >= 250 && hp[x][1] <= 15) {
+                sp[x] = 255;
+                ++specular_cnt;
+            } else if (hp[x][2] > 180 && hp[x][1] < 55) {
+                ++matte_white_cnt;
+            }
             if (gp[x] < 55) ++dark_cnt;
         }
     }
-    const double white_ratio = static_cast<double>(white_cnt) / total_px;
-    const double dark_stroke_ratio = static_cast<double>(dark_cnt) / total_px;
+    const double specular_ratio = static_cast<double>(specular_cnt) / total_px;
+    const double non_spec_px = std::max(1.0, total_px - static_cast<double>(specular_cnt));
+    const double white_ratio = static_cast<double>(matte_white_cnt) / non_spec_px;
+    const double dark_stroke_ratio = static_cast<double>(dark_cnt) / non_spec_px;
     cv::Scalar g_mean, g_std;
     cv::meanStdDev(gray, g_mean, g_std);
-    cv::Mat edges;
+    cv::Mat edges, spec_dilated;
     cv::Canny(gray, edges, 55, 150);
-    const double edge_ratio = static_cast<double>(cv::countNonZero(edges)) / total_px;
+    cv::dilate(spec_mask, spec_dilated, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
+    edges.setTo(0, spec_dilated);
+    const double edge_ratio = static_cast<double>(cv::countNonZero(edges)) / non_spec_px;
     out.infer_ms = round_to((monotonic_seconds() - t0) * 1000.0, 2);
 
     // Neural model class-specific optical corroboration gate
@@ -3041,7 +3791,8 @@ LiveCameraEngine::ClassificationResult LiveCameraEngine::classify_live_label_roi
         out.confidence = round_to(std::min(0.98, 0.84 + white_ratio * 0.20), 3);
         return out;
     }
-    if (white_ratio >= 0.28 &&
+    if (specular_ratio <= 0.35 &&
+        white_ratio >= 0.28 &&
         !(nn_pred.has_value() &&
           (*nn_pred == "covered" || *nn_pred == "crossed_out" || *nn_pred == "absent") &&
           nn_conf >= 0.65)) {
@@ -3524,6 +4275,19 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
         tracked.hand_contact_candidate
     );
 
+    std::optional<double> cur_end_asymmetry;
+    if (tr.target_locked && tr.tube_box.has_value()) {
+        const cv::Mat tube_crop = crop_norm(frame, *tr.tube_box);
+        if (!tube_crop.empty() && tube_crop.cols >= 12 && tube_crop.rows >= 4) {
+            cv::Mat tube_gray;
+            cv::cvtColor(tube_crop, tube_gray, cv::COLOR_BGR2GRAY);
+            const int tw3 = std::max(1, tube_gray.cols / 3);
+            const double left_mean = cv::mean(tube_gray(cv::Rect(0, 0, tw3, tube_gray.rows)))[0];
+            const double right_mean = cv::mean(tube_gray(cv::Rect(tube_gray.cols - tw3, 0, tw3, tube_gray.rows)))[0];
+            cur_end_asymmetry = (left_mean - right_mean) / 255.0;
+        }
+    }
+
     const double fsm_now = std::max(capture_ts, monotonic_seconds());
     std::string queued_event_id;
     bool queued_needs_evidence = false;
@@ -3534,9 +4298,14 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
     bool fire_auto_capture = false;
     AutoCaptureConfig auto_cfg_snapshot{};
     AutoSampleCallback auto_cb;
-    bool trigger_burst = false;
-    std::string burst_cid;
-    std::string burst_reason;
+    struct FinishedBurst {
+        std::string cid;
+        std::string reason;
+        double mono{0.0};
+        std::vector<BufferedFrame> frames;
+    };
+    std::vector<FinishedBurst> bursts_to_enqueue;
+    bool active_burst_just_started = false;
 
     pre_trigger_ring_.push_if_due(current_frame_id, capture_ts, frame);
 
@@ -3596,6 +4365,10 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
             }
         }
 
+        json optics_snap = camera_optics_to_json(optics_config_);
+        optics_snap["auto_calibrating"] = auto_calibrating_;
+        optics_snap["calibration_status"] = calibration_status_;
+
         json frame_meta{
             {"camera_status", "ONLINE"},
             {"online", true},
@@ -3630,6 +4403,7 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
             {"mirror_horizontal", mirror_now},
             {"work_mode", work_mode_now},
             {"hardware_3a", hardware_3a_status_},
+            {"camera_optics", std::move(optics_snap)},
             {"tracked_objects", tr.tracked_objects},
             {"tracked_label_box", (tr.target_locked && tr.label_box.has_value()) ? box_to_json(tr.label_box) : json(nullptr)},
             {"config_version", roi_ver},
@@ -3659,7 +4433,12 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                     reasons.push_back("PERSISTENCE_QUEUE_OVERFLOW");
                 }
             } else {
-                if (tr.bare_hand_touching_part && work_mode_now == "strict" && !alarm_latched_) {
+                if (tr.bare_hand_touching_part && work_mode_now == "strict") {
+                    ++bare_hand_violation_streak_;
+                } else {
+                    bare_hand_violation_streak_ = 0;
+                }
+                if (bare_hand_violation_streak_ >= 3 && work_mode_now == "strict" && !alarm_latched_) {
                     alarm_latched_ = true;
                     latched_reason_ = "BARE_HAND_VIOLATION";
                     latched_cycle_id_ = fsm_.cycle_id().value_or(generate_live_cycle_id());
@@ -3681,6 +4460,7 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                             pass_target_lost_since_.reset();
                             active_cycle_tube_center_.reset();
                             active_cycle_pipe_color_.clear();
+                            active_cycle_end_asymmetry_.reset();
                             last_emitted_dedup_key_.clear();
                             changed = true;
                         }
@@ -3693,6 +4473,7 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                         fsm_ = InspectionFSM(live_fsm_config());
                         active_cycle_tube_center_.reset();
                         active_cycle_pipe_color_.clear();
+                        active_cycle_end_asymmetry_.reset();
                         ++cycle_generation_;
                     }
 
@@ -3717,6 +4498,7 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                     if (fsm_.state() == FSMState::WAIT_PART) {
                         active_cycle_tube_center_.reset();
                         active_cycle_pipe_color_.clear();
+                        active_cycle_end_asymmetry_.reset();
                         FSMEvent nc{};
                         nc.kind = "new_cycle";
                         nc.cycle_id = generate_live_cycle_id();
@@ -3752,6 +4534,15 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                                 cur_tube_center->second - active_cycle_tube_center_->second
                             );
                             if (jump > 0.25) {
+                                swap_suspected = true;
+                            }
+                        }
+                        if (active_cycle_end_asymmetry_.has_value() && cur_end_asymmetry.has_value()) {
+                            const double prev_asym = *active_cycle_end_asymmetry_;
+                            const double cur_asym = *cur_end_asymmetry;
+                            if (std::abs(prev_asym) >= 0.12 &&
+                                (prev_asym * cur_asym) < 0.0 &&
+                                std::abs(cur_asym - prev_asym) >= 0.24) {
                                 swap_suspected = true;
                             }
                         }
@@ -3812,6 +4603,11 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                             if (cls.pipe_color == "yellow" || cls.pipe_color == "blue") {
                                 active_cycle_pipe_color_ = cls.pipe_color;
                             }
+                            if (!active_cycle_end_asymmetry_.has_value() &&
+                                cur_end_asymmetry.has_value() &&
+                                std::abs(*cur_end_asymmetry) >= 0.12) {
+                                active_cycle_end_asymmetry_ = cur_end_asymmetry;
+                            }
                         }
 
                         active_fsm_state = fsm_.state_str();
@@ -3829,7 +4625,7 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
             }
             state_["view_valid"] = view_valid;
             state_["view_valid_reasons"] = reasons;
-            state_["bare_hand_violation"] = tr.bare_hand_touching_part ||
+            state_["bare_hand_violation"] = (bare_hand_violation_streak_ >= 3) ||
                                             (latched_reason_.value_or("") == "BARE_HAND_VIOLATION");
             state_["alarm_latched"] = alarm_latched_;
             state_["label_contact_active"] = tracked.hand_contact_candidate;
@@ -3893,9 +4689,25 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
             }
 
             if (active_outcome == "ALARM" && changed) {
-                trigger_burst = true;
-                burst_cid = active_cycle_id.value_or("LIVE_ALARM");
-                burst_reason = active_reason.value_or("ALARM");
+                if (active_burst_.active && !active_burst_.frames.empty()) {
+                    bursts_to_enqueue.push_back(FinishedBurst{
+                        std::move(active_burst_.cycle_id),
+                        std::move(active_burst_.reason),
+                        active_burst_.trigger_mono,
+                        std::move(active_burst_.frames)
+                    });
+                }
+                active_burst_ = ActiveBurstCapture{};
+                active_burst_.active = true;
+                active_burst_.cycle_id = active_cycle_id.value_or("LIVE_ALARM");
+                active_burst_.reason = active_reason.value_or("ALARM");
+                active_burst_.trigger_mono = fsm_now;
+                active_burst_.post_frames_remaining = 10;
+                active_burst_.frames = pre_trigger_ring_.snapshot_ordered();
+                if (active_burst_.frames.empty() || active_burst_.frames.back().frame_id != current_frame_id) {
+                    active_burst_.frames.push_back(BufferedFrame{current_frame_id, capture_ts, frame.clone()});
+                }
+                active_burst_just_started = true;
             }
         } else {
             raw_frame_state_ = state_;
@@ -3904,17 +4716,31 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
             }
         }
 
-        hud_bare_violation = tr.bare_hand_touching_part ||
+        if (active_burst_.active && !active_burst_just_started && (current_frame_id % 5) == 0) {
+            active_burst_.frames.push_back(BufferedFrame{current_frame_id, capture_ts, frame.clone()});
+            --active_burst_.post_frames_remaining;
+            if (active_burst_.post_frames_remaining <= 0) {
+                bursts_to_enqueue.push_back(FinishedBurst{
+                    std::move(active_burst_.cycle_id),
+                    std::move(active_burst_.reason),
+                    active_burst_.trigger_mono,
+                    std::move(active_burst_.frames)
+                });
+                active_burst_ = ActiveBurstCapture{};
+            }
+        }
+
+        hud_bare_violation = (bare_hand_violation_streak_ >= 3) ||
                              (latched_reason_.value_or("") == "BARE_HAND_VIOLATION");
         hud_alarm_latched = alarm_latched_;
     }
 
-    if (trigger_burst) {
+    for (auto& b : bursts_to_enqueue) {
         async_evidence_writer_.enqueue_burst(
-            burst_cid,
-            burst_reason,
-            pre_trigger_ring_.snapshot_ordered(),
-            fsm_now
+            b.cid,
+            b.reason,
+            std::move(b.frames),
+            b.mono
         );
     }
 

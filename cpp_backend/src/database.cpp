@@ -704,6 +704,12 @@ void StationDatabase::open_and_initialize() {
             purged_at_utc TEXT,
             purged_monotonic_s REAL
         );
+        CREATE TABLE IF NOT EXISTS camera_optics (
+            singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+            updated_at_utc TEXT NOT NULL,
+            changed_by TEXT NOT NULL,
+            optics_json TEXT NOT NULL
+        );
     )SQL");
 
     if (!column_exists_unlocked("cycles", "source")) {
@@ -1252,6 +1258,97 @@ json StationDatabase::list_config_history(int limit) const {
     return arr;
 }
 
+json StationDatabase::get_camera_optics() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    StmtGuard stmt(
+        db_,
+        "SELECT updated_at_utc, changed_by, optics_json FROM camera_optics WHERE singleton_id=1;"
+    );
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        const std::string updated = col_text(stmt.get(), 0);
+        const std::string actor = col_text(stmt.get(), 1);
+        CameraOpticsConfig cfg{};
+        try {
+            cfg = camera_optics_from_json(json::parse(col_text(stmt.get(), 2)), cfg);
+        } catch (...) {
+        }
+        json out = camera_optics_to_json(cfg);
+        out["updated_at_utc"] = updated.empty() ? json(nullptr) : json(updated);
+        out["changed_by"] = actor.empty() ? json(nullptr) : json(actor);
+        return out;
+    }
+    json out = camera_optics_to_json(CameraOpticsConfig{});
+    out["updated_at_utc"] = nullptr;
+    out["changed_by"] = nullptr;
+    return out;
+}
+
+json StationDatabase::save_camera_optics(const json& payload, const std::string& actor) {
+    if (!payload.is_object()) {
+        throw DatabaseHttpError(422, "INVALID_CAMERA_OPTICS_PAYLOAD");
+    }
+    static const std::set<std::string> kAllowed = {
+        "lock_3a", "exposure", "gain", "focus", "wb_temperature", "backlight_comp", "calibrated"
+    };
+    for (auto it = payload.begin(); it != payload.end(); ++it) {
+        if (kAllowed.find(it.key()) == kAllowed.end()) {
+            throw DatabaseHttpError(422, "EXTRA_FIELD_FORBIDDEN:" + it.key());
+        }
+        const std::string& k = it.key();
+        const json& v = it.value();
+        if (k == "lock_3a" || k == "calibrated") {
+            if (!v.is_boolean()) throw DatabaseHttpError(422, "INVALID_OPTICS_FIELD:" + k);
+        } else if (k == "backlight_comp") {
+            if (!(v.is_boolean() || (v.is_number() && !v.is_boolean() && std::isfinite(v.get<double>())))) {
+                throw DatabaseHttpError(422, "INVALID_OPTICS_FIELD:" + k);
+            }
+        } else {
+            if (!v.is_number() || v.is_boolean() || !std::isfinite(v.get<double>())) {
+                throw DatabaseHttpError(422, "INVALID_OPTICS_FIELD:" + k);
+            }
+        }
+    }
+
+    const std::string now = utc_now_iso();
+    const std::string clean_actor = actor.empty() ? "engineer" : actor;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    CameraOpticsConfig current{};
+    {
+        StmtGuard cur_stmt(db_, "SELECT optics_json FROM camera_optics WHERE singleton_id=1;");
+        if (sqlite3_step(cur_stmt.get()) == SQLITE_ROW) {
+            try {
+                current = camera_optics_from_json(json::parse(col_text(cur_stmt.get(), 0)), current);
+            } catch (...) {
+            }
+        }
+    }
+    CameraOpticsConfig merged = camera_optics_from_json(payload, current);
+    if (!payload.contains("calibrated")) {
+        merged.calibrated = true;
+    }
+
+    const json clean_json = camera_optics_to_json(merged);
+    const std::string dumped = clean_json.dump();
+
+    TransactionGuard tx(db_);
+    {
+        StmtGuard upd(db_, "INSERT OR REPLACE INTO camera_optics VALUES(1,?,?,?);");
+        bind_text(upd.get(), 1, now);
+        bind_text(upd.get(), 2, clean_actor);
+        bind_text(upd.get(), 3, dumped);
+        if (sqlite3_step(upd.get()) != SQLITE_DONE) {
+            throw std::runtime_error(std::string("Failed to save camera_optics: ") + sqlite3_errmsg(db_));
+        }
+    }
+    tx.commit();
+
+    json out = clean_json;
+    out["updated_at_utc"] = now;
+    out["changed_by"] = clean_actor;
+    return out;
+}
+
 json StationDatabase::list_cycles(int limit) const {
     const int clamped = std::clamp(limit, 1, 500);
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1663,7 +1760,7 @@ bool StationDatabase::record_live_transition(
         if (++write_ops_since_checkpoint_ >= 100) {
             write_ops_since_checkpoint_ = 0;
             try {
-                exec_sql_unlocked("PRAGMA wal_checkpoint(TRUNCATE);");
+                exec_sql_unlocked("PRAGMA wal_checkpoint(PASSIVE);");
             } catch (...) {
             }
         }
@@ -1745,6 +1842,59 @@ json StationDatabase::enforce_evidence_quota(std::uint64_t max_bytes, double min
         free_ratio = current_free_ratio();
     }
 
+    int deleted_burst_dirs = 0;
+    if (total_bytes > max_bytes || free_ratio < min_free_ratio) {
+        const std::filesystem::path bursts_root = evidence_root_ / "bursts";
+        std::error_code bec;
+        if (std::filesystem::exists(bursts_root, bec) && std::filesystem::is_directory(bursts_root, bec)) {
+            struct BurstDirEntry {
+                std::filesystem::file_time_type mtime{};
+                std::string name;
+                std::filesystem::path path;
+                std::uint64_t bytes{0};
+            };
+            std::vector<BurstDirEntry> burst_dirs;
+            for (std::filesystem::directory_iterator dit(bursts_root, bec), dend;
+                 !bec && dit != dend;
+                 dit.increment(bec)) {
+                std::error_code dec;
+                if (!dit->is_directory(dec) || !is_path_within(evidence_root_, dit->path())) {
+                    continue;
+                }
+                BurstDirEntry item;
+                item.path = dit->path();
+                item.name = path_to_utf8(item.path.filename());
+                item.mtime = dit->last_write_time(dec);
+                std::error_code rec;
+                for (std::filesystem::recursive_directory_iterator rit(item.path, rec), rend;
+                     !rec && rit != rend;
+                     rit.increment(rec)) {
+                    std::error_code fec;
+                    if (rit->is_regular_file(fec)) {
+                        const auto fsz = rit->file_size(fec);
+                        if (!fec) item.bytes += static_cast<std::uint64_t>(fsz);
+                    }
+                }
+                burst_dirs.push_back(std::move(item));
+            }
+            std::sort(burst_dirs.begin(), burst_dirs.end(), [](const BurstDirEntry& a, const BurstDirEntry& b) {
+                if (a.mtime != b.mtime) return a.mtime < b.mtime;
+                return a.name < b.name;
+            });
+            for (const auto& item : burst_dirs) {
+                if (total_bytes <= max_bytes && free_ratio >= min_free_ratio) break;
+                std::error_code rme;
+                std::filesystem::remove_all(item.path, rme);
+                if (!rme) {
+                    total_bytes = (total_bytes > item.bytes) ? (total_bytes - item.bytes) : 0;
+                    freed_bytes += item.bytes;
+                    ++deleted_burst_dirs;
+                    free_ratio = current_free_ratio();
+                }
+            }
+        }
+    }
+
     if (deleted_count > 0 && db_) {
         try {
             exec_sql_unlocked("PRAGMA wal_checkpoint(TRUNCATE);");
@@ -1755,6 +1905,7 @@ json StationDatabase::enforce_evidence_quota(std::uint64_t max_bytes, double min
 
     return json{
         {"deleted_count", deleted_count},
+        {"deleted_burst_dirs", deleted_burst_dirs},
         {"freed_bytes", freed_bytes},
         {"remaining_bytes", total_bytes}
     };

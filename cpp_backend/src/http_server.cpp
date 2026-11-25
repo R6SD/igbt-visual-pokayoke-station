@@ -684,6 +684,19 @@ StationHttpServer::StationHttpServer(
     camera_.set_evidence_root(db_.evidence_root());
     camera_.set_config_loader([this]() { return db_.get_config(); });
     camera_.update_config(db_.get_config());
+    {
+        const json saved_optics = db_.get_camera_optics();
+        camera_.set_camera_optics(
+            camera_optics_from_json(saved_optics),
+            saved_optics.value("calibrated", false)
+        );
+    }
+    camera_.set_optics_persist_callback([this](const CameraOpticsConfig& cfg) {
+        try {
+            db_.save_camera_optics(camera_optics_to_json(cfg), "auto-anti-glare");
+        } catch (...) {
+        }
+    });
     camera_.set_cycle_callback(
         [this](const json& snap, const std::optional<std::string>& prev_fsm, const std::vector<uint8_t>& ev_jpg) {
             return db_.record_live_transition(snap, prev_fsm, ev_jpg);
@@ -792,6 +805,7 @@ json StationHttpServer::build_offline_live_state() const {
     state["mirror_horizontal"] = camera_.get_mirror_horizontal();
     state["work_mode"] = camera_.get_work_mode();
     state["auto_capture"] = camera_.get_auto_capture().to_json();
+    state["camera_optics"] = camera_.get_camera_optics_json();
     state["engine"] = "cpp20";
     if (!state.contains("updated_at_utc") || state["updated_at_utc"].is_null()) {
         state["updated_at_utc"] = utc_now_iso();
@@ -838,6 +852,7 @@ json StationHttpServer::build_current_state_response() {
     state["mirror_horizontal"] = camera_.get_mirror_horizontal();
     state["work_mode"] = camera_.get_work_mode();
     state["auto_capture"] = camera_.get_auto_capture().to_json();
+    state["camera_optics"] = camera_.get_camera_optics_json();
     state["engine"] = "cpp20";
     state["online"] = cam_online || state.value("camera_status", "") == "ONLINE";
     if (cam_online) {
@@ -988,6 +1003,9 @@ void StationHttpServer::register_routes() {
             try {
                 fn(req, res);
             } catch (const DatabaseHttpError& err) {
+                if (err.status_code() == 429) {
+                    res.set_header("Retry-After", "60");
+                }
                 send_error(res, err.status_code(), err.detail());
             } catch (const std::out_of_range& err) {
                 send_error(res, 404, err.what());
@@ -1009,6 +1027,16 @@ void StationHttpServer::register_routes() {
             {"interlock_backend", interlock_.backend_name()},
             {"mes_connected", mes_client_.is_connected()},
             {"engine", "cpp20"}
+        });
+    }));
+
+    svr_.Get("/api/diagnostics/runtime", wrap([this](const httplib::Request&, httplib::Response& res) {
+        const json cam_state = camera_.get_state_json();
+        send_json(res, 200, json{
+            {"async_evidence", camera_.async_evidence_stats()},
+            {"db_pragmas", db_.pragma_diagnostics()},
+            {"hardware_3a", cam_state.value("hardware_3a", json::object())},
+            {"camera_optics", camera_.get_camera_optics_json()}
         });
     }));
 
@@ -1187,6 +1215,30 @@ void StationHttpServer::register_routes() {
             throw DatabaseHttpError(422, "INVALID_WORK_MODE:" + mode);
         }
         send_json(res, 200, json{{"work_mode", camera_.set_work_mode(mode)}});
+    }));
+
+    svr_.Get("/api/camera/optics", wrap([this](const httplib::Request&, httplib::Response& res) {
+        json out = camera_.get_camera_optics_json();
+        const json persisted = db_.get_camera_optics();
+        out["updated_at_utc"] = persisted.value("updated_at_utc", json(nullptr));
+        out["changed_by"] = persisted.value("changed_by", json(nullptr));
+        send_json(res, 200, out);
+    }));
+
+    svr_.Post("/api/camera/optics", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const std::string actor = auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        const json body = parse_json_body_or_throw(req);
+        const json saved = db_.save_camera_optics(body, actor);
+        json out = camera_.set_camera_optics(camera_optics_from_json(saved), true);
+        out["updated_at_utc"] = saved.value("updated_at_utc", json(nullptr));
+        out["changed_by"] = saved.value("changed_by", json(nullptr));
+        send_json(res, 200, out);
+    }));
+
+    svr_.Post("/api/camera/optics/auto_calibrate", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        json out = camera_.trigger_anti_glare_calibration();
+        send_json(res, 200, json{{"triggered", true}, {"optics", std::move(out)}});
     }));
 
     // 4. Simulation & Station Snapshot
@@ -2122,8 +2174,10 @@ bool StationHttpServer::listen_blocking() {
     }
     bound_port_.store(port);
     running_.store(true);
+    start_maintenance_thread();
     const bool ok = svr_.listen_after_bind();
     running_.store(false);
+    stop_maintenance_thread();
     if (options_.enable_live_camera) {
         camera_.stop();
     }
@@ -2151,6 +2205,7 @@ int StationHttpServer::start_background() {
     }
     bound_port_.store(port);
     running_.store(true);
+    start_maintenance_thread();
 
     server_thread_ = std::thread([this]() {
         svr_.listen_after_bind();
@@ -2163,14 +2218,43 @@ int StationHttpServer::start_background() {
     return port;
 }
 
+void StationHttpServer::start_maintenance_thread() {
+    stop_maintenance_thread();
+    maintenance_thread_ = std::thread([this]() {
+        std::unique_lock<std::mutex> lk(maintenance_mutex_);
+        while (!stopping_.load()) {
+            if (maintenance_cv_.wait_for(lk, std::chrono::minutes(5), [this]() {
+                    return stopping_.load();
+                })) {
+                break;
+            }
+            lk.unlock();
+            try {
+                (void)db_.enforce_evidence_quota();
+            } catch (...) {
+            }
+            lk.lock();
+        }
+    });
+}
+
+void StationHttpServer::stop_maintenance_thread() {
+    maintenance_cv_.notify_all();
+    if (maintenance_thread_.joinable()) {
+        maintenance_thread_.join();
+    }
+}
+
 void StationHttpServer::stop() {
     stopping_.store(true);
+    maintenance_cv_.notify_all();
     if (svr_.is_running()) {
         svr_.stop();
     }
     if (server_thread_.joinable()) {
         server_thread_.join();
     }
+    stop_maintenance_thread();
     running_.store(false);
     if (options_.enable_live_camera && camera_.is_running()) {
         camera_.stop();

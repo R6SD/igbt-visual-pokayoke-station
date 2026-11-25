@@ -203,6 +203,26 @@ SimulationRunResult run_simulation_scenario(
 );
 
 // ============================================================================
+// Hardware Camera Optics & Closed-Loop Anti-Glare Configuration
+// ============================================================================
+
+struct CameraOpticsConfig {
+    bool lock_3a{true};
+    double exposure{-7.0};
+    double gain{0.0};
+    int focus{-1};
+    int wb_temperature{-1};
+    int backlight_comp{0};
+    bool calibrated{false};
+};
+
+json camera_optics_to_json(const CameraOpticsConfig& cfg);
+CameraOpticsConfig camera_optics_from_json(
+    const json& j,
+    const CameraOpticsConfig& base = CameraOpticsConfig{}
+);
+
+// ============================================================================
 // Real-Time 720P @ 25.0 FPS Live Camera, Dual Model Inference & Auto-Capture
 // ============================================================================
 
@@ -276,6 +296,29 @@ public:
     std::string get_work_mode() const;
     bool set_show_auxiliary_rois(bool show);
     bool get_show_auxiliary_rois() const;
+
+    // Hardware Camera Optics & Closed-Loop Anti-Glare Controls
+    struct AntiGlareStepResult {
+        double next_exposure{-7.0};
+        double next_gain{0.0};
+        bool converged{false};
+        double penalty{0.0};
+    };
+
+    using OpticsPersistCallback = std::function<void(const CameraOpticsConfig&)>;
+
+    static AntiGlareStepResult next_anti_glare_step(
+        double cur_exposure,
+        double cur_gain,
+        double mean_lum,
+        double over_frac,
+        double p95_lum
+    );
+
+    void set_optics_persist_callback(OpticsPersistCallback cb);
+    json set_camera_optics(const CameraOpticsConfig& cfg, bool mark_calibrated = true);
+    json get_camera_optics_json() const;
+    json trigger_anti_glare_calibration();
 
     // Cycle & simulation controls
     static std::string generate_live_cycle_id();
@@ -375,6 +418,18 @@ private:
     bool process_frame_internal(const cv::Mat& input_bgr, double capture_ts);
     void reset_tracking_state();
     void mark_camera_unavailable(const std::string& reason);
+    static json read_camera_optics_hardware(
+        cv::VideoCapture& cap,
+        const CameraOpticsConfig& optics,
+        bool auto_calibrating,
+        const std::string& status_label
+    );
+    static json apply_camera_optics(
+        cv::VideoCapture& cap,
+        CameraOpticsConfig& optics,
+        bool allow_converge_readback,
+        const std::string& status_label
+    );
 
     std::tuple<ROISet, json, std::string, json> active_rois_and_thresholds() const;
     std::tuple<bool, bool, std::vector<std::string>> evaluate_live_calibration(
@@ -470,6 +525,12 @@ private:
     uint64_t cycle_generation_{0};
     bool hardware_3a_locked_{true};
     json hardware_3a_status_{{"locked", true}, {"source", "not_opened"}};
+    CameraOpticsConfig optics_config_{};
+    uint64_t optics_generation_{0};
+    uint64_t anti_glare_calibrate_generation_{0};
+    bool auto_calibrating_{false};
+    std::string calibration_status_{"idle"};
+    OpticsPersistCallback optics_persist_callback_;
 
     cv::Mat raw_frame_;
     std::optional<Box> raw_frame_label_box_;
@@ -527,9 +588,21 @@ private:
 
     SkipFrameRingBuffer pre_trigger_ring_{25, 5};
     AsyncEvidenceWriter async_evidence_writer_;
+    struct ActiveBurstCapture {
+        bool active{false};
+        std::string cycle_id;
+        std::string reason;
+        double trigger_mono{0.0};
+        int post_frames_remaining{0};
+        std::vector<BufferedFrame> frames;
+    };
+    ActiveBurstCapture active_burst_;
     cv::Mat last_auto_capture_gray_small_;
     std::optional<std::pair<double, double>> active_cycle_tube_center_;
     std::string active_cycle_pipe_color_;
+    std::optional<double> active_cycle_end_asymmetry_;
+    int bare_hand_violation_streak_{0};
+    int consecutive_detach_count_{0};
 };
 
 }  // namespace igbt
