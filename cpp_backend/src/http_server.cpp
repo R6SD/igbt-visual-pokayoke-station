@@ -1569,8 +1569,7 @@ void StationHttpServer::register_routes() {
         send_json(res, 200, training_.list_samples(label, q, limit));
     }));
 
-    svr_.Get("/api/dataset/auto_capture", wrap([this](const httplib::Request& req, httplib::Response& res) {
-        auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+    svr_.Get("/api/dataset/auto_capture", wrap([this](const httplib::Request&, httplib::Response& res) {
         send_json(res, 200, camera_.get_auto_capture().to_json());
     }));
 

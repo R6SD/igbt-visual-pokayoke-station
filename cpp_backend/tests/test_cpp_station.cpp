@@ -605,10 +605,10 @@ void test_http_server_auth_autocapture_training_and_mjpeg() {
 
     httplib::Headers admin_hdrs = {{"X-Admin-Token", session_tok}};
 
-    // Unauthenticated protected mutations MUST return 401
+    // Unauthenticated protected mutations MUST return 401; read-only auto_capture status is public (200)
     REQUIRE_EQ(cli.Post("/api/cycles/purge", R"({"scope":"simulated_only","confirm":true})", "application/json")->status, 401);
     REQUIRE_EQ(cli.Post("/api/dataset/clear", "", "application/json")->status, 401);
-    REQUIRE_EQ(cli.Get("/api/dataset/auto_capture")->status, 401);
+    REQUIRE_EQ(cli.Get("/api/dataset/auto_capture")->status, 200);
     REQUIRE_EQ(cli.Post("/api/dataset/auto_capture", R"({"enabled":true})", "application/json")->status, 401);
 
     // Authenticated work_mode succeeds; expiring sessions immediately fails closed with 401

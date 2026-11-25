@@ -1862,11 +1862,12 @@ void LiveCameraEngine::capture_loop() {
             continue;
         }
 
-        // Strict property sequence: buffer -> 1280x720 -> 25 FPS -> FOURCC('M','J','P','G') LAST!
+        // Strict property sequence: buffer -> 1280x720 -> 30.0 FPS (UVC MJPG native) -> FOURCC('M','J','P','G') LAST!
+        // Requesting 25.0 FPS on Logitech C920 DirectShow rounds down to 15.0 FPS because UVC only lists 30.0.
         cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
         cap.set(cv::CAP_PROP_FRAME_WIDTH, kDefaultCameraWidth);
         cap.set(cv::CAP_PROP_FRAME_HEIGHT, kDefaultCameraHeight);
-        cap.set(cv::CAP_PROP_FPS, kDefaultTargetFps);
+        cap.set(cv::CAP_PROP_FPS, 30.0);
         cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
 
         {
@@ -1875,18 +1876,87 @@ void LiveCameraEngine::capture_loop() {
             fps_times_.clear();
         }
 
+        // Decouple blocking UVC cap.read() from the 40.0 ms (25.0 FPS) consumer pacer to eliminate
+        // 30 Hz UVC VSync aliasing and Windows 15.625 ms timer quantum oversleep.
+        struct GrabberState {
+            std::mutex mtx;
+            std::condition_variable cv;
+            cv::Mat latest_frame;
+            uint64_t latest_seq{0};
+            std::chrono::steady_clock::time_point last_frame_tp{};
+            bool grab_failed{false};
+            std::atomic<bool> stop{false};
+        } grab_state;
+
+        std::thread grabber([&]() {
+            while (!stop_requested_.load() && !grab_state.stop.load()) {
+                cv::Mat raw;
+                const bool ok = cap.read(raw);
+                const auto grabbed_tp = std::chrono::steady_clock::now();
+                if (!ok || raw.empty()) {
+                    {
+                        std::lock_guard<std::mutex> glk(grab_state.mtx);
+                        grab_state.grab_failed = true;
+                    }
+                    grab_state.cv.notify_all();
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> glk(grab_state.mtx);
+                    grab_state.latest_frame = std::move(raw);
+                    ++grab_state.latest_seq;
+                    grab_state.last_frame_tp = grabbed_tp;
+                }
+                grab_state.cv.notify_all();
+            }
+        });
+
+        constexpr auto kHardwareStallTimeout = std::chrono::milliseconds(1500);
+        const auto first_wait_deadline = std::chrono::steady_clock::now() + kHardwareStallTimeout;
+        bool first_frame_ready = false;
+        {
+            std::unique_lock<std::mutex> glk(grab_state.mtx);
+            while (!stop_requested_.load() && !grab_state.grab_failed && grab_state.latest_seq == 0) {
+                const auto now_tp = std::chrono::steady_clock::now();
+                if (now_tp >= first_wait_deadline) break;
+                const auto step = std::min<std::chrono::milliseconds>(
+                    std::chrono::milliseconds(50),
+                    std::chrono::duration_cast<std::chrono::milliseconds>(first_wait_deadline - now_tp)
+                );
+                grab_state.cv.wait_for(glk, std::max(std::chrono::milliseconds(1), step));
+            }
+            first_frame_ready = (grab_state.latest_seq > 0 && !grab_state.grab_failed);
+        }
+
+        if (!first_frame_ready) {
+            if (!stop_requested_.load()) {
+                mark_camera_unavailable("CAMERA_FEED_LOST");
+            }
+            grab_state.stop.store(true);
+            if (grabber.joinable()) {
+                grabber.join();
+            }
+            cap.release();
+            if (!stop_requested_.load()) {
+                interruptible_sleep(std::chrono::milliseconds(400));
+            }
+            continue;
+        }
+
         auto deadline = std::chrono::steady_clock::now();
 
         while (!stop_requested_.load()) {
             deadline = next_pacer_deadline(deadline, std::chrono::steady_clock::now(), kFrameInterval);
 
-            // Sleep until exact 40.0 ms pacer boundary
+            // Account for Windows default 15.625 ms timer resolution: only sleep_for(1ms)
+            // while > 17 ms remain, then yield() for the final < 17 ms so wakeup hits
+            // the 40.0 ms pacer boundary within < 0.2 ms.
             while (!stop_requested_.load()) {
                 const auto now_tp = std::chrono::steady_clock::now();
                 if (now_tp >= deadline) break;
                 const auto rem = deadline - now_tp;
-                if (rem > std::chrono::milliseconds(2)) {
-                    std::this_thread::sleep_for(rem - std::chrono::milliseconds(1));
+                if (rem > std::chrono::milliseconds(17)) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 } else {
                     std::this_thread::yield();
                 }
@@ -1894,11 +1964,24 @@ void LiveCameraEngine::capture_loop() {
             if (stop_requested_.load()) break;
 
             cv::Mat frame;
-            const bool ok = cap.read(frame);
+            bool failed = false;
+            bool stalled = false;
+            {
+                std::lock_guard<std::mutex> glk(grab_state.mtx);
+                failed = grab_state.grab_failed;
+                if (!failed && grab_state.latest_seq > 0) {
+                    const auto age = std::chrono::steady_clock::now() - grab_state.last_frame_tp;
+                    if (age > kHardwareStallTimeout) {
+                        stalled = true;
+                    } else {
+                        frame = grab_state.latest_frame.clone();
+                    }
+                }
+            }
             const double capture_ts = monotonic_seconds();
             if (stop_requested_.load()) break;
 
-            if (!ok || frame.empty()) {
+            if (failed || stalled || frame.empty()) {
                 mark_camera_unavailable("CAMERA_FEED_LOST");
                 break;
             }
@@ -1917,6 +2000,10 @@ void LiveCameraEngine::capture_loop() {
             process_frame_internal(frame, capture_ts);
         }
 
+        grab_state.stop.store(true);
+        if (grabber.joinable()) {
+            grabber.join();
+        }
         cap.release();
         if (!stop_requested_.load()) {
             interruptible_sleep(std::chrono::milliseconds(400));
