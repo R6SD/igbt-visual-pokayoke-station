@@ -1147,7 +1147,7 @@ void test_v42_hardening_and_diagnostics() {
         REQUIRE_EQ(st.value("alarm_latched", true), false);
     }
 
-    // In-work-zone bare skin touching tube requires 3 consecutive frames before latching ALARM
+    // In-work-zone bare skin touching tube requires 2 consecutive frames (fast trigger) before latching ALARM
     const cv::Mat f_bare = make_tube_scene(false, true);
     ts += 0.04;
     REQUIRE(cam.process_injected_frame(f_bare, ts));
@@ -1155,15 +1155,11 @@ void test_v42_hardening_and_diagnostics() {
 
     ts += 0.04;
     REQUIRE(cam.process_injected_frame(f_bare, ts));
-    REQUIRE_EQ(cam.get_state_json().value("alarm_latched", true), false);
-
-    ts += 0.04;
-    REQUIRE(cam.process_injected_frame(f_bare, ts));
     {
-        const json st3 = cam.get_state_json();
-        REQUIRE_EQ(st3.value("alarm_latched", false), true);
-        REQUIRE_EQ(st3.value("bare_hand_violation", false), true);
-        REQUIRE_EQ(st3.value("result_reason", ""), "BARE_HAND_VIOLATION");
+        const json st2 = cam.get_state_json();
+        REQUIRE_EQ(st2.value("alarm_latched", false), true);
+        REQUIRE_EQ(st2.value("bare_hand_violation", false), true);
+        REQUIRE_EQ(st2.value("result_reason", ""), "BARE_HAND_VIOLATION");
     }
 
     // Feed 52 more frames so all 10 post-trigger 5-FPS frames finish and flush cleanly
@@ -2068,6 +2064,437 @@ void test_adam_modbus_dio_watchdog_and_failsafe() {
     mock.stop();
 }
 
+// ----------------------------------------------------------------------------
+// Test 11: v4.4 P0-3 RANSAC Tube Alignment, TUBE_ALIGN_FAIL, NanoDet GFL & 2/10 Hysteresis
+// ----------------------------------------------------------------------------
+void test_v44_ransac_alignment_nanodet_and_hysteresis() {
+    ScopedTempDir tmp;
+
+    auto make_tilted_tube_scene = [](double angle_deg, double tube_h_frac = 0.125, bool glare_midband = false) {
+        const int W = kDefaultCameraWidth;
+        const int H = kDefaultCameraHeight;
+        cv::Mat img(H, W, CV_8UC3, cv::Scalar(46, 50, 54));
+        const double rad = angle_deg * 3.14159265358979323846 / 180.0;
+        const cv::Point2d center(W * 0.50, H * 0.50);
+        const cv::Point2d u(std::cos(rad), std::sin(rad));
+        const cv::Point2d n(-u.y, u.x);
+        const double half_l = W * 0.34;
+        const double half_w = H * tube_h_frac * 0.5;
+
+        auto to_pt = [&](double s, double t) {
+            return cv::Point(
+                static_cast<int>(std::llround(center.x + s * u.x + t * n.x)),
+                static_cast<int>(std::llround(center.y + s * u.y + t * n.y))
+            );
+        };
+        const std::vector<cv::Point> tube_poly = {
+            to_pt(-half_l, -half_w), to_pt(half_l, -half_w),
+            to_pt(half_l, half_w), to_pt(-half_l, half_w)
+        };
+        cv::fillConvexPoly(img, tube_poly, cv::Scalar(35, 195, 235));
+        cv::polylines(img, tube_poly, true, cv::Scalar(20, 125, 170), 3, cv::LINE_AA);
+
+        const double lbl_hl = W * 0.07;
+        const double lbl_hw = half_w * 0.72;
+        const std::vector<cv::Point> lbl_poly = {
+            to_pt(-lbl_hl, -lbl_hw), to_pt(lbl_hl, -lbl_hw),
+            to_pt(lbl_hl, lbl_hw), to_pt(-lbl_hl, lbl_hw)
+        };
+        cv::fillConvexPoly(img, lbl_poly, cv::Scalar(212, 215, 218));
+        cv::polylines(img, lbl_poly, true, cv::Scalar(60, 62, 65), 2, cv::LINE_AA);
+        for (double s = -lbl_hl + 12.0; s <= lbl_hl - 12.0; s += 10.0) {
+            cv::line(img, to_pt(s, -lbl_hw + 8.0), to_pt(s, lbl_hw - 8.0), cv::Scalar(55, 58, 60), 2, cv::LINE_AA);
+        }
+
+        // Occluding white ESD gloves gripping both tube ends
+        cv::rectangle(img, cv::Rect(static_cast<int>(0.15 * W), static_cast<int>(0.34 * H),
+                                    static_cast<int>(0.13 * W), static_cast<int>(0.36 * H)),
+                      cv::Scalar(235, 238, 240), cv::FILLED);
+        cv::rectangle(img, cv::Rect(static_cast<int>(0.72 * W), static_cast<int>(0.34 * H),
+                                    static_cast<int>(0.13 * W), static_cast<int>(0.36 * H)),
+                      cv::Scalar(235, 238, 240), cv::FILLED);
+
+        if (glare_midband) {
+            cv::rectangle(img, cv::Rect(static_cast<int>(0.29 * W), static_cast<int>(0.38 * H),
+                                        static_cast<int>(0.42 * W), static_cast<int>(0.24 * H)),
+                          cv::Scalar(255, 255, 255), cv::FILLED);
+        }
+        return img;
+    };
+
+    // 11A. Horizontal (0 deg, affine path) & 10 deg tilted (perspective path) with end-glove occlusion
+    {
+        vision::TubeGeometryAligner aligner;
+        const Box tb{0.16, 0.42, 0.84, 0.58};
+        const Box lb{0.43, 0.44, 0.57, 0.56};
+        const std::vector<Box> hands{{0.15, 0.34, 0.28, 0.70}, {0.72, 0.34, 0.85, 0.70}};
+
+        const cv::Mat f0 = make_tilted_tube_scene(0.0, 0.125, false);
+        const auto r0 = aligner.align(f0, tb, hands, lb, 0.125);
+        REQUIRE_EQ(vision::tube_align_status_to_string(r0.status), "ALIGNED");
+        REQUIRE(r0.geometry_ok);
+        REQUIRE(!r0.used_perspective);
+        REQUIRE(r0.condition_number <= 3.5);
+        REQUIRE(r0.det_2x2 >= 0.25 && r0.det_2x2 <= 4.0);
+        REQUIRE(r0.parallel_diff_deg <= 3.0);
+        REQUIRE_EQ(r0.rectified_tube_bgr.size(), cv::Size(256, 64));
+        REQUIRE_EQ(r0.rectified_label_bgr.size(), cv::Size(160, 96));
+
+        vision::TubeGeometryAligner aligner_tilt;
+        const Box tb_tilt{0.15, 0.32, 0.85, 0.68};
+        const cv::Mat f10 = make_tilted_tube_scene(10.0, 0.125, false);
+        const auto r10 = aligner_tilt.align(f10, tb_tilt, hands, lb, 0.125);
+        REQUIRE_EQ(vision::tube_align_status_to_string(r10.status), "ALIGNED");
+        REQUIRE(r10.geometry_ok);
+        REQUIRE(r10.used_perspective);
+        REQUIRE(std::abs(r10.angle_deg - 10.0) < 2.5);
+        REQUIRE(r10.condition_number <= 3.5);
+        REQUIRE(r10.parallel_diff_deg <= 3.0);
+        REQUIRE_EQ(r10.rectified_tube_bgr.size(), cv::Size(256, 64));
+        REQUIRE_EQ(r10.rectified_label_bgr.size(), cv::Size(160, 96));
+    }
+
+    // 11B. Homography gate SVD / det boundary assertions
+    {
+        double cond = 0.0, det = 0.0;
+        cv::Mat eye = cv::Mat::eye(3, 3, CV_64F);
+        REQUIRE(vision::TubeGeometryAligner::check_homography_gate(eye, 3.5, 0.25, 4.0, cond, det));
+        REQUIRE(cond < 1.05 && std::abs(det - 1.0) < 1e-3);
+
+        cv::Mat singular = (cv::Mat_<double>(3, 3) << 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+        REQUIRE(!vision::TubeGeometryAligner::check_homography_gate(singular, 3.5, 0.25, 4.0, cond, det));
+
+        cv::Mat high_shear = (cv::Mat_<double>(3, 3) << 1.0, 4.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+        REQUIRE(!vision::TubeGeometryAligner::check_homography_gate(high_shear, 3.5, 0.25, 4.0, cond, det));
+        REQUIRE(cond > 3.5);
+
+        cv::Mat tiny_det = (cv::Mat_<double>(3, 3) << 0.3, 0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0, 1.0);
+        REQUIRE(!vision::TubeGeometryAligner::check_homography_gate(tiny_det, 3.5, 0.25, 4.0, cond, det));
+    }
+
+    // 11C. REUSED_LOW_CONF (<=2 failures) -> TUBE_ALIGN_FAIL (>=3 failures) & NO unrectified fallback
+    {
+        json cfg = StationDatabase::default_config();
+        cfg["roi_calibrated"] = true;
+        cfg["roi_config_version"] = "ROI_V001";
+        cfg["config_version"] = 1;
+        cfg["calibrated_at_utc"] = utc_now_iso();
+        cfg["rois"] = json{
+            {"tube_roi", {0.16, 0.42, 0.84, 0.58}},
+            {"label_roi", {0.43, 0.45, 0.57, 0.55}},
+            {"label_contact_roi", {0.40, 0.38, 0.60, 0.62}},
+            {"left_grip_zone", {0.16, 0.34, 0.31, 0.82}},
+            {"right_grip_zone", {0.69, 0.34, 0.84, 0.82}}
+        };
+        cfg["camera_width"] = 1280;
+        cfg["camera_height"] = 720;
+        cfg["thresholds"]["expected_tube_width_norm"] = 0.14;
+
+        LiveCameraEngine cam(0, [cfg]() { return cfg; });
+        cam.update_config(cfg);
+        const cv::Mat empty_bg(kDefaultCameraHeight, kDefaultCameraWidth, CV_8UC3, cv::Scalar(48, 52, 56));
+        double ts = monotonic_seconds();
+        for (int i = 0; i < 3; ++i) {
+            ts += 0.04;
+            REQUIRE(cam.process_injected_frame(empty_bg, ts));
+        }
+
+        const cv::Mat good_frame = make_synthetic_station_frame(1280, 720, "complete", false, false);
+        for (int i = 0; i < 3; ++i) {
+            ts += 0.04;
+            REQUIRE(cam.process_injected_frame(good_frame, ts));
+        }
+        {
+            const json st_ok = cam.get_state_json();
+            REQUIRE_EQ(st_ok.value("tube_align_failed", true), false);
+            REQUIRE_EQ(st_ok.at("tube_alignment").value("status", ""), "ALIGNED");
+            REQUIRE_EQ(st_ok.value("label_status", ""), "complete");
+        }
+
+        // Blind the midband with clipped specular glare while keeping the outer tube visible
+        cv::Mat blinded = good_frame.clone();
+        cv::rectangle(
+            blinded,
+            cv::Rect(static_cast<int>(0.28 * 1280), static_cast<int>(0.38 * 720),
+                     static_cast<int>(0.44 * 1280), static_cast<int>(0.24 * 720)),
+            cv::Scalar(255, 255, 255),
+            cv::FILLED
+        );
+
+        ts += 0.04;
+        REQUIRE(cam.process_injected_frame(blinded, ts));
+        {
+            const json st1 = cam.get_state_json();
+            REQUIRE_EQ(st1.at("tube_alignment").value("status", ""), "REUSED_LOW_CONF");
+            REQUIRE_EQ(st1.value("tube_align_failed", true), false);
+            REQUIRE_EQ(st1.value("view_valid", true), false);
+            REQUIRE_EQ(st1.value("c_timer_ms", -1), 0);
+        }
+
+        ts += 0.04;
+        REQUIRE(cam.process_injected_frame(blinded, ts));
+        REQUIRE_EQ(cam.get_state_json().at("tube_alignment").value("status", ""), "REUSED_LOW_CONF");
+        REQUIRE_EQ(cam.get_state_json().value("view_valid", true), false);
+
+        ts += 0.04;
+        REQUIRE(cam.process_injected_frame(blinded, ts));
+        {
+            const json st3 = cam.get_state_json();
+            REQUIRE_EQ(st3.at("tube_alignment").value("status", ""), "TUBE_ALIGN_FAIL");
+            REQUIRE_EQ(st3.value("tube_align_failed", false), true);
+            REQUIRE_EQ(st3.value("view_valid", true), false);
+            REQUIRE_EQ(st3.value("label_status", ""), "unknown");
+            REQUIRE(st3.at("label_confidence").is_null());
+            REQUIRE_EQ(st3.value("result_reason", ""), "TUBE_ALIGN_FAIL");
+        }
+    }
+
+    // 11D. Width deviation > 12% & interframe angle jump > 15 deg rejection
+    {
+        vision::TubeGeometryAligner aligner;
+        const Box tb{0.16, 0.40, 0.84, 0.60};
+        const std::vector<Box> hands{{0.15, 0.34, 0.28, 0.70}, {0.72, 0.34, 0.85, 0.70}};
+
+        const cv::Mat wide_tube = make_tilted_tube_scene(0.0, 0.20, false);  // 0.20 vs 0.125 prior (+60%)
+        const auto rw = aligner.align(wide_tube, tb, hands, std::nullopt, 0.125);
+        REQUIRE(!rw.geometry_ok);
+        REQUIRE_EQ(rw.fail_reason, "WIDTH_DEV_EXCEEDED");
+
+        aligner.reset();
+        const cv::Mat f0 = make_tilted_tube_scene(0.0, 0.125, false);
+        REQUIRE(aligner.align(f0, Box{0.16, 0.42, 0.84, 0.58}, hands, std::nullopt, 0.125).geometry_ok);
+        const cv::Mat f20 = make_tilted_tube_scene(20.0, 0.125, false);
+        const auto rj = aligner.align(f20, Box{0.14, 0.26, 0.86, 0.74}, hands, std::nullopt, 0.125);
+        REQUIRE(!rj.geometry_ok);
+        REQUIRE_EQ(rj.fail_reason, "ANGLE_JUMP_EXCEEDED");
+    }
+
+    // 11E. NanoDet-Plus-m GFL output decoding ([1, 2125, 36] & [1, 2100, 36]), Letterbox, NMS & thresholds
+    {
+        vision::HandGloveConfig hcfg;
+        const int orig_w = 1280, orig_h = 720, sz = 320;
+        const float lb_scale = std::min(static_cast<float>(sz) / orig_w, static_cast<float>(sz) / orig_h);
+        const int pad_x = (sz - static_cast<int>(std::round(orig_w * lb_scale))) / 2;
+        const int pad_y = (sz - static_cast<int>(std::round(orig_h * lb_scale))) / 2;
+
+        auto set_gfl_cell = [&](cv::Mat& out, int row_idx, int cls, float score,
+                                float dl_bins, float dt_bins, float dr_bins, float db_bins) {
+            out.at<float>(0, row_idx, cls) = score;
+            const std::array<float, 4> d_bins{dl_bins, dt_bins, dr_bins, db_bins};
+            for (int e = 0; e < 4; ++e) {
+                const int best_k = std::clamp(static_cast<int>(std::llround(d_bins[e])), 0, 7);
+                for (int k = 0; k < 8; ++k) {
+                    out.at<float>(0, row_idx, 4 + e * 8 + k) = (k == best_k) ? 10.0f : -10.0f;
+                }
+            }
+        };
+
+        // 4-stride [1, 2125, 36]
+        const int dims4[3] = {1, 2125, 36};
+        cv::Mat raw4 = cv::Mat::zeros(3, dims4, CV_32F);
+        // Stride-32 starts at 1600 + 400 = 2000 (grid 10x10, cell (5, 2) -> cx=64, cy=160)
+        set_gfl_cell(raw4, 2000 + 5 * 10 + 2, 1, 0.90f, 1.0f, 1.0f, 1.0f, 1.0f);  // esd_white left
+        // Duplicate overlapping esd_white on stride-16 cell (10, 4) -> cx=64, cy=160 (grid 20x20 starts at 1600)
+        set_gfl_cell(raw4, 1600 + 10 * 20 + 4, 1, 0.72f, 2.0f, 2.0f, 2.0f, 2.0f);
+        // Valid bare_hand on stride-32 cell (5, 5) -> cx=160, cy=160 (in work zone, score 0.85 >= 0.60)
+        set_gfl_cell(raw4, 2000 + 5 * 10 + 5, 0, 0.85f, 1.0f, 1.0f, 1.0f, 1.0f);
+        // Below-threshold bare_hand (0.55 < 0.60) MUST be filtered out
+        set_gfl_cell(raw4, 2000 + 6 * 10 + 8, 0, 0.55f, 1.0f, 1.0f, 1.0f, 1.0f);
+        // Out-of-work-zone bare_hand (cy near top pad_y + 10 -> cy_norm < 0.22) MUST be filtered out
+        set_gfl_cell(raw4, 2000 + 2 * 10 + 5, 0, 0.92f, 0.5f, 0.5f, 0.5f, 0.5f);
+        // esd_gray & esd_black
+        set_gfl_cell(raw4, 2000 + 5 * 10 + 8, 2, 0.82f, 1.0f, 1.0f, 1.0f, 1.0f);
+        set_gfl_cell(raw4, 2000 + 6 * 10 + 7, 3, 0.78f, 1.0f, 1.0f, 1.0f, 1.0f);
+
+        const auto dets4 = vision::HandGloveDetector::decode_nanodet_plus_output(
+            raw4, orig_w, orig_h, lb_scale, pad_x, pad_y, hcfg);
+        int white_cnt = 0, bare_cnt = 0, gray_cnt = 0, black_cnt = 0;
+        for (const auto& d : dets4) {
+            if (d.class_name == "esd_white") {
+                ++white_cnt;
+                const double cx = 0.5 * (d.box[0] + d.box[2]);
+                REQUIRE(std::abs(cx - 0.20) < 0.02);
+            } else if (d.class_name == "bare_hand") {
+                ++bare_cnt;
+                const double cy = 0.5 * (d.box[1] + d.box[3]);
+                REQUIRE(cy >= 0.22 && cy <= 0.88);
+                REQUIRE(d.score >= 0.60);
+            } else if (d.class_name == "esd_gray") ++gray_cnt;
+            else if (d.class_name == "esd_black") ++black_cnt;
+        }
+        REQUIRE_EQ(white_cnt, 1);  // NMS deduplicated stride-16 duplicate
+        REQUIRE_EQ(bare_cnt, 1);
+        REQUIRE_EQ(gray_cnt, 1);
+        REQUIRE_EQ(black_cnt, 1);
+
+        // 3-stride [1, 2100, 36]
+        const int dims3[3] = {1, 2100, 36};
+        cv::Mat raw3 = cv::Mat::zeros(3, dims3, CV_32F);
+        set_gfl_cell(raw3, 2000 + 5 * 10 + 2, 1, 0.88f, 1.0f, 1.0f, 1.0f, 1.0f);
+        const auto dets3 = vision::HandGloveDetector::decode_nanodet_plus_output(
+            raw3, orig_w, orig_h, lb_scale, pad_x, pad_y, hcfg);
+        REQUIRE_EQ(dets3.size(), 1u);
+        REQUIRE_EQ(dets3[0].class_name, "esd_white");
+    }
+
+    // 11F. 3 Physical Guardrails (white overexposure, label isolation, black carbon-fiber texture)
+    {
+        vision::HandGloveConfig hcfg;
+        cv::Mat scene(360, 640, CV_8UC3, cv::Scalar(48, 52, 56));
+        // Overexposed white glove (V=247, S=22 -> glare_warning=true, not pure specular)
+        cv::rectangle(scene, cv::Rect(32, 120, 96, 140), cv::Scalar(225, 232, 247), cv::FILLED);
+        // White false box inside label window (must be dropped by label isolation)
+        cv::rectangle(scene, cv::Rect(275, 160, 90, 40), cv::Scalar(220, 222, 224), cv::FILLED);
+        // Flat dark shadow (V=22, zero texture -> must be dropped)
+        cv::rectangle(scene, cv::Rect(380, 235, 90, 100), cv::Scalar(20, 22, 22), cv::FILLED);
+        // Textured carbon-fiber black ESD glove (checker weave V~30 -> must pass)
+        for (int y = 110; y < 220; ++y) {
+            for (int x = 500; x < 590; ++x) {
+                const uint8_t v = (((x / 3) + (y / 3)) % 2 == 0) ? 14 : 42;
+                scene.at<cv::Vec3b>(y, x) = cv::Vec3b(v, v, v);
+            }
+        }
+
+        std::vector<vision::HandGloveDetection> dets;
+        dets.push_back({vision::HandGloveClass::ESD_WHITE, "esd_white", 0.90, {0.05, 0.33, 0.20, 0.72}});
+        dets.push_back({vision::HandGloveClass::ESD_WHITE, "esd_white", 0.85, {0.43, 0.44, 0.57, 0.56}});
+        dets.push_back({vision::HandGloveClass::ESD_BLACK, "esd_black", 0.82, {0.60, 0.66, 0.73, 0.92}});
+        dets.push_back({vision::HandGloveClass::ESD_BLACK, "esd_black", 0.84, {0.78, 0.31, 0.92, 0.61}});
+
+        bool glare_warn = false;
+        vision::HandGloveDetector::apply_physical_guardrails(
+            scene, dets, Box{0.16, 0.42, 0.84, 0.58}, Box{0.42, 0.43, 0.58, 0.57}, hcfg, glare_warn);
+        REQUIRE(glare_warn);
+        REQUIRE_EQ(dets.size(), 2u);
+        REQUIRE_EQ(dets[0].class_name, "esd_white");
+        REQUIRE(dets[0].glare_warning);
+        REQUIRE_EQ(dets[1].class_name, "esd_black");
+        REQUIRE(dets[1].texture_gradient >= hcfg.black_glove_min_texture_grad);
+    }
+
+    // 11G. Asymmetric Bare-Hand Hysteresis (2-frame fast enter, 10-frame slow clear) + LiveCameraEngine E2E
+    {
+        vision::AsymmetricBareHandHysteresis hyst(2, 10);
+        REQUIRE(!hyst.update(true, false).bare_hand_active);   // frame 1 -> false
+        REQUIRE(hyst.update(true, false).bare_hand_active);    // frame 2 -> true
+        for (int i = 0; i < 9; ++i) {
+            REQUIRE(hyst.update(false, false).bare_hand_active);  // 9 clean frames -> still true
+        }
+        REQUIRE(!hyst.update(false, false).bare_hand_active);  // 10th clean frame -> cleared
+
+        LiveCameraEngine cam(0);
+        cv::Mat empty_bg(kDefaultCameraHeight, kDefaultCameraWidth, CV_8UC3, cv::Scalar(48, 52, 56));
+        for (int y = 0; y < empty_bg.rows; y += 8) {
+            cv::line(empty_bg, cv::Point(0, y), cv::Point(empty_bg.cols, y), cv::Scalar(58, 62, 66), 1);
+        }
+        cv::Mat with_bare = empty_bg.clone();
+        cv::rectangle(with_bare,
+                      cv::Rect(static_cast<int>(0.08 * 1280), static_cast<int>(0.50 * 720),
+                               static_cast<int>(0.10 * 1280), static_cast<int>(0.24 * 720)),
+                      cv::Scalar(115, 150, 215), cv::FILLED);
+
+        double ts = 50.0;
+        for (int i = 0; i < 4; ++i) {
+            ts += 0.04;
+            REQUIRE(cam.process_injected_frame(empty_bg, ts));
+        }
+        ts += 0.04;
+        REQUIRE(cam.process_injected_frame(with_bare, ts));
+        REQUIRE_EQ(cam.get_state_json().value("bare_hand_detected", true), false);
+
+        ts += 0.04;
+        REQUIRE(cam.process_injected_frame(with_bare, ts));
+        REQUIRE_EQ(cam.get_state_json().value("bare_hand_detected", false), true);
+        REQUIRE_EQ(cam.get_state_json().value("alarm_latched", true), false);
+
+        for (int i = 0; i < 9; ++i) {
+            ts += 0.04;
+            REQUIRE(cam.process_injected_frame(empty_bg, ts));
+            REQUIRE_EQ(cam.get_state_json().value("bare_hand_detected", false), true);
+        }
+        ts += 0.04;
+        REQUIRE(cam.process_injected_frame(empty_bg, ts));
+        REQUIRE_EQ(cam.get_state_json().value("bare_hand_detected", true), false);
+    }
+
+    // 11H. ONNX Hot-Load Error Guards & HTTP Pipeline Endpoints
+    {
+        const auto data_dir = tmp.path() / "srv_data";
+        StationDatabase db(data_dir);
+        LiveCameraEngine camera(0, [&db]() { return db.get_config(); });
+        TrainingManager training(data_dir);
+        StationServerOptions opts{};
+        opts.port = 0;
+        opts.data_dir = data_dir;
+        opts.web_dist_dir = tmp.path() / "web_dist";
+        opts.assets_dir = StationHttpServer::detect_default_assets_dir();
+        std::filesystem::create_directories(opts.web_dist_dir);
+        write_file_bytes_atomic(opts.web_dist_dir / "index.html", "<html></html>", 13);
+
+        StationHttpServer server(db, camera, training, opts);
+        server.auth().set_env_override("IGBT_ENGINEER_PIN", "445566");
+        const int port = server.start_background();
+        REQUIRE(port > 0);
+        httplib::Client cli("127.0.0.1", port);
+
+        auto ps = cli.Get("/api/vision/pipeline_status");
+        REQUIRE(ps && ps->status == 200);
+        REQUIRE_EQ(json::parse(ps->body).at("hand_glove_detector").value("backend", ""), "heuristic_fallback");
+
+        REQUIRE_EQ(cli.Post("/api/models/hand_glove/load", R"({"onnx_path":"missing.onnx"})", "application/json")->status, 401);
+
+        auto auth_res = cli.Post("/api/auth/verify", R"({"passcode":"445566"})", "application/json");
+        REQUIRE(auth_res && auth_res->status == 200);
+        httplib::Headers hdrs{{"X-Admin-Token", json::parse(auth_res->body).value("admin_token", "")}};
+
+        REQUIRE_EQ(cli.Post("/api/models/hand_glove/load", hdrs, R"({"onnx_path":"missing.onnx"})", "application/json")->status, 404);
+
+        const auto bad_onnx = data_dir / "models" / "bad_hand.onnx";
+        const std::string bad_payload = "NOT_A_VALID_ONNX_BINARY";
+        REQUIRE(write_file_bytes_atomic(bad_onnx, bad_payload.data(), bad_payload.size()));
+        const std::string bad_sha = sha256_hex(bad_payload);
+
+        json req_wrong_sha{{"onnx_path", path_to_utf8(bad_onnx)}, {"expected_sha256", std::string(64, '0')}};
+        REQUIRE_EQ(cli.Post("/api/models/hand_glove/load", hdrs, req_wrong_sha.dump(), "application/json")->status, 409);
+
+        json req_corrupt{{"onnx_path", path_to_utf8(bad_onnx)}, {"expected_sha256", bad_sha}};
+        REQUIRE_EQ(cli.Post("/api/models/hand_glove/load", hdrs, req_corrupt.dump(), "application/json")->status, 422);
+
+        auto ps_after = cli.Get("/api/vision/pipeline_status");
+        REQUIRE(ps_after && ps_after->status == 200);
+        REQUIRE_EQ(json::parse(ps_after->body).at("hand_glove_detector").value("backend", ""), "heuristic_fallback");
+        server.stop();
+    }
+
+    // 11I. 720P CPU Latency Benchmark (P50 / P95 vision pipeline budget check <= 15 ms)
+    {
+        LiveCameraEngine bench_cam(0);
+        const cv::Mat bench_frame = make_synthetic_station_frame(1280, 720, "complete", false, false);
+        double ts = 100.0;
+        for (int i = 0; i < 4; ++i) {
+            ts += 0.04;
+            REQUIRE(bench_cam.process_injected_frame(bench_frame, ts));
+        }
+        std::vector<double> vision_ms;
+        vision_ms.reserve(25);
+        for (int i = 0; i < 25; ++i) {
+            ts += 0.04;
+            REQUIRE(bench_cam.process_injected_frame(bench_frame, ts));
+            const json st = bench_cam.get_state_json();
+            const double align_ms = st.at("tube_alignment").value("align_ms", 0.0);
+            const double hand_ms = st.at("hand_glove_detector").value("last_infer_ms", 0.0);
+            const double cls_ms = st.value("inference_ms", 0.0);
+            vision_ms.push_back(align_ms + hand_ms + cls_ms);
+        }
+        std::sort(vision_ms.begin(), vision_ms.end());
+        const double p50 = vision_ms[vision_ms.size() / 2];
+        const double p95 = vision_ms[(vision_ms.size() * 95) / 100];
+        std::cout << "       [BENCH] 720P vision pipeline (hand+RANSAC+cls): P50="
+                  << p50 << " ms, P95=" << p95 << " ms" << std::endl;
+        REQUIRE(p95 <= 15.0);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -2088,6 +2515,7 @@ int main() {
         {"8. Hardware Camera Optics Persistence, Anti-Glare Stepper & Specular Resistance", test_camera_optics_and_anti_glare},
         {"9. v4.3 Red Rabbit Mandatory Challenge, Anti-Cheat & SHA-256 Audit Chain", test_red_rabbit_challenge_and_hash_chain_audit},
         {"10. v4.3 ADAM-6050/6060 Native Winsock2 Modbus TCP Watchdog & Fail-Safe", test_adam_modbus_dio_watchdog_and_failsafe},
+        {"11. v4.4 P0-3 RANSAC Tube Alignment, TUBE_ALIGN_FAIL Gate, NanoDet GFL & 2/10 Hysteresis", test_v44_ransac_alignment_nanodet_and_hysteresis},
     };
 
     int passed = 0;

@@ -1330,6 +1330,20 @@ function App() {
         </div>
       )}
 
+      {!error && !state.hardware_fault_locked && state.tube_align_failed && (
+        <div className="banner studio-banner" role="alert">
+          <AlertTriangle size={16} aria-hidden="true" />
+          <span>
+            料管透视对齐失败阻断：
+            {reasonOf(state.tube_alignment?.fail_reason || "TUBE_ALIGN_FAIL")}
+            （连续 {Number(state.tube_alignment?.consecutive_failures || 3)} 帧 · κ=
+            {fmt(state.tube_alignment?.condition_number, 2)} · Δθ=
+            {fmt(state.tube_alignment?.parallel_diff_deg, 1)}°）
+          </span>
+          <code>{String(state.tube_alignment?.fail_reason || "TUBE_ALIGN_FAIL")}</code>
+        </div>
+      )}
+
       {role === "operator" ? (
         <main className="content content-op">
           <OperatorView

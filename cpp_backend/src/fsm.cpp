@@ -492,7 +492,12 @@ bool InspectionFSM::contact_eligible(const FSMEvent& event) const {
 }
 
 std::pair<bool, std::string> InspectionFSM::observation_valid(const FSMEvent& event) const {
-    if (!event.view_valid.value_or(false)) return {false, "VIEW_INVALID"};
+    if (!event.view_valid.value_or(false)) {
+        if (event.reason.has_value() && !event.reason->empty()) {
+            return {false, *event.reason};
+        }
+        return {false, "VIEW_INVALID"};
+    }
     if (!event.quality_ok.value_or(false)) return {false, "IMAGE_QUALITY_INVALID"};
     if (!event.tube_present.value_or(false)) return {false, "TUBE_NOT_PRESENT_OR_UNKNOWN"};
     if (!event.label_window_present.value_or(false)) return {false, "LABEL_WINDOW_INVALID"};
@@ -702,6 +707,9 @@ ReasonExplanationZh explain_reason_zh(
         {"ROI_UNCALIBRATED", {"工位待标定：请切换至工程师工作台完成 ROI 区域标定", "ROI_UNCALIBRATED：严格模式要求已标定的 ROI 配置"}},
         {"CAMERA_NOT_CONNECTED", {"相机未连接：请检查 USB 视觉相机连接状态", "UVC 采集设备离线或初始化中"}},
         {"CAMERA_FEED_LOST", {"相机信号中断：正在自动重连 USB 相机", "视频流读取中断，已自动置为 VIEW_INVALID 防止误放行"}},
+        {"TUBE_ALIGN_FAIL", {"料管对齐失败：请摆正料管并避开中段强反光（已阻断放行）", "RANSAC 平行壁面拟合连续失败 ≥3 帧或几何门控越界，严禁回退无拉平分类"}},
+        {"TUBE_ALIGN_LOW_CONF", {"料管姿态波动：暂借上一帧矩阵，请保持料管平稳以恢复核验", "料管对齐连续失败 ≤2 帧，复用上一有效矩阵并冻结 PASS 达标计时"}},
+        {"WHITE_GLOVE_OVEREXPOSED", {"白色手套反光过强：请检查补光角度并确认合规佩戴", "白色 ESD 手套区域 V>=245 过曝占比超过 35%，已触发光学护栏告警"}},
         {"AUTHORIZED_RESET", {"人工复位完成，请放入下一支待检料管", "已执行授权复位，状态机回到 WAIT_PART"}},
         {"STRICT_MODE_REVERIFY_REQUIRED", {"已切换至车间严格模式，请重新放入料管执行完整核验", "从调试模式切入严格模式，已清除未闭锁调试周期状态"}},
     };

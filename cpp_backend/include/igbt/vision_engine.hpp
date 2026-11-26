@@ -3,6 +3,8 @@
 #include <igbt/async_evidence_writer.hpp>
 #include <igbt/common.hpp>
 #include <igbt/fsm.hpp>
+#include <igbt/vision/hand_glove_detector.hpp>
+#include <igbt/vision/tube_geometry.hpp>
 
 #include <atomic>
 #include <condition_variable>
@@ -345,6 +347,18 @@ public:
     );
     void clear_loaded_model();
 
+    // v4.4 P0-3 NanoDet-Plus-m Hand/Glove Detector & RANSAC Tube Alignment controls
+    json load_hand_glove_onnx_model(
+        const std::filesystem::path& onnx_path,
+        const std::string& model_version,
+        const std::string& expected_sha256 = "",
+        int frame_stride = 1
+    );
+    void clear_hand_glove_onnx_model();
+    void set_hand_glove_frame_stride(int stride);
+    json hand_glove_detector_status_json() const;
+    json tube_alignment_status_json() const;
+
     // Skip-Frame Auto-Capture (A3) & Async Pre-Trigger Ring Buffer
     AutoCaptureConfig set_auto_capture(const AutoCaptureConfig& cfg);
     AutoCaptureConfig get_auto_capture() const;
@@ -405,9 +419,16 @@ private:
         std::optional<Box> left_glove;
         std::optional<Box> right_glove;
         std::optional<Box> bare_hand;
+        std::string left_glove_class;
+        std::string right_glove_class;
+        bool white_glove_glare_warning{false};
+        bool bare_hand_hysteresis_active{false};
+        bool bare_hand_violation_triggered{false};
         bool contact_active{false};
         bool bare_hand_touching_part{false};
         bool target_locked{false};
+        vision::TubeAlignResult tube_align;
+        json hand_detector_meta{json::object()};
         json tracked_objects{json::array()};
     };
 
@@ -453,11 +474,16 @@ private:
         const cv::Mat& person_exclusion,
         int sw,
         int sh,
-        bool already_locked
+        bool already_locked,
+        bool extra_glove_present = false
     ) const;
 
     Box project_label_window(const Box& tube_box) const;
-    TrackResult track_dynamic_targets(const cv::Mat& frame, const std::string& work_mode);
+    TrackResult track_dynamic_targets(
+        const cv::Mat& frame,
+        const std::string& work_mode,
+        const std::optional<double>& calibrated_tube_height_norm = std::nullopt
+    );
     ClassificationResult classify_live_label_roi(
         const cv::Mat& crop,
         bool target_locked,
@@ -481,7 +507,8 @@ private:
         const std::string& label_status,
         std::optional<double> label_conf,
         const std::string& work_mode,
-        bool show_aux
+        bool show_aux,
+        const vision::TubeAlignResult* tube_align = nullptr
     );
 
     void draw_unicode_badge(
@@ -610,6 +637,8 @@ private:
     int bare_hand_violation_streak_{0};
     int consecutive_detach_count_{0};
     std::atomic<int64_t> last_vision_tick_ms_{0};
+    vision::TubeGeometryAligner tube_aligner_;
+    vision::HandGloveDetector hand_glove_detector_;
 };
 
 }  // namespace igbt

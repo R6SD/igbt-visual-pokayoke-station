@@ -1048,6 +1048,41 @@ json StationHttpServer::load_verified_model_into_camera(
 
 bool StationHttpServer::autoload_latest_verified_model() {
     try {
+        const std::string stride_env = auth_.get_env_value("IGBT_HAND_GLOVE_FRAME_STRIDE");
+        if (!stride_env.empty()) {
+            try {
+                camera_.set_hand_glove_frame_stride(std::stoi(stride_env));
+            } catch (...) {
+            }
+        }
+        std::filesystem::path hg_path;
+        const std::string hg_env = auth_.get_env_value("IGBT_HAND_GLOVE_ONNX");
+        if (!hg_env.empty()) {
+            hg_path = path_from_utf8(hg_env);
+        } else if (!options_.data_dir.empty()) {
+            hg_path = options_.data_dir / "models" / "nanodet_hand_glove.onnx";
+        }
+        std::error_code ec;
+        if (!hg_path.empty() && std::filesystem::is_regular_file(hg_path, ec)) {
+            std::string sidecar_sha;
+            auto sha_path = hg_path;
+            sha_path += ".sha256";
+            std::vector<uint8_t> sha_bytes;
+            if (std::filesystem::is_regular_file(sha_path, ec) && read_file_bytes(sha_path, sha_bytes)) {
+                std::string raw(sha_bytes.begin(), sha_bytes.end());
+                std::istringstream iss(raw);
+                iss >> sidecar_sha;
+                sidecar_sha = to_lower_ascii(sidecar_sha);
+            }
+            try {
+                camera_.load_hand_glove_onnx_model(hg_path, "nanodet-plus-m-auto", sidecar_sha);
+            } catch (...) {
+            }
+        }
+    } catch (...) {
+    }
+
+    try {
         const auto runs = training_.find_verified_runs();
         for (const auto& run : runs) {
             try {
@@ -1187,7 +1222,16 @@ void StationHttpServer::register_routes() {
             {"hardware_3a", cam_state.value("hardware_3a", json::object())},
             {"camera_optics", camera_.get_camera_optics_json()},
             {"red_rabbit", red_rabbit_.status_json()},
-            {"hal_dio", dio_health_to_json(dio)}
+            {"hal_dio", dio_health_to_json(dio)},
+            {"tube_alignment", camera_.tube_alignment_status_json()},
+            {"hand_glove_detector", camera_.hand_glove_detector_status_json()}
+        });
+    }));
+
+    svr_.Get("/api/vision/pipeline_status", wrap([this](const httplib::Request&, httplib::Response& res) {
+        send_json(res, 200, json{
+            {"tube_alignment", camera_.tube_alignment_status_json()},
+            {"hand_glove_detector", camera_.hand_glove_detector_status_json()}
         });
     }));
 
@@ -1558,6 +1602,57 @@ void StationHttpServer::register_routes() {
             out[it.key()] = it.value();
         }
         send_json(res, 200, out);
+    }));
+
+    svr_.Post("/api/models/hand_glove/load", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const std::string actor = auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        const json body = parse_json_body_or_throw(req);
+        if (!body.is_object() || !body.contains("onnx_path") || !body["onnx_path"].is_string()) {
+            throw DatabaseHttpError(422, "INVALID_HAND_GLOVE_ONNX_PAYLOAD");
+        }
+        const std::string raw_path = body["onnx_path"].get<std::string>();
+        if (raw_path.empty()) {
+            throw DatabaseHttpError(422, "INVALID_HAND_GLOVE_ONNX_PAYLOAD");
+        }
+        const std::string model_version =
+            (body.contains("model_version") && body["model_version"].is_string())
+                ? body["model_version"].get<std::string>()
+                : "nanodet-plus-m";
+        const std::string expected_sha =
+            (body.contains("expected_sha256") && body["expected_sha256"].is_string())
+                ? to_lower_ascii(body["expected_sha256"].get<std::string>())
+                : "";
+        int frame_stride = 1;
+        if (body.contains("frame_stride")) {
+            if (!body["frame_stride"].is_number_integer()) {
+                throw DatabaseHttpError(422, "INVALID_FRAME_STRIDE");
+            }
+            frame_stride = std::clamp(body["frame_stride"].get<int>(), 1, 8);
+        }
+
+        std::filesystem::path target_path = path_from_utf8(raw_path);
+        if (target_path.is_relative() && !options_.data_dir.empty()) {
+            target_path = options_.data_dir / "models" / target_path;
+        }
+        try {
+            const json st = camera_.load_hand_glove_onnx_model(target_path, model_version, expected_sha, frame_stride);
+            red_rabbit_.trigger_challenge("MODEL_OR_OPTICS_CHANGE", "", actor);
+            send_json(res, 200, json{
+                {"loaded", true},
+                {"hand_glove_detector", st}
+            });
+        } catch (const DatabaseHttpError&) {
+            throw;
+        } catch (const std::exception& exc) {
+            const std::string msg = exc.what();
+            if (msg.find("NOT_FOUND") != std::string::npos || msg.find("READ_FAILED") != std::string::npos) {
+                throw DatabaseHttpError(404, msg);
+            }
+            if (msg.find("SHA256") != std::string::npos) {
+                throw DatabaseHttpError(409, msg);
+            }
+            throw DatabaseHttpError(422, msg);
+        }
     }));
 
     svr_.Post("/api/models/:model_id/activate", wrap([this](const httplib::Request& req, httplib::Response& res) {

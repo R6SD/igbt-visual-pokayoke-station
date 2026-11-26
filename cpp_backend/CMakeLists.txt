@@ -17,7 +17,7 @@ add_compile_definitions(
     _UNICODE
 )
 
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio dnn ml)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio dnn ml calib3d)
 
 find_path(SQLITE3_INCLUDE_DIR sqlite3.h REQUIRED)
 find_library(SQLITE3_LIBRARY NAMES sqlite3 libsqlite3 REQUIRED)
@@ -25,6 +25,8 @@ find_library(SQLITE3_LIBRARY NAMES sqlite3 libsqlite3 REQUIRED)
 set(IGBT_CORE_SOURCES
     src/fsm.cpp
     src/vision_engine.cpp
+    src/vision/tube_geometry.cpp
+    src/vision/hand_glove_detector.cpp
     src/training_manager.cpp
     src/database.cpp
     src/db/red_rabbit_audit_repo.cpp

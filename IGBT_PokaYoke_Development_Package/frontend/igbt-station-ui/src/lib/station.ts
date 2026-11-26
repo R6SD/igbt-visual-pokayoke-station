@@ -143,6 +143,15 @@ const reasonText: Record<string, string> = {
   HARDWARE_ESTOP_ACTIVE: "急停按钮 / 安全回路断开闭锁",
   RELAY_CONTACT_WELD_FAULT: "安全继电器辅助触点粘连故障闭锁",
   VISION_LOOP_STALL_WATCHDOG_STOP: "视觉推理循环停滞，看门狗主动停喂硬锁",
+  TUBE_ALIGN_FAIL: "料管透视对齐失败（已阻断放行）",
+  TUBE_ALIGN_LOW_CONF: "料管姿态波动，已暂停 PASS 计时",
+  WHITE_GLOVE_OVEREXPOSED: "白色手套区域过曝，请调整补光角度",
+  INSUFFICIENT_MIDBAND_EDGES: "料管中段有效边缘不足（遮挡或强反光）",
+  PARALLEL_PAIR_NOT_FOUND: "未检出合法平行管壁边缘对",
+  COND_NUMBER_EXCEEDED: "透视变换矩阵条件数越界（几何畸变）",
+  PARALLEL_DIFF_EXCEEDED: "料管上下壁面平行度偏差超限",
+  WIDTH_DEV_EXCEEDED: "料管实测宽度与标定先验偏差超限",
+  ANGLE_JUMP_EXCEEDED: "料管帧间倾角跳变超限",
 }
 
 export const reasonOf = (code?: string) => (code ? reasonText[code] || fsmText[code] || code.replaceAll("_", " ") : "")
@@ -171,6 +180,19 @@ export function guidanceFor(state: Data) {
     return { title: "等待料管入位" }
   }
   if (!valid) {
+    if (
+      state.tube_align_failed ||
+      state.result_reason === "TUBE_ALIGN_FAIL" ||
+      state.view_valid_reasons?.includes("TUBE_ALIGN_FAIL")
+    ) {
+      return { title: "料管对齐失败·请摆正料管" }
+    }
+    if (
+      state.result_reason === "TUBE_ALIGN_LOW_CONF" ||
+      state.view_valid_reasons?.includes("TUBE_ALIGN_LOW_CONF")
+    ) {
+      return { title: "料管姿态波动·请保持平稳" }
+    }
     if (state.left_grip_active !== true || state.right_grip_active !== true) {
       return { title: "请双手握持两端" }
     }

@@ -1283,6 +1283,9 @@ LiveCameraEngine::LiveCameraEngine(
         {"glove_compliant", false},
         {"bare_hand_detected", false},
         {"bare_hand_violation", false},
+        {"tube_align_failed", false},
+        {"tube_alignment", tube_aligner_.last_status_json()},
+        {"hand_glove_detector", hand_glove_detector_.status_json()},
         {"alarm_latched", false},
         {"label_contact_active", false},
         {"hand_contact_candidate", false},
@@ -1467,6 +1470,7 @@ std::string LiveCameraEngine::set_work_mode(const std::string& mode) {
         alarm_latched_ = false;
         latched_reason_.reset();
         bare_hand_violation_streak_ = 0;
+        hand_glove_detector_.reset_state();
         state_["alarm_latched"] = false;
         state_["bare_hand_violation"] = false;
     } else if (prev_mode != "strict") {
@@ -1474,6 +1478,8 @@ std::string LiveCameraEngine::set_work_mode(const std::string& mode) {
         if (!alarm_latched_ && fsm_.state() != FSMState::ALARM) {
             fsm_ = InspectionFSM(live_fsm_config());
             contact_tracker_.reset();
+            tube_aligner_.reset();
+            hand_glove_detector_.reset_state();
             pass_target_lost_since_.reset();
             active_cycle_tube_center_.reset();
             active_cycle_pipe_color_.clear();
@@ -1636,6 +1642,11 @@ json LiveCameraEngine::trigger_new_cycle(const std::string& pipe_color) {
     state_["alarm_latched"] = false;
     state_["bare_hand_violation"] = false;
     state_["c_timer_ms"] = 0;
+    state_["tube_align_failed"] = false;
+    tube_aligner_.reset();
+    hand_glove_detector_.reset_state();
+    state_["tube_alignment"] = tube_aligner_.last_status_json();
+    state_["hand_glove_detector"] = hand_glove_detector_.status_json();
     state_["updated_at_utc"] = utc_now_iso();
     return state_;
 }
@@ -1836,6 +1847,50 @@ void LiveCameraEngine::clear_loaded_model() {
         state_["model_version"] = kHeuristicModelVersion;
         state_["inference_backend"] = kHeuristicBackendLabel;
     }
+}
+
+json LiveCameraEngine::load_hand_glove_onnx_model(
+    const std::filesystem::path& onnx_path,
+    const std::string& model_version,
+    const std::string& expected_sha256,
+    int frame_stride
+) {
+    hand_glove_detector_.set_frame_stride(frame_stride);
+    std::string err;
+    if (!hand_glove_detector_.load_onnx(onnx_path, model_version, expected_sha256, err)) {
+        throw std::runtime_error(err.empty() ? "HAND_GLOVE_ONNX_LOAD_FAILED" : err);
+    }
+    const json st = hand_glove_detector_.status_json();
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        state_["hand_glove_detector"] = st;
+        raw_frame_state_["hand_glove_detector"] = st;
+    }
+    return st;
+}
+
+void LiveCameraEngine::clear_hand_glove_onnx_model() {
+    hand_glove_detector_.clear_onnx();
+    const json st = hand_glove_detector_.status_json();
+    std::lock_guard<std::mutex> lk(mutex_);
+    state_["hand_glove_detector"] = st;
+    raw_frame_state_["hand_glove_detector"] = st;
+}
+
+void LiveCameraEngine::set_hand_glove_frame_stride(int stride) {
+    hand_glove_detector_.set_frame_stride(stride);
+    const json st = hand_glove_detector_.status_json();
+    std::lock_guard<std::mutex> lk(mutex_);
+    state_["hand_glove_detector"] = st;
+}
+
+json LiveCameraEngine::hand_glove_detector_status_json() const {
+    return hand_glove_detector_.status_json();
+}
+
+json LiveCameraEngine::tube_alignment_status_json() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return tube_aligner_.last_status_json();
 }
 
 // ============================================================================
@@ -2868,6 +2923,8 @@ void LiveCameraEngine::reset_tracking_state() {
     tube_ttl_ = 0;
     target_locked_ = false;
     target_confidence_ = 0.0;
+    tube_aligner_.reset();
+    hand_glove_detector_.reset_state();
 }
 
 std::tuple<ROISet, json, std::string, json> LiveCameraEngine::active_rois_and_thresholds() const {
@@ -3005,7 +3062,8 @@ std::pair<std::optional<Box>, double> LiveCameraEngine::detect_tube_body(
     const cv::Mat& person_exclusion,
     int sw,
     int sh,
-    bool already_locked
+    bool already_locked,
+    bool extra_glove_present
 ) const {
     cv::Mat yellow_tube, blue_tube, color_tube, fg_tube, tube_mask, not_person;
     cv::inRange(hsv, cv::Scalar(15, 45, 65), cv::Scalar(42, 255, 255), yellow_tube);
@@ -3039,19 +3097,29 @@ std::pair<std::optional<Box>, double> LiveCameraEngine::detect_tube_body(
 
     std::optional<Box> best_box;
     double best_score = -1.0;
-    const bool glove_present = tracked_left_glove_.has_value() || tracked_right_glove_.has_value();
+    const bool glove_present =
+        extra_glove_present || tracked_left_glove_.has_value() || tracked_right_glove_.has_value();
 
     for (const auto& cnt : contours) {
         const double area = cv::contourArea(cnt);
         if (area < sw * sh * 0.010 || area > sw * sh * 0.42) continue;
         const cv::Rect r = cv::boundingRect(cnt);
-        if (static_cast<double>(r.width) / sw < 0.16 ||
-            static_cast<double>(r.height) / sh < 0.030 ||
-            static_cast<double>(r.height) / sh > 0.30) {
+        const double rw_norm = static_cast<double>(r.width) / sw;
+        const double rh_norm = static_cast<double>(r.height) / sh;
+        double aspect = static_cast<double>(r.width) / std::max(1, r.height);
+        if (rw_norm < 0.16 || rh_norm < 0.030 || rh_norm > 0.48) {
             continue;
         }
-        const double aspect = static_cast<double>(r.width) / std::max(1, r.height);
-        if (aspect < 2.0) continue;
+        if (rh_norm > 0.30 || aspect < 2.0) {
+            const cv::RotatedRect rr = cv::minAreaRect(cnt);
+            const double long_side = std::max(rr.size.width, rr.size.height);
+            const double short_side = std::max(1.0f, std::min(rr.size.width, rr.size.height));
+            const double rot_aspect = long_side / short_side;
+            if (long_side / sw < 0.16 || short_side / sh < 0.030 || short_side / sh > 0.25 || rot_aspect < 2.2) {
+                continue;
+            }
+            aspect = rot_aspect;
+        }
 
         const double cx = (r.x + r.width * 0.5) / sw;
         const double cy = (r.y + r.height * 0.5) / sh;
@@ -3134,7 +3202,8 @@ Box LiveCameraEngine::project_label_window(const Box& tube_box) const {
 
 LiveCameraEngine::TrackResult LiveCameraEngine::track_dynamic_targets(
     const cv::Mat& frame,
-    const std::string& work_mode
+    const std::string& work_mode,
+    const std::optional<double>& calibrated_tube_height_norm
 ) {
     constexpr int sw = 384;
     constexpr int sh = 216;
@@ -3220,11 +3289,6 @@ LiveCameraEngine::TrackResult LiveCameraEngine::track_dynamic_targets(
             .setTo(255);
     }
 
-    const cv::Mat kernel_open = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7));
-    const cv::Mat kernel_close = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(9, 9));
-    const double min_hand_area = sw * sh * 0.010;
-    const double max_hand_area = sw * sh * 0.11;
-
     // Specular glare isolation (pure white clipped highlights V>=250, S<=15)
     cv::Mat specular_mask = cv::Mat::zeros(sh, sw, CV_8U);
     cv::Mat clipped_mask = cv::Mat::zeros(sh, sw, CV_8U);
@@ -3242,128 +3306,12 @@ LiveCameraEngine::TrackResult LiveCameraEngine::track_dynamic_targets(
         }
     }
 
-    // A. Compliant White / Light-Gray ESD Gloves
-    cv::Mat glove_raw = cv::Mat::zeros(sh, sw, CV_8U);
-    for (int y = 0; y < sh; ++y) {
-        const auto* hp = hsv.ptr<cv::Vec3b>(y);
-        const float* mp = motion_diff.ptr<float>(y);
-        const float* fp = fg_diff.ptr<float>(y);
-        const uint8_t* pp = person_exclusion.ptr<uint8_t>(y);
-        const uint8_t* sp = specular_mask.ptr<uint8_t>(y);
-        uint8_t* gp = glove_raw.ptr<uint8_t>(y);
-        for (int x = 0; x < sw; ++x) {
-            if (pp[x] == 0 && sp[x] == 0 && hp[x][2] >= 178 && hp[x][1] <= 42 &&
-                (mp[x] > 7.5f || fp[x] > 20.0f)) {
-                gp[x] = 255;
-            }
-        }
-    }
-    cv::Mat glove_clean;
-    cv::morphologyEx(glove_raw, glove_clean, cv::MORPH_OPEN, kernel_open);
-    cv::morphologyEx(glove_clean, glove_clean, cv::MORPH_CLOSE, kernel_close);
-    std::vector<std::vector<cv::Point>> glove_contours;
-    cv::findContours(glove_clean, glove_contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-    std::optional<Box> left_glove_cand, right_glove_cand;
-    double lg_area = 0.0, rg_area = 0.0;
-    cv::Mat mot_gt_65;
-    cv::compare(motion_diff, 6.5f, mot_gt_65, cv::CMP_GT);
-    for (const auto& cnt : glove_contours) {
-        const double area = cv::contourArea(cnt);
-        if (area < min_hand_area || area > max_hand_area) continue;
-        const cv::Rect r = cv::boundingRect(cnt);
-        const double cx = (r.x + r.width * 0.5) / sw;
-        if (r.y <= 4 || static_cast<double>(r.y) / sh >= 0.82 ||
-            static_cast<double>(r.width) / sw > 0.25 ||
-            static_cast<double>(r.height) / sh > 0.40) {
-            continue;
-        }
-        const double r_area = static_cast<double>(r.width * r.height);
-        if (static_cast<double>(cv::countNonZero(clipped_mask(r))) / r_area > 0.55) {
-            continue;
-        }
-        const double mot = static_cast<double>(cv::countNonZero(mot_gt_65(r))) / r_area;
-        if (mot < 0.12) continue;
-        const Box b{
-            std::max(0.01, static_cast<double>(r.x) / sw),
-            std::max(0.02, static_cast<double>(r.y) / sh),
-            std::min(0.99, static_cast<double>(r.x + r.width) / sw),
-            std::min(0.99, static_cast<double>(r.y + r.height) / sh),
-        };
-        if (cx < 0.50 && area > lg_area) {
-            lg_area = area;
-            left_glove_cand = b;
-        } else if (cx >= 0.50 && area > rg_area) {
-            rg_area = area;
-            right_glove_cand = b;
-        }
-    }
-
-    if (left_glove_cand.has_value()) {
-        tracked_left_glove_ = ema_box(tracked_left_glove_, *left_glove_cand, 0.50);
-        left_glove_ttl_ = 5;
-    } else if (left_glove_ttl_ > 0) {
-        --left_glove_ttl_;
-    } else {
-        tracked_left_glove_.reset();
-    }
-
-    if (right_glove_cand.has_value()) {
-        tracked_right_glove_ = ema_box(tracked_right_glove_, *right_glove_cand, 0.50);
-        right_glove_ttl_ = 5;
-    } else if (right_glove_ttl_ > 0) {
-        --right_glove_ttl_;
-    } else {
-        tracked_right_glove_.reset();
-    }
-
-    // B. Bare-Hand Skin Detection
-    cv::Mat not_person, bare_raw, bare_clean;
-    cv::compare(person_exclusion, 0, not_person, cv::CMP_EQ);
-    cv::bitwise_and(skin_mask, not_person, bare_raw);
-    cv::morphologyEx(bare_raw, bare_clean, cv::MORPH_OPEN, kernel_open);
-    cv::morphologyEx(bare_clean, bare_clean, cv::MORPH_CLOSE, kernel_close);
-    std::vector<std::vector<cv::Point>> bare_contours;
-    cv::findContours(bare_clean, bare_contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-    std::optional<Box> bare_cand;
-    double bare_best_area = 0.0;
-    cv::Mat fg_gt_14, mot_gt_55;
-    cv::compare(fg_diff, 14.0f, fg_gt_14, cv::CMP_GT);
-    cv::compare(motion_diff, 5.5f, mot_gt_55, cv::CMP_GT);
-    for (const auto& cnt : bare_contours) {
-        const double area = cv::contourArea(cnt);
-        if (area < min_hand_area || area > max_hand_area) continue;
-        const cv::Rect r = cv::boundingRect(cnt);
-        const double cx = (r.x + r.width * 0.5) / sw;
-        const double cy = (r.y + r.height * 0.5) / sh;
-        if (r.y <= 4 && cx > 0.22 && cx < 0.78) continue;
-        if (static_cast<double>(r.y) / sh >= 0.82) continue;
-        if (cy < 0.22 || cy > 0.88) continue;
-        const double denom = static_cast<double>(r.width * r.height);
-        const double hand_fg = static_cast<double>(cv::countNonZero(fg_gt_14(r))) / denom;
-        const double hand_mot = static_cast<double>(cv::countNonZero(mot_gt_55(r))) / denom;
-        if (hand_fg < 0.18 && hand_mot < 0.08) continue;
-        if (static_cast<double>(r.width) / sw > 0.26 || static_cast<double>(r.height) / sh > 0.42) continue;
-        if (area > bare_best_area) {
-            bare_best_area = area;
-            bare_cand = Box{
-                std::max(0.01, static_cast<double>(r.x) / sw),
-                std::max(0.02, static_cast<double>(r.y) / sh),
-                std::min(0.99, static_cast<double>(r.x + r.width) / sw),
-                std::min(0.99, static_cast<double>(r.y + r.height) / sh),
-            };
-        }
-    }
-
-    if (bare_cand.has_value()) {
-        tracked_bare_hand_ = ema_box(tracked_bare_hand_, *bare_cand, 0.50);
-        bare_hand_ttl_ = 5;
-    } else if (bare_hand_ttl_ > 0) {
-        --bare_hand_ttl_;
-    } else {
-        tracked_bare_hand_.reset();
-    }
+    // A & B. NanoDet-Plus-m ONNX / Enhanced Heuristic Hand & ESD Glove Detection
+    vision::HandGloveInferResult hand_res = hand_glove_detector_.detect_candidates(
+        frame, hsv, skin_mask, fg_diff, motion_diff, person_exclusion, specular_mask, clipped_mask
+    );
+    vision::HandGloveDetector::summarize_detections(hand_res);
+    const bool extra_glove_present = hand_res.left_glove.has_value() || hand_res.right_glove.has_value();
 
     // C. Elongated Tube Body + Rectangular White Label Tracking
     cv::Mat blur_u8, edges, edges_dilated, bright_patch, label_candidates_mask, mot_gt_75;
@@ -3423,7 +3371,7 @@ LiveCameraEngine::TrackResult LiveCameraEngine::track_dynamic_targets(
         const double patch_motion = static_cast<double>(cv::countNonZero(mot_gt_75(r))) / denom;
         if (patch_bright < 0.35 || patch_edge < 0.09) continue;
 
-        const double glove_bonus = (tracked_left_glove_.has_value() || tracked_right_glove_.has_value()) ? 0.45 : 0.0;
+        const double glove_bonus = (extra_glove_present || tracked_left_glove_.has_value() || tracked_right_glove_.has_value()) ? 0.45 : 0.0;
         const double score = patch_bright * 1.4 + patch_edge * 2.5 + rectangularity * 1.2 + patch_motion * 1.8 + glove_bonus;
         if (score > best_score) {
             best_score = score;
@@ -3439,7 +3387,7 @@ LiveCameraEngine::TrackResult LiveCameraEngine::track_dynamic_targets(
     }
 
     const auto [tube_body_box, tube_body_score] = detect_tube_body(
-        hsv, edges, edges_dilated, fg_diff, person_exclusion, sw, sh, target_locked_
+        hsv, edges, edges_dilated, fg_diff, person_exclusion, sw, sh, target_locked_, extra_glove_present
     );
 
     const double min_lock_score = (work_mode == "strict") ? 1.72 : 1.20;
@@ -3500,14 +3448,49 @@ LiveCameraEngine::TrackResult LiveCameraEngine::track_dynamic_targets(
         target_confidence_ = 0.0;
     }
 
+    // Finalize hand/glove detections with label-isolation guardrail #2 and hysteresis
+    vision::HandGloveDetector::filter_label_isolation(hand_res.detections, tracked_label_box_);
+    vision::HandGloveDetector::summarize_detections(hand_res);
+
+    if (hand_res.left_glove.has_value()) {
+        tracked_left_glove_ = ema_box(tracked_left_glove_, *hand_res.left_glove, 0.50);
+        left_glove_ttl_ = 5;
+    } else if (left_glove_ttl_ > 0) {
+        --left_glove_ttl_;
+    } else {
+        tracked_left_glove_.reset();
+    }
+
+    if (hand_res.right_glove.has_value()) {
+        tracked_right_glove_ = ema_box(tracked_right_glove_, *hand_res.right_glove, 0.50);
+        right_glove_ttl_ = 5;
+    } else if (right_glove_ttl_ > 0) {
+        --right_glove_ttl_;
+    } else {
+        tracked_right_glove_.reset();
+    }
+
+    if (hand_res.bare_hand.has_value()) {
+        tracked_bare_hand_ = ema_box(tracked_bare_hand_, *hand_res.bare_hand, 0.50);
+        bare_hand_ttl_ = 5;
+    } else if (bare_hand_ttl_ > 0) {
+        --bare_hand_ttl_;
+    } else {
+        tracked_bare_hand_.reset();
+    }
+
     TrackResult tr{};
     tr.tube_box = tracked_tube_box_;
     tr.label_box = tracked_label_box_;
     tr.left_glove = tracked_left_glove_;
     tr.right_glove = tracked_right_glove_;
     tr.bare_hand = tracked_bare_hand_;
+    tr.left_glove_class = hand_res.left_glove_class;
+    tr.right_glove_class = hand_res.right_glove_class;
+    tr.white_glove_glare_warning = hand_res.white_glove_glare_warning;
     tr.target_locked = target_locked_;
 
+    bool raw_bare_touching = false;
     if (target_locked_ && tracked_label_box_.has_value()) {
         if (!tracked_tube_box_.has_value()) {
             const double lc_x = ((*tracked_label_box_)[0] + (*tracked_label_box_)[2]) * 0.5;
@@ -3546,12 +3529,12 @@ LiveCameraEngine::TrackResult LiveCameraEngine::track_dynamic_targets(
             }
         }
 
-        if (tracked_bare_hand_.has_value()) {
-            const auto [iou_t, cov_t] = box_iou_and_overlap(*tracked_bare_hand_, tb);
-            const auto [iou_l, cov_l] = box_iou_and_overlap(*tracked_bare_hand_, lb);
+        if (hand_res.bare_hand.has_value()) {
+            const auto [iou_t, cov_t] = box_iou_and_overlap(*hand_res.bare_hand, tb);
+            const auto [iou_l, cov_l] = box_iou_and_overlap(*hand_res.bare_hand, lb);
             if (iou_t > 0.01 || cov_t > 0.03 || iou_l > 0.01 || cov_l > 0.03) {
                 if (work_mode == "strict") {
-                    tr.bare_hand_touching_part = true;
+                    raw_bare_touching = true;
                 } else if (iou_l > 0.04 || cov_l > 0.10) {
                     tr.contact_active = true;
                 }
@@ -3572,10 +3555,46 @@ LiveCameraEngine::TrackResult LiveCameraEngine::track_dynamic_targets(
         });
     }
 
+    const vision::HysteresisState hyst =
+        hand_glove_detector_.update_hysteresis(hand_res.bare_hand.has_value(), raw_bare_touching);
+    tr.bare_hand_hysteresis_active = hyst.bare_hand_active;
+    tr.bare_hand_violation_triggered = hyst.bare_hand_violation;
+    tr.bare_hand_touching_part = raw_bare_touching || hyst.bare_hand_violation;
+    tr.hand_detector_meta = hand_glove_detector_.status_json();
+
+    std::vector<Box> align_hand_boxes;
+    if (tracked_left_glove_.has_value()) align_hand_boxes.push_back(*tracked_left_glove_);
+    if (tracked_right_glove_.has_value()) align_hand_boxes.push_back(*tracked_right_glove_);
+    if (tracked_bare_hand_.has_value()) align_hand_boxes.push_back(*tracked_bare_hand_);
+    if (tr.target_locked && tr.tube_box.has_value()) {
+        tr.tube_align = tube_aligner_.align(
+            frame,
+            tr.tube_box,
+            align_hand_boxes,
+            tr.label_box,
+            calibrated_tube_height_norm
+        );
+    } else {
+        tr.tube_align = tube_aligner_.align(
+            frame,
+            std::nullopt,
+            align_hand_boxes,
+            std::nullopt,
+            calibrated_tube_height_norm
+        );
+    }
+
+    auto glove_label_zh = [](const std::string& cls_name, const std::string& side) -> std::string {
+        if (cls_name == "esd_gray") return side + "手套(灰ESD)";
+        if (cls_name == "esd_black") return side + "手套(黑ESD)";
+        return side + "手套(合规)";
+    };
+
     if (tracked_left_glove_.has_value()) {
         tr.tracked_objects.push_back(json{
             {"kind", "glove_left"},
-            {"label", "左手套(合规)"},
+            {"label", glove_label_zh(tr.left_glove_class, "左")},
+            {"class_name", tr.left_glove_class.empty() ? "esd_white" : tr.left_glove_class},
             {"box", box_to_json(tracked_left_glove_)},
             {"confidence", 0.94},
         });
@@ -3583,7 +3602,8 @@ LiveCameraEngine::TrackResult LiveCameraEngine::track_dynamic_targets(
     if (tracked_right_glove_.has_value()) {
         tr.tracked_objects.push_back(json{
             {"kind", "glove_right"},
-            {"label", "右手套(合规)"},
+            {"label", glove_label_zh(tr.right_glove_class, "右")},
+            {"class_name", tr.right_glove_class.empty() ? "esd_white" : tr.right_glove_class},
             {"box", box_to_json(tracked_right_glove_)},
             {"confidence", 0.94},
         });
@@ -3925,7 +3945,8 @@ std::tuple<std::vector<uint8_t>, std::vector<uint8_t>, cv::Mat> LiveCameraEngine
     const std::string& label_status,
     std::optional<double> label_conf,
     const std::string& work_mode,
-    bool show_aux
+    bool show_aux,
+    const vision::TubeAlignResult* tube_align
 ) {
     cv::Mat hud = frame.clone();
     const int h = hud.rows;
@@ -4011,6 +4032,27 @@ std::tuple<std::vector<uint8_t>, std::vector<uint8_t>, cv::Mat> LiveCameraEngine
         }
         draw_dynamic_box(label_box, label_color, label_tag, 2);
         active_crop_box = *label_box;
+    }
+
+    if (tube_align != nullptr) {
+        if (tube_align->status == vision::TubeAlignStatus::ALIGNED && tube_align->has_quad) {
+            const cv::Scalar quad_col(235, 200, 45);
+            for (int i = 0; i < 4; ++i) {
+                const auto& a = tube_align->quad_norm[i];
+                const auto& b = tube_align->quad_norm[(i + 1) % 4];
+                cv::line(
+                    hud,
+                    cv::Point(static_cast<int>(a.x * w), static_cast<int>(a.y * h)),
+                    cv::Point(static_cast<int>(b.x * w), static_cast<int>(b.y * h)),
+                    quad_col,
+                    2,
+                    cv::LINE_AA
+                );
+            }
+        } else if (tube_align->status == vision::TubeAlignStatus::TUBE_ALIGN_FAIL) {
+            const Box warn_box = tube_box.value_or(Box{0.25, 0.35, 0.75, 0.65});
+            draw_dynamic_box(warn_box, cv::Scalar(35, 45, 210), "对齐失败·禁止放行", 3);
+        }
     }
 
     const double lcx = (active_crop_box[0] + active_crop_box[2]) * 0.5;
@@ -4184,7 +4226,16 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
     const auto [config_match, camera_settings_locked, cal_reasons] =
         evaluate_live_calibration(cfg, w, h, work_mode_now);
 
-    const TrackResult tr = track_dynamic_targets(frame, work_mode_now);
+    std::optional<double> expected_tube_width_norm;
+    if (thresholds.is_object() && thresholds.contains("expected_tube_width_norm") &&
+        thresholds["expected_tube_width_norm"].is_number()) {
+        const double tw = thresholds["expected_tube_width_norm"].get<double>();
+        if (tw >= 0.04 && tw <= 0.35) {
+            expected_tube_width_norm = tw;
+        }
+    }
+
+    const TrackResult tr = track_dynamic_targets(frame, work_mode_now, expected_tube_width_norm);
     const Box eval_box = (tr.target_locked && tr.label_box.has_value()) ? *tr.label_box : rois.label_roi;
     const auto quality = measure_label_quality(frame, eval_box);
 
@@ -4203,8 +4254,12 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                              (work_mode_now == "debug" && bare_cx.has_value() && *bare_cx < 0.50);
     const bool right_active = tr.right_glove.has_value() ||
                               (work_mode_now == "debug" && bare_cx.has_value() && *bare_cx >= 0.50);
-    const bool glove_compliant = (left_active || right_active) && (!tr.bare_hand.has_value() || work_mode_now == "debug");
-    const bool bare_hand_detected = tr.bare_hand.has_value() && (work_mode_now == "strict");
+    const bool bare_hand_detected = tr.bare_hand_hysteresis_active && (work_mode_now == "strict");
+    const bool glove_compliant = (left_active || right_active) && (!bare_hand_detected || work_mode_now == "debug");
+    const bool align_hard_failed =
+        tr.target_locked && (tr.tube_align.status == vision::TubeAlignStatus::TUBE_ALIGN_FAIL);
+    const bool align_reused_low_conf =
+        tr.target_locked && (tr.tube_align.status == vision::TubeAlignStatus::REUSED_LOW_CONF);
 
     std::vector<std::string> reasons = cal_reasons;
     if (tr.bare_hand_touching_part && work_mode_now == "strict") {
@@ -4212,8 +4267,15 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
     } else if (bare_hand_detected) {
         reasons.push_back("BARE_HAND_WARNING_NO_GLOVE");
     }
+    if (tr.white_glove_glare_warning) {
+        reasons.push_back("WHITE_GLOVE_OVEREXPOSED");
+    }
     if (!tr.target_locked) {
         reasons.push_back("TUBE_NOT_PRESENT");
+    } else if (align_hard_failed) {
+        reasons.push_back("TUBE_ALIGN_FAIL");
+    } else if (align_reused_low_conf) {
+        reasons.push_back("TUBE_ALIGN_LOW_CONF");
     }
     if (!quality.has_value()) {
         reasons.push_back("LABEL_ROI_QUALITY_UNAVAILABLE");
@@ -4267,22 +4329,38 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                    r == "UNDEREXPOSED";
         });
     bool view_valid = tr.target_locked && quality_ok && config_match && camera_settings_locked &&
-                      !label_roi_drift_exceeded && !tracked.hand_contact_candidate && !tr.bare_hand_touching_part;
+                      !label_roi_drift_exceeded && !tracked.hand_contact_candidate &&
+                      !tr.bare_hand_touching_part && !align_hard_failed && !align_reused_low_conf;
     if (tracked.hand_contact_candidate) {
         reasons.push_back("HAND_IN_CONTACT_ROI");
     }
 
-    const cv::Mat label_crop_for_cls = crop_norm(frame, eval_box);
-    const ClassificationResult cls = classify_live_label_roi(
-        label_crop_for_cls,
-        tr.target_locked,
-        contact_seen_now,
-        tracked.hand_contact_candidate
-    );
+    // Strict fail-closed: on TUBE_ALIGN_FAIL, NEVER silently fall back to unrectified crop classification
+    const bool allow_rectified_cls =
+        tr.target_locked &&
+        !align_hard_failed &&
+        (!align_reused_low_conf || !tr.tube_align.rectified_label_bgr.empty());
+    const cv::Mat raw_label_crop = crop_norm(frame, eval_box);
+    const cv::Mat label_crop_for_cls =
+        !tr.tube_align.rectified_label_bgr.empty()
+            ? tr.tube_align.rectified_label_bgr
+            : raw_label_crop;
+    ClassificationResult cls{};
+    if (allow_rectified_cls) {
+        cls = classify_live_label_roi(
+            label_crop_for_cls,
+            tr.target_locked,
+            contact_seen_now,
+            tracked.hand_contact_candidate
+        );
+    }
 
     std::optional<double> cur_end_asymmetry;
     if (tr.target_locked && tr.tube_box.has_value()) {
-        const cv::Mat tube_crop = crop_norm(frame, *tr.tube_box);
+        const cv::Mat tube_crop =
+            !tr.tube_align.rectified_tube_bgr.empty()
+                ? tr.tube_align.rectified_tube_bgr
+                : crop_norm(frame, *tr.tube_box);
         if (!tube_crop.empty() && tube_crop.cols >= 12 && tube_crop.rows >= 4) {
             cv::Mat tube_gray;
             cv::cvtColor(tube_crop, tube_gray, cv::COLOR_BGR2GRAY);
@@ -4342,10 +4420,10 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                 const bool use_diff_gate =
                     (auto_capture_.min_diff_mad > 0.0) &&
                     (auto_capture_.label != "unknown_challenge") &&
-                    !label_crop_for_cls.empty();
+                    !raw_label_crop.empty();
                 if (use_diff_gate) {
                     cv::Mat small_bgr;
-                    cv::resize(label_crop_for_cls, small_bgr, cv::Size(64, 48), 0, 0, cv::INTER_AREA);
+                    cv::resize(raw_label_crop, small_bgr, cv::Size(64, 48), 0, 0, cv::INTER_AREA);
                     cv::cvtColor(small_bgr, cur_small_gray, cv::COLOR_BGR2GRAY);
                     if (!last_auto_capture_gray_small_.empty() &&
                         last_auto_capture_gray_small_.size() == cur_small_gray.size()) {
@@ -4398,6 +4476,9 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
             {"right_grip_active", right_active},
             {"glove_compliant", glove_compliant},
             {"bare_hand_detected", bare_hand_detected},
+            {"tube_align_failed", align_hard_failed},
+            {"tube_alignment", tr.tube_align.to_json()},
+            {"hand_glove_detector", tr.hand_detector_meta},
             {"pipe_color", cls.pipe_color},
             {"frame_id", current_frame_id},
             {"capture_monotonic_s", round_to(capture_ts, 3)},
@@ -4438,12 +4519,7 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                     reasons.push_back("PERSISTENCE_QUEUE_OVERFLOW");
                 }
             } else {
-                if (tr.bare_hand_touching_part && work_mode_now == "strict") {
-                    ++bare_hand_violation_streak_;
-                } else {
-                    bare_hand_violation_streak_ = 0;
-                }
-                if (bare_hand_violation_streak_ >= 3 && work_mode_now == "strict" && !alarm_latched_) {
+                if (tr.bare_hand_violation_triggered && work_mode_now == "strict" && !alarm_latched_) {
                     alarm_latched_ = true;
                     latched_reason_ = "BARE_HAND_VIOLATION";
                     latched_cycle_id_ = fsm_.cycle_id().value_or(generate_live_cycle_id());
@@ -4585,6 +4661,11 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                         obs_ev.hand_in_left_grip_zone = tracked.hand_contact_candidate ? false : left_active;
                         obs_ev.hand_in_right_grip_zone = tracked.hand_contact_candidate ? false : right_active;
                         obs_ev.pipe_color = cls.pipe_color;
+                        if (align_hard_failed) {
+                            obs_ev.reason = "TUBE_ALIGN_FAIL";
+                        } else if (align_reused_low_conf) {
+                            obs_ev.reason = "TUBE_ALIGN_LOW_CONF";
+                        }
                         obs_ev.operator_anon_id = "OP_STATION_01";
                         fsm_.process(obs_ev, fsm_now);
 
@@ -4630,7 +4711,7 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
             }
             state_["view_valid"] = view_valid;
             state_["view_valid_reasons"] = reasons;
-            state_["bare_hand_violation"] = (bare_hand_violation_streak_ >= 3) ||
+            state_["bare_hand_violation"] = tr.bare_hand_violation_triggered ||
                                             (latched_reason_.value_or("") == "BARE_HAND_VIOLATION");
             state_["alarm_latched"] = alarm_latched_;
             state_["label_contact_active"] = tracked.hand_contact_candidate;
@@ -4735,7 +4816,7 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
             }
         }
 
-        hud_bare_violation = (bare_hand_violation_streak_ >= 3) ||
+        hud_bare_violation = tr.bare_hand_violation_triggered ||
                              (latched_reason_.value_or("") == "BARE_HAND_VIOLATION");
         hud_alarm_latched = alarm_latched_;
     }
@@ -4758,7 +4839,7 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                     : auto_cfg_snapshot.pipe_color;
             auto_cb(
                 frame,
-                label_crop_for_cls,
+                raw_label_crop,
                 auto_cfg_snapshot.label,
                 sample_pipe,
                 auto_cfg_snapshot.physical_tube_id,
@@ -4786,7 +4867,8 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
             cls.label_status,
             cls.confidence,
             work_mode_now,
-            show_aux_now
+            show_aux_now,
+            &tr.tube_align
         );
 
         {
