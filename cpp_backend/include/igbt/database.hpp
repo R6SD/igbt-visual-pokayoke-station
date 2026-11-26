@@ -159,6 +159,36 @@ public:
     void run_wal_checkpoint_truncate();
     json pragma_diagnostics() const;
 
+    // Red Rabbit Golden-Sample Challenge & Hash-Chain Audit Repository (v4.3 AEC-Q101)
+    json rr_list_samples(bool active_only = false) const;
+    std::optional<json> rr_get_sample(const std::string& sample_uid) const;
+    json rr_upsert_sample(const json& payload, const std::string& actor);
+
+    json rr_create_session(const json& session_obj);
+    std::optional<json> rr_get_session(const std::string& session_id) const;
+    json rr_list_sessions(int limit = 30) const;
+    void rr_update_session_status(
+        const std::string& session_id,
+        const std::string& status,
+        std::optional<int64_t> completed_at_ms = std::nullopt
+    );
+
+    json rr_record_attempt(const json& attempt_obj);
+    json rr_list_attempts(const std::string& session_id) const;
+    std::optional<json> rr_last_passed_session() const;
+
+    json rr_append_lock_audit(
+        const std::string& event_type,
+        const std::string& actor_id,
+        const std::string& actor_role,
+        const std::string& reason_code,
+        const std::string& comment,
+        const std::optional<std::string>& related_session,
+        int64_t created_at_ms
+    );
+    json rr_list_lock_audit(int limit = 50) const;
+    json rr_verify_lock_audit_chain() const;
+
 private:
     void open_and_initialize();
     void exec_sql_unlocked(const std::string& sql) const;

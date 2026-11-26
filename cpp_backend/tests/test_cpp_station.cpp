@@ -1,3 +1,14 @@
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 #include "igbt/http_server.hpp"
 
 #include <sqlite3.h>
@@ -1387,6 +1398,676 @@ void test_camera_optics_and_anti_glare() {
     REQUIRE(q->overexposed_fraction > 0.08);
 }
 
+// ----------------------------------------------------------------------------
+// Test 9: v4.3 Red Rabbit Mandatory Challenge, Anti-Cheat & SHA-256 Audit Chain
+// ----------------------------------------------------------------------------
+void test_red_rabbit_challenge_and_hash_chain_audit() {
+    ScopedTempDir tmp;
+    const auto web_dir = tmp.path() / "web_dist";
+    std::filesystem::create_directories(web_dir);
+    const std::string html = "<!doctype html><html><body>Red Rabbit OK</body></html>";
+    REQUIRE(write_file_bytes_atomic(web_dir / "index.html", html.data(), html.size()));
+
+    StationDatabase db(tmp.path());
+    REQUIRE_EQ(db.rr_list_samples(true).size(), 4u);
+
+    LiveCameraEngine cam(0);
+    TrainingManager training(tmp.path());
+    StationServerOptions opts;
+    opts.host = "127.0.0.1";
+    opts.port = 0;
+    opts.data_dir = tmp.path();
+    opts.web_dist_dir = web_dir;
+    opts.enable_live_camera = false;
+
+    std::tm base_tm{};
+    base_tm.tm_year = 126;  // 2026
+    base_tm.tm_mon = 10;    // Nov
+    base_tm.tm_mday = 26;
+    base_tm.tm_hour = 7;
+    base_tm.tm_min = 50;
+    base_tm.tm_sec = 0;
+    base_tm.tm_isdst = -1;
+    const int64_t t_0750_ms = static_cast<int64_t>(std::mktime(&base_tm)) * 1000;
+    REQUIRE(t_0750_ms > 0);
+    std::atomic<int64_t> fake_clock_ms{t_0750_ms};
+
+    StationHttpServer server(db, cam, training, opts);
+    server.red_rabbit().set_wall_clock_for_test([&]() { return fake_clock_ms.load(); });
+    server.auth().set_env_override("IGBT_ENGINEER_PIN", "271828");
+    const int port = server.start_background();
+    REQUIRE(port > 0);
+
+    httplib::Client cli("127.0.0.1", port);
+
+    // 9A. Cold boot enters CHALLENGE_REQUIRED and marks /api/state as blocking
+    auto st_cold = cli.Get("/api/state");
+    REQUIRE(st_cold != nullptr && st_cold->status == 200);
+    json st_cold_j = json::parse(st_cold->body);
+    REQUIRE_EQ(st_cold_j.value("red_rabbit_blocking", false), true);
+    REQUIRE(st_cold_j.contains("red_rabbit") && st_cold_j["red_rabbit"].is_object());
+    REQUIRE_EQ(st_cold_j["red_rabbit"].value("state", ""), "CHALLENGE_REQUIRED");
+    REQUIRE_EQ(st_cold_j["red_rabbit"].value("trigger_reason", ""), "COLD_BOOT");
+
+    // Authenticate admin token & add an expired golden sample (must be excluded from plans)
+    auto pin_res = cli.Post("/api/auth/verify", R"({"passcode":"271828"})", "application/json");
+    REQUIRE(pin_res != nullptr && pin_res->status == 200);
+    const std::string admin_tok = json::parse(pin_res->body).value("admin_token", "");
+    httplib::Headers admin_hdrs = {{"X-Admin-Token", admin_tok}};
+
+    json exp_payload = {
+        {"sample_uid", "RR-NG-EXPIRED-999"},
+        {"sample_type", "NG_OOD"},
+        {"expected_verdict", "ALARM"},
+        {"product_family", "IGBT_TO247"},
+        {"is_active", true},
+        {"expires_at_ms", t_0750_ms - 1000},
+    };
+    auto exp_res = cli.Post("/api/red_rabbit/samples", admin_hdrs, exp_payload.dump(), "application/json");
+    REQUIRE(exp_res != nullptr && exp_res->status == 200);
+
+    // 9B. Start randomized challenge (1 OK + 2 NG) & verify anti-cheat guards
+    auto start_res = cli.Post(
+        "/api/red_rabbit/sessions/start",
+        R"({"operator_id":"OP_TEST","lot_id":"LOT_RR_01"})",
+        "application/json"
+    );
+    REQUIRE(start_res != nullptr && start_res->status == 200);
+    json rr = json::parse(start_res->body);
+    REQUIRE(rr.contains("session") && rr["session"].is_object());
+    const json& sess = rr["session"];
+    const std::string sid = sess.value("session_id", "");
+    REQUIRE(!sid.empty());
+    const json& plan = sess["required_plan"];
+    REQUIRE_EQ(plan.size(), 3u);
+
+    int ok_cnt = 0;
+    int ng_cnt = 0;
+    for (const auto& step : plan) {
+        REQUIRE(step.value("sample_uid", "") != "RR-NG-EXPIRED-999");
+        if (step.value("sample_type", "") == "OK_GOLDEN") ++ok_cnt;
+        else ++ng_cnt;
+    }
+    REQUIRE_EQ(ok_cnt, 1);
+    REQUIRE_EQ(ng_cnt, 2);
+
+    const std::string uid0 = plan[0].value("sample_uid", "");
+    const std::string exp0 = plan[0].value("expected_verdict", "");
+    const std::string uid1 = plan[1].value("sample_uid", "");
+    const std::string exp1 = plan[1].value("expected_verdict", "");
+    const std::string uid2 = plan[2].value("sample_uid", "");
+    const std::string exp2 = plan[2].value("expected_verdict", "");
+
+    // Wrong UID for step 0 rejected with 422
+    auto bad_arm = cli.Post(
+        "/api/red_rabbit/sessions/" + sid + "/arm",
+        json{{"sample_uid", uid1}}.dump(),
+        "application/json"
+    );
+    REQUIRE(bad_arm != nullptr && bad_arm->status == 422);
+
+    // Arm & pass step 0
+    auto arm0 = cli.Post(
+        "/api/red_rabbit/sessions/" + sid + "/arm",
+        json{{"sample_uid", uid0}}.dump(),
+        "application/json"
+    );
+    REQUIRE(arm0 != nullptr && arm0->status == 200);
+    auto att0 = cli.Post(
+        "/api/red_rabbit/sessions/" + sid + "/attempt",
+        json{{"sample_uid", uid0}, {"actual_verdict", exp0}}.dump(),
+        "application/json"
+    );
+    REQUIRE(att0 != nullptr && att0->status == 200);
+    REQUIRE_EQ(json::parse(att0->body)["session"].value("current_step_index", 0), 1);
+
+    // Duplicate reuse of step 0 UID rejected with 409
+    auto dup_arm = cli.Post(
+        "/api/red_rabbit/sessions/" + sid + "/arm",
+        json{{"sample_uid", uid0}}.dump(),
+        "application/json"
+    );
+    REQUIRE(dup_arm != nullptr && dup_arm->status == 409);
+
+    // 9C. Force CRITICAL_NG_MISSED_AS_PASS -> CHALLENGE_HARD_LOCK
+    std::string fail_uid = uid1;
+    if (exp1 == "PASS") {
+        // Step 1 is OK_GOLDEN; pass it first so step 2 is guaranteed NG_ALARM
+        REQUIRE(cli.Post("/api/red_rabbit/sessions/" + sid + "/arm", json{{"sample_uid", uid1}}.dump(), "application/json")->status == 200);
+        REQUIRE(cli.Post("/api/red_rabbit/sessions/" + sid + "/attempt", json{{"sample_uid", uid1}, {"actual_verdict", "PASS"}}.dump(), "application/json")->status == 200);
+        REQUIRE_EQ(exp2, "ALARM");
+        fail_uid = uid2;
+    }
+    auto arm_ng = cli.Post(
+        "/api/red_rabbit/sessions/" + sid + "/arm",
+        json{{"sample_uid", fail_uid}}.dump(),
+        "application/json"
+    );
+    REQUIRE(arm_ng != nullptr && arm_ng->status == 200);
+    auto fail_ng = cli.Post(
+        "/api/red_rabbit/sessions/" + sid + "/attempt",
+        json{{"sample_uid", fail_uid}, {"actual_verdict", "PASS"}}.dump(),
+        "application/json"
+    );
+    REQUIRE(fail_ng != nullptr && fail_ng->status == 200);
+    json hard_j = json::parse(fail_ng->body);
+    REQUIRE_EQ(hard_j.value("state", ""), "CHALLENGE_HARD_LOCK");
+    REQUIRE_EQ(hard_j.value("hard_locked", false), true);
+    REQUIRE_EQ(hard_j["last_lock_event"].value("reason_code", ""), "CRITICAL_NG_MISSED_AS_PASS");
+
+    // Cannot start new challenge while hard-locked
+    REQUIRE_EQ(cli.Post("/api/red_rabbit/sessions/start", "{}", "application/json")->status, 409);
+
+    // Unlock requires admin token + >= 6 char comment, and returns to CHALLENGE_REQUIRED (never PROD_READY)
+    REQUIRE_EQ(
+        cli.Post(
+            "/api/red_rabbit/unlock",
+            R"({"actor_id":"QE_01","actor_role":"QE","reason_code":"OPTICS_RECHECKED","comment":"已复检偏振镜与金样，重新执行点检"})",
+            "application/json"
+        )->status,
+        401
+    );
+    REQUIRE_EQ(
+        cli.Post(
+            "/api/red_rabbit/unlock",
+            admin_hdrs,
+            R"({"actor_id":"QE_01","actor_role":"QE","reason_code":"OPTICS_RECHECKED","comment":"ok"})",
+            "application/json"
+        )->status,
+        422
+    );
+    auto unlock_res = cli.Post(
+        "/api/red_rabbit/unlock",
+        admin_hdrs,
+        R"({"actor_id":"QE_01","actor_role":"QE","reason_code":"OPTICS_RECHECKED","comment":"已复检光源偏振与金样表面，退回重测"})",
+        "application/json"
+    );
+    REQUIRE(unlock_res != nullptr && unlock_res->status == 200);
+    REQUIRE_EQ(json::parse(unlock_res->body).value("state", ""), "CHALLENGE_REQUIRED");
+
+    // Helper to execute a full passing 3-step challenge
+    auto run_full_pass_challenge = [&]() {
+        auto s_res = cli.Post(
+            "/api/red_rabbit/sessions/start",
+            R"({"operator_id":"OP_TEST","lot_id":"LOT_RR_01"})",
+            "application/json"
+        );
+        REQUIRE(s_res != nullptr && s_res->status == 200);
+        json sj = json::parse(s_res->body);
+        const std::string cur_sid = sj["session"].value("session_id", "");
+        const json& cur_plan = sj["session"]["required_plan"];
+        REQUIRE_EQ(cur_plan.size(), 3u);
+        json last_resp;
+        for (const auto& step : cur_plan) {
+            const std::string suid = step.value("sample_uid", "");
+            const std::string sexp = step.value("expected_verdict", "");
+            REQUIRE_EQ(
+                cli.Post("/api/red_rabbit/sessions/" + cur_sid + "/arm", json{{"sample_uid", suid}}.dump(), "application/json")->status,
+                200
+            );
+            auto a_res = cli.Post(
+                "/api/red_rabbit/sessions/" + cur_sid + "/attempt",
+                json{{"sample_uid", suid}, {"actual_verdict", sexp}}.dump(),
+                "application/json"
+            );
+            REQUIRE(a_res != nullptr && a_res->status == 200);
+            last_resp = json::parse(a_res->body);
+        }
+        REQUIRE_EQ(last_resp.value("state", ""), "PROD_READY");
+        REQUIRE_EQ(last_resp.value("blocking", true), false);
+    };
+
+    // 9D. Complete challenge cleanly at 07:50 -> PROD_READY
+    run_full_pass_challenge();
+    auto st_ready = cli.Get("/api/state");
+    REQUIRE(st_ready != nullptr && st_ready->status == 200);
+    REQUIRE_EQ(json::parse(st_ready->body).value("red_rabbit_blocking", true), false);
+
+    // 9E. Shift change trigger (08:06 local > 08:00 + 5min grace)
+    fake_clock_ms.store(t_0750_ms + 16LL * 60 * 1000);
+    auto st_shift = cli.Get("/api/red_rabbit/status");
+    REQUIRE(st_shift != nullptr && st_shift->status == 200);
+    json shift_j = json::parse(st_shift->body);
+    REQUIRE_EQ(shift_j.value("state", ""), "CHALLENGE_REQUIRED");
+    REQUIRE_EQ(shift_j.value("trigger_reason", ""), "SHIFT_CHANGE");
+    run_full_pass_challenge();
+
+    // 9F. 4h interval expiration trigger
+    fake_clock_ms.fetch_add(4LL * 3600 * 1000 + 1000);
+    auto st_int = cli.Get("/api/red_rabbit/status");
+    REQUIRE(st_int != nullptr && st_int->status == 200);
+    json int_j = json::parse(st_int->body);
+    REQUIRE_EQ(int_j.value("state", ""), "CHALLENGE_REQUIRED");
+    REQUIRE_EQ(int_j.value("trigger_reason", ""), "INTERVAL_EXPIRED");
+    run_full_pass_challenge();
+
+    // 9G. Optics 3A update triggers MODEL_OR_OPTICS_CHANGE
+    auto opt_res = cli.Post(
+        "/api/camera/optics",
+        admin_hdrs,
+        R"({"lock_3a":true,"exposure":-6.0,"gain":0.0,"focus":35,"wb_temperature":4600,"backlight_comp":0})",
+        "application/json"
+    );
+    REQUIRE(opt_res != nullptr && opt_res->status == 200);
+    auto st_opt = cli.Get("/api/red_rabbit/status");
+    REQUIRE(st_opt != nullptr && st_opt->status == 200);
+    REQUIRE_EQ(json::parse(st_opt->body).value("trigger_reason", ""), "MODEL_OR_OPTICS_CHANGE");
+
+    // 9H. Session timeout (> 10 min) transitions to CHALLENGE_HARD_LOCK
+    auto start_to = cli.Post("/api/red_rabbit/sessions/start", "{}", "application/json");
+    REQUIRE(start_to != nullptr && start_to->status == 200);
+    fake_clock_ms.fetch_add(11LL * 60 * 1000);
+    auto st_to = cli.Get("/api/red_rabbit/status");
+    REQUIRE(st_to != nullptr && st_to->status == 200);
+    json to_j = json::parse(st_to->body);
+    REQUIRE_EQ(to_j.value("state", ""), "CHALLENGE_HARD_LOCK");
+    REQUIRE_EQ(to_j.value("trigger_reason", ""), "SESSION_TIMEOUT");
+
+    // 9I. SHA-256 hash-chain verification & SQLite tampering detection
+    auto aud_res = cli.Get("/api/red_rabbit/audit");
+    REQUIRE(aud_res != nullptr && aud_res->status == 200);
+    json aud_j = json::parse(aud_res->body);
+    REQUIRE_EQ(aud_j["chain_verification"].value("valid", false), true);
+    REQUIRE(aud_j["chain_verification"].value("checked_rows", 0) >= 3);
+
+    server.stop();
+
+    sqlite3* raw_db = nullptr;
+    REQUIRE_EQ(sqlite3_open_v2(path_to_utf8(db.db_path()).c_str(), &raw_db, SQLITE_OPEN_READWRITE, nullptr), SQLITE_OK);
+    char* errmsg = nullptr;
+    int rc = sqlite3_exec(raw_db, "UPDATE station_lock_audit SET comment='TAMPERED' WHERE audit_seq=1;", nullptr, nullptr, &errmsg);
+    if (errmsg) sqlite3_free(errmsg);
+    sqlite3_close_v2(raw_db);
+    REQUIRE_EQ(rc, SQLITE_OK);
+
+    const json broken = db.rr_verify_lock_audit_chain();
+    REQUIRE_EQ(broken.value("valid", true), false);
+    REQUIRE_EQ(broken.value("broken_seq", int64_t{-1}), int64_t{1});
+
+    // 9J. Crash dump presence triggers CRASH_RECOVERY on server initialization
+    ScopedTempDir tmp_crash;
+    const auto dumps_dir = tmp_crash.path() / "dumps";
+    std::filesystem::create_directories(dumps_dir);
+    const std::string fake_dmp = "MDMP_TEST";
+    REQUIRE(write_file_bytes_atomic(dumps_dir / "crash_999.dmp", fake_dmp.data(), fake_dmp.size()));
+    StationDatabase db_crash(tmp_crash.path());
+    LiveCameraEngine cam_crash(0);
+    TrainingManager tr_crash(tmp_crash.path());
+    StationServerOptions opts_crash;
+    opts_crash.data_dir = tmp_crash.path();
+    opts_crash.web_dist_dir = web_dir;
+    StationHttpServer srv_crash(db_crash, cam_crash, tr_crash, opts_crash);
+    REQUIRE_EQ(srv_crash.red_rabbit().status_json().value("trigger_reason", ""), "CRASH_RECOVERY");
+}
+
+// ----------------------------------------------------------------------------
+// Test 10: v4.3 ADAM-6050/6060 Native Winsock2 Modbus TCP Watchdog & Fail-Safe
+// ----------------------------------------------------------------------------
+class MockModbusTcpServer {
+public:
+    MockModbusTcpServer() {
+        WSADATA wsa{};
+        (void)WSAStartup(MAKEWORD(2, 2), &wsa);
+
+        listen_sock_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        REQUIRE(listen_sock_ != INVALID_SOCKET);
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        REQUIRE_EQ(::bind(listen_sock_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+        REQUIRE_EQ(::listen(listen_sock_, 4), 0);
+
+        sockaddr_in bound{};
+        int bound_len = sizeof(bound);
+        REQUIRE_EQ(::getsockname(listen_sock_, reinterpret_cast<sockaddr*>(&bound), &bound_len), 0);
+        port_ = ntohs(bound.sin_port);
+
+        u_long nonblock = 1;
+        ioctlsocket(listen_sock_, FIONBIO, &nonblock);
+        worker_ = std::thread([this]() { serve_loop(); });
+    }
+
+    ~MockModbusTcpServer() {
+        stop();
+    }
+
+    uint16_t port() const noexcept { return port_; }
+
+    void stop() {
+        stop_requested_.store(true);
+        if (listen_sock_ != INVALID_SOCKET) {
+            closesocket(listen_sock_);
+            listen_sock_ = INVALID_SOCKET;
+        }
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    std::atomic<uint16_t> di_mask{0x0009};  // bit 0 (active-low E-Stop OK) + bit 3 (ESD ground OK)
+    std::atomic<bool> drop_responses{false};
+    std::atomic<bool> corrupt_tx_id{false};
+    std::atomic<uint8_t> latest_do_mask{0};
+    std::atomic<int> fc15_count{0};
+    std::atomic<int> fc02_count{0};
+    std::atomic<int> seen_toggle_0{0};
+    std::atomic<int> seen_toggle_1{0};
+
+private:
+    static bool recv_n(SOCKET s, uint8_t* dst, std::size_t n, const std::atomic<bool>& stop_flag) {
+        std::size_t got = 0;
+        while (got < n && !stop_flag.load()) {
+            WSAPOLLFD pfd{};
+            pfd.fd = s;
+            pfd.events = POLLRDNORM;
+            const int prc = WSAPoll(&pfd, 1, 20);
+            if (prc < 0) return false;
+            if (prc == 0) continue;
+            if (pfd.revents & (POLLERR | POLLNVAL)) return false;
+            const int r = ::recv(s, reinterpret_cast<char*>(dst + got), static_cast<int>(n - got), 0);
+            if (r <= 0) return false;
+            got += static_cast<std::size_t>(r);
+        }
+        return got == n;
+    }
+
+    void handle_client(SOCKET cli) {
+        u_long nb = 1;
+        ioctlsocket(cli, FIONBIO, &nb);
+        while (!stop_requested_.load()) {
+            uint8_t mbap[7]{};
+            if (!recv_n(cli, mbap, 7, stop_requested_)) break;
+            const uint16_t rx_tx = static_cast<uint16_t>((mbap[0] << 8) | mbap[1]);
+            const uint16_t pdu_len = static_cast<uint16_t>((mbap[4] << 8) | mbap[5]);
+            const uint8_t unit_id = mbap[6];
+            if (pdu_len < 2 || pdu_len > 64) break;
+            std::vector<uint8_t> pdu(pdu_len - 1);
+            if (!recv_n(cli, pdu.data(), pdu.size(), stop_requested_)) break;
+
+            if (drop_responses.load()) {
+                continue;
+            }
+
+            const uint16_t tx_out = corrupt_tx_id.load() ? static_cast<uint16_t>(rx_tx ^ 0x8000U) : rx_tx;
+            if (pdu[0] == 0x0F && pdu.size() >= 7) {
+                const uint8_t mask = pdu[6];
+                latest_do_mask.store(mask);
+                ++fc15_count;
+                if ((mask & (1U << 2)) != 0) ++seen_toggle_1;
+                else ++seen_toggle_0;
+
+                uint8_t resp[12]{
+                    static_cast<uint8_t>(tx_out >> 8), static_cast<uint8_t>(tx_out & 0xFF),
+                    0x00, 0x00, 0x00, 0x06, unit_id, 0x0F,
+                    pdu[1], pdu[2], pdu[3], pdu[4]
+                };
+                (void)::send(cli, reinterpret_cast<const char*>(resp), sizeof(resp), 0);
+            } else if (pdu[0] == 0x02 && pdu.size() >= 5) {
+                ++fc02_count;
+                const uint16_t cnt = static_cast<uint16_t>((pdu[3] << 8) | pdu[4]);
+                const uint8_t byte_cnt = static_cast<uint8_t>((cnt + 7) / 8);
+                const uint16_t cur_di = di_mask.load();
+                std::vector<uint8_t> resp(9 + byte_cnt, 0);
+                resp[0] = static_cast<uint8_t>(tx_out >> 8);
+                resp[1] = static_cast<uint8_t>(tx_out & 0xFF);
+                resp[2] = 0x00;
+                resp[3] = 0x00;
+                const uint16_t rlen = static_cast<uint16_t>(3 + byte_cnt);
+                resp[4] = static_cast<uint8_t>(rlen >> 8);
+                resp[5] = static_cast<uint8_t>(rlen & 0xFF);
+                resp[6] = unit_id;
+                resp[7] = 0x02;
+                resp[8] = byte_cnt;
+                for (uint8_t b = 0; b < byte_cnt; ++b) {
+                    resp[9 + b] = static_cast<uint8_t>((cur_di >> (b * 8)) & 0xFF);
+                }
+                (void)::send(cli, reinterpret_cast<const char*>(resp.data()), static_cast<int>(resp.size()), 0);
+            }
+        }
+        closesocket(cli);
+    }
+
+    void serve_loop() {
+        while (!stop_requested_.load()) {
+            WSAPOLLFD pfd{};
+            pfd.fd = listen_sock_;
+            pfd.events = POLLRDNORM;
+            const int prc = WSAPoll(&pfd, 1, 20);
+            if (prc <= 0) continue;
+            SOCKET cli = ::accept(listen_sock_, nullptr, nullptr);
+            if (cli != INVALID_SOCKET) {
+                handle_client(cli);
+            }
+        }
+    }
+
+    SOCKET listen_sock_{INVALID_SOCKET};
+    uint16_t port_{0};
+    std::atomic<bool> stop_requested_{false};
+    std::thread worker_;
+};
+
+template <typename Pred>
+bool wait_until_true(Pred pred, int timeout_ms = 2500) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    }
+    return pred();
+}
+
+void test_adam_modbus_dio_watchdog_and_failsafe() {
+    MockModbusTcpServer mock;
+
+    auto steady_ms = []() -> int64_t {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count();
+    };
+
+    AdamModbusConfig cfg;
+    cfg.enabled = true;
+    cfg.host = "127.0.0.1";
+    cfg.port = mock.port();
+    cfg.unit_id = 1;
+    cfg.heartbeat_period_ms = 35;
+    cfg.connect_timeout_ms = 200;
+    cfg.io_timeout_ms = 100;
+    cfg.max_consecutive_timeouts = 2;
+    cfg.vision_stall_timeout_ms = 220;
+    cfg.enable_estop_di_check = true;
+    cfg.enable_relay_aux_check = true;
+    cfg.enable_esd_di_check = true;
+
+    std::atomic<bool> fake_vision_running{true};
+    std::atomic<bool> freeze_vision_tick{false};
+    std::atomic<int64_t> frozen_tick_ms{0};
+
+    AdamModbusDioDriver drv(
+        cfg,
+        [&]() { return fake_vision_running.load(); },
+        [&]() { return freeze_vision_tick.load() ? frozen_tick_ms.load() : steady_ms(); }
+    );
+    drv.start();
+
+    // 10A. Normal FC15+FC02 heartbeat loop, toggle bit flip, PASS_ALLOW & LOCKED
+    REQUIRE(wait_until_true([&]() {
+        const auto st = drv.health_status();
+        return st.connected && st.hardware_ready && !st.fault_locked &&
+               st.total_heartbeats >= 4 &&
+               mock.seen_toggle_0.load() > 0 && mock.seen_toggle_1.load() > 0;
+    }));
+    REQUIRE_EQ(drv.is_esd_ground_ok(), true);
+    REQUIRE((mock.latest_do_mask.load() & (1U << 0)) != 0);  // system healthy bit
+    REQUIRE((mock.latest_do_mask.load() & (1U << 1)) == 0);  // pass allow initially 0
+
+    REQUIRE(drv.set_interlock(InterlockSignal::PASS_ALLOW));
+    REQUIRE(wait_until_true([&]() { return (mock.latest_do_mask.load() & (1U << 1)) != 0; }));
+    REQUIRE(drv.set_interlock(InterlockSignal::LOCKED));
+    REQUIRE(wait_until_true([&]() { return (mock.latest_do_mask.load() & (1U << 1)) == 0; }));
+
+    // 10B. Active-low E-Stop fault drops DO to 0x00 and recovers on restore
+    mock.di_mask.store(0x0008);  // clear bit 0 (E-Stop active)
+    REQUIRE(wait_until_true([&]() {
+        const auto st = drv.health_status();
+        return st.fault_locked && st.fault_reason == "HARDWARE_ESTOP_ACTIVE" &&
+               mock.latest_do_mask.load() == 0x00;
+    }));
+    REQUIRE(!drv.is_hardware_ready());
+    mock.di_mask.store(0x0009);  // restore bit 0
+    REQUIRE(wait_until_true([&]() {
+        const auto st = drv.health_status();
+        return !st.fault_locked && drv.is_hardware_ready();
+    }));
+
+    // 10C. Safety relay auxiliary contact weld latches until engineer acknowledge
+    mock.di_mask.store(0x000D);  // bit 0 + bit 2 (relay_aux closed while pass_allow=0) + bit 3
+    REQUIRE(wait_until_true([&]() {
+        const auto st = drv.health_status();
+        return st.relay_weld_fault && st.fault_locked &&
+               st.fault_reason == "RELAY_CONTACT_WELD_FAULT";
+    }));
+    mock.di_mask.store(0x0009);  // clear aux bit -> fault MUST remain latched
+    std::this_thread::sleep_for(std::chrono::milliseconds(90));
+    REQUIRE_EQ(drv.health_status().fault_locked, true);
+    REQUIRE(drv.acknowledge_relay_fault());
+    REQUIRE(wait_until_true([&]() { return !drv.health_status().fault_locked && drv.is_hardware_ready(); }));
+
+    // 10D. Vision loop soft deadlock -> immediate safe-zero DO and stops feeding watchdog
+    frozen_tick_ms.store(steady_ms() - 1000);
+    freeze_vision_tick.store(true);
+    REQUIRE(wait_until_true([&]() {
+        const auto st = drv.health_status();
+        return st.vision_stalled && st.fault_locked &&
+               st.fault_reason == "VISION_LOOP_STALL_WATCHDOG_STOP" &&
+               mock.latest_do_mask.load() == 0x00;
+    }));
+    const int fc15_at_stall = mock.fc15_count.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(160));
+    REQUIRE_EQ(mock.fc15_count.load(), fc15_at_stall);  // must NOT keep feeding ADAM WDT!
+
+    freeze_vision_tick.store(false);
+    REQUIRE(wait_until_true([&]() {
+        const auto st = drv.health_status();
+        return !st.vision_stalled && !st.fault_locked && drv.is_hardware_ready();
+    }));
+
+    // 10E. Corrupt MBAP transaction ID & comm timeout -> MODBUS_WATCHDOG_TIMEOUT -> recovery -> clean stop
+    mock.corrupt_tx_id.store(true);
+    REQUIRE(wait_until_true([&]() {
+        const auto st = drv.health_status();
+        return st.total_comm_errors >= 2 && st.fault_locked &&
+               st.fault_reason == "MODBUS_WATCHDOG_TIMEOUT";
+    }));
+    mock.corrupt_tx_id.store(false);
+    REQUIRE(wait_until_true([&]() { return !drv.health_status().fault_locked && drv.is_hardware_ready(); }));
+
+    mock.drop_responses.store(true);
+    REQUIRE(wait_until_true([&]() {
+        const auto st = drv.health_status();
+        return st.fault_locked && st.fault_reason == "MODBUS_WATCHDOG_TIMEOUT";
+    }));
+    mock.drop_responses.store(false);
+    REQUIRE(wait_until_true([&]() { return !drv.health_status().fault_locked && drv.is_hardware_ready(); }));
+
+    drv.stop();
+    REQUIRE_EQ(mock.latest_do_mask.load(), uint8_t{0x00});
+
+    // 10F. StationHttpServer + HAL + Audit Chain + LiveCameraEngine tick integration
+    ScopedTempDir tmp;
+    const auto web_dir = tmp.path() / "web_dist";
+    std::filesystem::create_directories(web_dir);
+    const std::string html = "<!doctype html><html><body>HAL OK</body></html>";
+    REQUIRE(write_file_bytes_atomic(web_dir / "index.html", html.data(), html.size()));
+
+    StationDatabase db(tmp.path());
+    LiveCameraEngine cam(0);
+    cv::Mat synth = make_synthetic_station_frame(1280, 720, "complete", false, false);
+    REQUIRE(cam.process_injected_frame(synth, 100.0));
+    REQUIRE(cam.last_vision_tick_ms() > 0);
+
+    TrainingManager tr(tmp.path());
+    StationServerOptions opts;
+    opts.host = "127.0.0.1";
+    opts.port = 0;
+    opts.data_dir = tmp.path();
+    opts.web_dist_dir = web_dir;
+    opts.enable_live_camera = false;
+    opts.adam_config = cfg;
+
+    StationHttpServer server(db, cam, tr, opts);
+    server.auth().set_env_override("IGBT_ENGINEER_PIN", "112233");
+    const int http_port = server.start_background();
+    REQUIRE(http_port > 0);
+
+    httplib::Client cli("127.0.0.1", http_port);
+    REQUIRE(wait_until_true([&]() {
+        auto h = cli.Get("/api/health");
+        if (!h || h->status != 200) return false;
+        json hj = json::parse(h->body);
+        return hj.value("interlock_backend", "") == "adam_modbus_tcp" &&
+               hj.value("interlock_hardware_ready", false) &&
+               hj.value("mode", "") == "hardware_interlock";
+    }));
+
+    mock.drop_responses.store(true);
+    REQUIRE(wait_until_true([&]() {
+        auto s = cli.Get("/api/state");
+        if (!s || s->status != 200) return false;
+        json sj = json::parse(s->body);
+        return sj.value("hardware_fault_locked", false) &&
+               sj.value("outcome", "") == "FAULT" &&
+               sj.value("fsm_state", "") == "FAULT" &&
+               sj.value("result_reason", "") == "MODBUS_WATCHDOG_TIMEOUT";
+    }));
+
+    auto aud_res = cli.Get("/api/red_rabbit/audit");
+    REQUIRE(aud_res != nullptr && aud_res->status == 200);
+    json aud_j = json::parse(aud_res->body);
+    REQUIRE_EQ(aud_j["chain_verification"].value("valid", false), true);
+    bool found_wdt_audit = false;
+    for (const auto& row : aud_j["lock_audit"]) {
+        if (row.value("event_type", "") == "WATCHDOG_FAULT_LOCK" &&
+            row.value("reason_code", "") == "MODBUS_WATCHDOG_TIMEOUT") {
+            found_wdt_audit = true;
+            break;
+        }
+    }
+    REQUIRE(found_wdt_audit);
+
+    mock.drop_responses.store(false);
+    REQUIRE(wait_until_true([&]() {
+        auto s = cli.Get("/api/state");
+        return s && s->status == 200 && !json::parse(s->body).value("hardware_fault_locked", true);
+    }));
+
+    // Relay weld fault reset route requires admin token & writes audit trail
+    mock.di_mask.store(0x000D);
+    REQUIRE(wait_until_true([&]() {
+        auto d = cli.Get("/api/hal/dio");
+        return d && d->status == 200 && json::parse(d->body).value("relay_weld_fault", false);
+    }));
+    REQUIRE_EQ(cli.Post("/api/hal/dio/reset_weld_fault", "", "application/json")->status, 401);
+
+    auto pin_res = cli.Post("/api/auth/verify", R"({"passcode":"112233"})", "application/json");
+    REQUIRE(pin_res != nullptr && pin_res->status == 200);
+    httplib::Headers admin_hdrs = {{"X-Admin-Token", json::parse(pin_res->body).value("admin_token", "")}};
+    mock.di_mask.store(0x0009);
+    auto rst = cli.Post("/api/hal/dio/reset_weld_fault", admin_hdrs, "", "application/json");
+    REQUIRE(rst != nullptr && rst->status == 200);
+    REQUIRE_EQ(json::parse(rst->body).value("reset_applied", false), true);
+    REQUIRE(wait_until_true([&]() {
+        auto d = cli.Get("/api/hal/dio");
+        return d && d->status == 200 && !json::parse(d->body).value("fault_locked", true);
+    }));
+
+    server.stop();
+    mock.stop();
+}
+
 }  // namespace
 
 int main() {
@@ -1405,6 +2086,8 @@ int main() {
         {"6. Skip-Frame Ring Buffer, Async Burst Writer, Diff-Gated Capture & Evidence Quota", test_skip_frame_storage_and_diff_gate},
         {"7. v4.2.0 Hardening (bursts/ Quota, 429 Retry-After, /api/diagnostics/runtime, Debounce & Post-Burst)", test_v42_hardening_and_diagnostics},
         {"8. Hardware Camera Optics Persistence, Anti-Glare Stepper & Specular Resistance", test_camera_optics_and_anti_glare},
+        {"9. v4.3 Red Rabbit Mandatory Challenge, Anti-Cheat & SHA-256 Audit Chain", test_red_rabbit_challenge_and_hash_chain_audit},
+        {"10. v4.3 ADAM-6050/6060 Native Winsock2 Modbus TCP Watchdog & Fail-Safe", test_adam_modbus_dio_watchdog_and_failsafe},
     };
 
     int passed = 0;

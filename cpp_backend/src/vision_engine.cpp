@@ -4159,6 +4159,11 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
     int64_t current_frame_id = 0;
     double measured_fps = kDefaultTargetFps;
     {
+        const int64_t mono_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count();
+        last_vision_tick_ms_.store(mono_ms, std::memory_order_relaxed);
+
         std::lock_guard<std::mutex> lk(mutex_);
         current_frame_id = ++frame_id_;
         fps_times_.push_back(capture_ts);

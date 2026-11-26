@@ -396,6 +396,54 @@ bool is_trusted_loopback_host(const std::string& host_header) {
     return host == "127.0.0.1" || host == "localhost" || host == "testserver";
 }
 
+bool has_recent_crash_dump(const std::filesystem::path& data_dir) {
+    std::error_code ec;
+    const auto dumps_dir = data_dir / "dumps";
+    if (!std::filesystem::is_directory(dumps_dir, ec)) return false;
+    const auto now_ft = std::filesystem::file_time_type::clock::now();
+    for (std::filesystem::directory_iterator it(dumps_dir, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code fec;
+        if (!it->is_regular_file(fec)) continue;
+        if (it->path().extension() != L".dmp") continue;
+        const auto mtime = it->last_write_time(fec);
+        if (!fec && (now_ft - mtime) <= std::chrono::minutes(10)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+AdamModbusConfig resolve_adam_config(
+    const StationServerOptions& options,
+    const std::filesystem::path& data_dir,
+    const EngineerSessionAuth& auth
+) {
+    if (options.adam_config.has_value()) {
+        return *options.adam_config;
+    }
+    const auto cfg_path = data_dir / "hal_adam.json";
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(cfg_path, ec)) {
+        return load_adam_config_file(cfg_path);
+    }
+    const std::string env_host = auth.get_env_value("IGBT_ADAM_HOST");
+    if (!env_host.empty()) {
+        AdamModbusConfig cfg;
+        cfg.enabled = true;
+        cfg.host = env_host;
+        const std::string env_port = auth.get_env_value("IGBT_ADAM_PORT");
+        if (!env_port.empty()) {
+            try {
+                const int p = std::stoi(env_port);
+                if (p >= 1 && p <= 65535) cfg.port = static_cast<uint16_t>(p);
+            } catch (...) {
+            }
+        }
+        return cfg;
+    }
+    return {};
+}
+
 }  // namespace
 
 // ============================================================================
@@ -669,7 +717,14 @@ StationHttpServer::StationHttpServer(
     : db_(db),
       camera_(camera),
       training_(training),
-      options_(std::move(options)) {
+      options_(std::move(options)),
+      red_rabbit_(
+          db_,
+          "STATION_01",
+          RedRabbitPolicy{},
+          default_wall_clock_ms,
+          has_recent_crash_dump(options_.data_dir.empty() ? db_.data_root() : options_.data_dir)
+      ) {
     if (options_.data_dir.empty()) {
         options_.data_dir = db_.data_root();
     }
@@ -679,6 +734,39 @@ StationHttpServer::StationHttpServer(
     if (options_.assets_dir.empty()) {
         options_.assets_dir = detect_default_assets_dir();
     }
+
+    const AdamModbusConfig adam_cfg = resolve_adam_config(options_, options_.data_dir, auth_);
+    if (adam_cfg.enabled) {
+        auto driver = std::make_unique<AdamModbusDioDriver>(
+            adam_cfg,
+            [this]() { return camera_.is_running(); },
+            [this]() { return camera_.last_vision_tick_ms(); },
+            [this](bool fault_locked, const std::string& reason) {
+                try {
+                    if (fault_locked && !reason.empty()) {
+                        db_.rr_append_lock_audit(
+                            "WATCHDOG_FAULT_LOCK",
+                            "SYSTEM",
+                            "SYSTEM",
+                            reason,
+                            "ADAM Modbus TCP 看门狗或安全输入触发硬件故障落锁",
+                            std::nullopt,
+                            default_wall_clock_ms()
+                        );
+                    }
+                } catch (...) {
+                }
+            }
+        );
+        driver->start();
+        interlock_ = std::move(driver);
+    } else {
+        interlock_ = std::make_unique<ShadowNoopInterlock>();
+    }
+
+    red_rabbit_.set_interlock_callback([this](InterlockSignal sig) {
+        if (interlock_) interlock_->set_interlock(sig);
+    });
 
     // Wire LiveCameraEngine configuration loader & cycle persistence callback
     camera_.set_evidence_root(db_.evidence_root());
@@ -699,7 +787,27 @@ StationHttpServer::StationHttpServer(
     });
     camera_.set_cycle_callback(
         [this](const json& snap, const std::optional<std::string>& prev_fsm, const std::vector<uint8_t>& ev_jpg) {
-            return db_.record_live_transition(snap, prev_fsm, ev_jpg);
+            const bool saved = db_.record_live_transition(snap, prev_fsm, ev_jpg);
+            const std::string outcome = snap.value("outcome", "");
+            if (outcome == "PASS" || outcome == "ALARM") {
+                (void)red_rabbit_.try_consume_live_verdict(
+                    outcome,
+                    snap.value("latest_evidence_url", "")
+                );
+            }
+            if (interlock_) {
+                const DioHealthStatus dio = interlock_->health_status();
+                InterlockSignal sig = InterlockSignal::LOCKED;
+                if (dio.fault_locked) {
+                    sig = InterlockSignal::FAULT_HALT;
+                } else if (outcome == "ALARM" || red_rabbit_.state() == RedRabbitState::CHALLENGE_HARD_LOCK) {
+                    sig = InterlockSignal::ALARM_LATCHED;
+                } else if (!red_rabbit_.is_blocking() && outcome == "PASS" && snap.value("view_valid", false)) {
+                    sig = InterlockSignal::PASS_ALLOW;
+                }
+                interlock_->set_interlock(sig);
+            }
+            return saved;
         }
     );
 
@@ -814,6 +922,38 @@ json StationHttpServer::build_offline_live_state() const {
 }
 
 json StationHttpServer::build_current_state_response() {
+    const json rr = red_rabbit_.status_json();
+    const bool rr_blocking = rr.value("blocking", true);
+    const std::string rr_block_reason =
+        rr.value("hard_locked", false) ? "RED_RABBIT_HARD_LOCK" : "RED_RABBIT_CHALLENGE_REQUIRED";
+    const DioHealthStatus dio = interlock_ ? interlock_->health_status() : DioHealthStatus{};
+    const json dio_json = dio_health_to_json(dio);
+
+    auto attach_red_rabbit = [&](json st, bool override_pass) -> json {
+        st["red_rabbit"] = rr;
+        st["red_rabbit_blocking"] = rr_blocking;
+        st["hal_dio"] = dio_json;
+        st["hardware_fault_locked"] = dio.fault_locked;
+        if (override_pass) {
+            if (dio.fault_locked) {
+                st["interlock_output_enabled"] = false;
+                st["outcome"] = "FAULT";
+                st["fsm_state"] = "FAULT";
+                st["result_reason"] = dio.fault_reason.empty() ? "MODBUS_WATCHDOG_TIMEOUT" : dio.fault_reason;
+            } else if (rr_blocking) {
+                st["interlock_output_enabled"] = false;
+                if (st.value("outcome", "") == "PASS") {
+                    st["outcome"] = "ALARM";
+                    st["result_reason"] = rr_block_reason;
+                }
+            } else if (dio.configured && dio.hardware_ready) {
+                st["mode"] = "hardware_interlock";
+                st["interlock_output_enabled"] = true;
+            }
+        }
+        return st;
+    };
+
     double sim_until = 0.0;
     {
         std::lock_guard<std::mutex> lk(state_mutex_);
@@ -831,7 +971,7 @@ json StationHttpServer::build_current_state_response() {
         live["engine"] = "cpp20";
         live["live_stream_url"] = "/api/camera/stream";
         live["live_crop_url"] = "/api/camera/stream_crop";
-        return db_.attach_latest_evidence_and_summary(std::move(live));
+        return db_.attach_latest_evidence_and_summary(attach_red_rabbit(std::move(live), true));
     }
 
     json persisted = db_.get_persisted_station_state();
@@ -845,7 +985,7 @@ json StationHttpServer::build_current_state_response() {
                                    cyc_id.rfind("LIVE_", 0) == 0;
 
     if (!cam_online && !in_sim_override && (live_enabled || persisted_is_live)) {
-        return db_.attach_latest_evidence_and_summary(build_offline_live_state());
+        return db_.attach_latest_evidence_and_summary(attach_red_rabbit(build_offline_live_state(), true));
     }
 
     json state = apply_validity_gate(std::move(persisted));
@@ -862,7 +1002,7 @@ json StationHttpServer::build_current_state_response() {
         state.erase("live_stream_url");
         state.erase("live_crop_url");
     }
-    return db_.attach_latest_evidence_and_summary(std::move(state));
+    return db_.attach_latest_evidence_and_summary(attach_red_rabbit(std::move(state), !in_sim_override));
 }
 
 json StationHttpServer::load_verified_model_into_camera(
@@ -964,6 +1104,10 @@ bool StationHttpServer::on_training_completed(const json& run_summary) {
 
         // Hot-load into LiveCameraEngine and register in SQLite model_registry
         load_verified_model_into_camera(model_path, artifact_format, model_version, expected_sha, input_size);
+        try {
+            red_rabbit_.trigger_challenge("MODEL_OR_OPTICS_CHANGE", "", "trainer-pipeline");
+        } catch (...) {
+        }
 
         const double test_acc = run_summary.value("test_accuracy", 0.0) * 100.0;
         const int train_n = run_summary.value("train_samples", 0);
@@ -1019,12 +1163,16 @@ void StationHttpServer::register_routes() {
 
     // 1. Health & Auth
     svr_.Get("/api/health", wrap([this](const httplib::Request&, httplib::Response& res) {
+        const DioHealthStatus dio = interlock_ ? interlock_->health_status() : DioHealthStatus{};
+        const bool hw_interlock_active = dio.configured && dio.hardware_ready && !dio.fault_locked;
         send_json(res, 200, json{
             {"status", "ok"},
             {"host_policy", "loopback_only"},
-            {"mode", "shadow"},
-            {"interlock_output_enabled", false},
-            {"interlock_backend", interlock_.backend_name()},
+            {"mode", hw_interlock_active ? "hardware_interlock" : "shadow"},
+            {"interlock_output_enabled", hw_interlock_active},
+            {"interlock_backend", interlock_ ? interlock_->backend_name() : "shadow_noop"},
+            {"interlock_hardware_ready", dio.hardware_ready},
+            {"interlock_fault_locked", dio.fault_locked},
             {"mes_connected", mes_client_.is_connected()},
             {"engine", "cpp20"}
         });
@@ -1032,11 +1180,14 @@ void StationHttpServer::register_routes() {
 
     svr_.Get("/api/diagnostics/runtime", wrap([this](const httplib::Request&, httplib::Response& res) {
         const json cam_state = camera_.get_state_json();
+        const DioHealthStatus dio = interlock_ ? interlock_->health_status() : DioHealthStatus{};
         send_json(res, 200, json{
             {"async_evidence", camera_.async_evidence_stats()},
             {"db_pragmas", db_.pragma_diagnostics()},
             {"hardware_3a", cam_state.value("hardware_3a", json::object())},
-            {"camera_optics", camera_.get_camera_optics_json()}
+            {"camera_optics", camera_.get_camera_optics_json()},
+            {"red_rabbit", red_rabbit_.status_json()},
+            {"hal_dio", dio_health_to_json(dio)}
         });
     }));
 
@@ -1230,14 +1381,16 @@ void StationHttpServer::register_routes() {
         const json body = parse_json_body_or_throw(req);
         const json saved = db_.save_camera_optics(body, actor);
         json out = camera_.set_camera_optics(camera_optics_from_json(saved), true);
+        red_rabbit_.trigger_challenge("MODEL_OR_OPTICS_CHANGE", "", actor);
         out["updated_at_utc"] = saved.value("updated_at_utc", json(nullptr));
         out["changed_by"] = saved.value("changed_by", json(nullptr));
         send_json(res, 200, out);
     }));
 
     svr_.Post("/api/camera/optics/auto_calibrate", wrap([this](const httplib::Request& req, httplib::Response& res) {
-        auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        const std::string actor = auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
         json out = camera_.trigger_anti_glare_calibration();
+        red_rabbit_.trigger_challenge("MODEL_OR_OPTICS_CHANGE", "", actor);
         send_json(res, 200, json{{"triggered", true}, {"optics", std::move(out)}});
     }));
 
@@ -1387,6 +1540,7 @@ void StationHttpServer::register_routes() {
             sha,
             actual_size
         );
+        red_rabbit_.trigger_challenge("MODEL_OR_OPTICS_CHANGE", "", actor);
         json reg = db_.register_model(
             model_name,
             model_version,
@@ -1407,7 +1561,7 @@ void StationHttpServer::register_routes() {
     }));
 
     svr_.Post("/api/models/:model_id/activate", wrap([this](const httplib::Request& req, httplib::Response& res) {
-        auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        const std::string actor = auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
         const std::string model_id = req.path_params.at("model_id");
         auto row_opt = db_.get_model_by_id(model_id);
         if (!row_opt.has_value()) {
@@ -1469,6 +1623,7 @@ void StationHttpServer::register_routes() {
         }
 
         json info = load_verified_model_into_camera(chosen_path, chosen_format, version, expected_sha, input_size);
+        red_rabbit_.trigger_challenge("MODEL_OR_OPTICS_CHANGE", "", actor);
         json resp{
             {"activated", true},
             {"mode", chosen_format == "opencv_mlp" ? "opencv_mlp" : "onnx_runtime"}
@@ -2090,6 +2245,150 @@ void StationHttpServer::register_routes() {
             throw DatabaseHttpError(422, exc.what());
         }
     }));
+
+    // 10. Red Rabbit Golden-Sample Challenge & Hash-Chain Audit (v4.3 AEC-Q101)
+    svr_.Get("/api/red_rabbit/status", wrap([this](const httplib::Request&, httplib::Response& res) {
+        send_json(res, 200, red_rabbit_.status_json());
+    }));
+
+    svr_.Get("/api/red_rabbit/samples", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const bool active_only = get_int_query(req, "active_only", 0) != 0;
+        send_json(res, 200, json{{"samples", db_.rr_list_samples(active_only)}});
+    }));
+
+    svr_.Post("/api/red_rabbit/samples", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const std::string actor = auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        const json body = parse_json_body_or_throw(req);
+        send_json(res, 200, db_.rr_upsert_sample(body, actor));
+    }));
+
+    svr_.Post("/api/red_rabbit/trigger", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const std::string actor = auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        const json body = req.body.empty() ? json::object() : parse_json_body_or_throw(req);
+        if (!body.is_object()) {
+            throw DatabaseHttpError(422, "INVALID_TRIGGER_PAYLOAD");
+        }
+        const std::string reason = body.value("reason", "MANUAL_AUDIT");
+        const std::string lot_id = body.value("lot_id", "");
+        send_json(res, 200, red_rabbit_.trigger_challenge(reason, lot_id, actor));
+    }));
+
+    svr_.Post("/api/red_rabbit/sessions/start", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const json body = req.body.empty() ? json::object() : parse_json_body_or_throw(req);
+        if (!body.is_object()) {
+            throw DatabaseHttpError(422, "INVALID_SESSION_START_PAYLOAD");
+        }
+        const std::string operator_id = body.value("operator_id", "OP_DEFAULT");
+        const std::string lot_id = body.value("lot_id", "");
+        const json cam_state = camera_.get_state_json();
+        std::string model_sha = cam_state.value("model_sha256", "");
+        if (model_sha.empty()) {
+            model_sha = cam_state.value("model_version", "heuristic");
+        }
+        send_json(res, 200, red_rabbit_.start_session(operator_id, lot_id, model_sha));
+    }));
+
+    svr_.Post("/api/red_rabbit/sessions/:session_id/arm", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const std::string session_id = req.path_params.at("session_id");
+        const json body = parse_json_body_or_throw(req);
+        if (!body.is_object() || !body.contains("sample_uid") || !body["sample_uid"].is_string()) {
+            throw DatabaseHttpError(422, "MISSING_SAMPLE_UID");
+        }
+        send_json(res, 200, red_rabbit_.arm_sample(session_id, body["sample_uid"].get<std::string>()));
+    }));
+
+    svr_.Post("/api/red_rabbit/sessions/:session_id/attempt", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const std::string session_id = req.path_params.at("session_id");
+        const json body = parse_json_body_or_throw(req);
+        if (!body.is_object() || !body.contains("sample_uid") || !body["sample_uid"].is_string()) {
+            throw DatabaseHttpError(422, "MISSING_SAMPLE_UID");
+        }
+        const std::string sample_uid = body["sample_uid"].get<std::string>();
+        const bool use_live_state = body.value("use_live_state", false);
+        std::string actual_verdict = body.value("actual_verdict", "");
+        std::string evidence_dir = body.value("evidence_dir", "");
+
+        if (use_live_state) {
+            const json live = camera_.get_state_json();
+            const std::string live_outcome = live.value("outcome", "");
+            if (live_outcome != "PASS" && live_outcome != "ALARM") {
+                throw DatabaseHttpError(409, "RED_RABBIT_LIVE_VERDICT_NOT_READY");
+            }
+            actual_verdict = live_outcome;
+            if (evidence_dir.empty() && live.contains("latest_evidence_url") && live["latest_evidence_url"].is_string()) {
+                evidence_dir = live["latest_evidence_url"].get<std::string>();
+            }
+        }
+
+        std::optional<double> ood_energy;
+        if (body.contains("ood_energy") && body["ood_energy"].is_number()) {
+            ood_energy = body["ood_energy"].get<double>();
+        }
+        std::optional<double> ood_mahalanobis;
+        if (body.contains("ood_mahalanobis") && body["ood_mahalanobis"].is_number()) {
+            ood_mahalanobis = body["ood_mahalanobis"].get<double>();
+        }
+        send_json(
+            res,
+            200,
+            red_rabbit_.record_attempt(
+                session_id,
+                sample_uid,
+                actual_verdict,
+                evidence_dir,
+                ood_energy,
+                ood_mahalanobis
+            )
+        );
+    }));
+
+    svr_.Post("/api/red_rabbit/unlock", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const std::string admin_actor = auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        const json body = parse_json_body_or_throw(req);
+        if (!body.is_object()) {
+            throw DatabaseHttpError(422, "INVALID_UNLOCK_PAYLOAD");
+        }
+        std::string actor_id = body.value("actor_id", "");
+        if (actor_id.empty()) actor_id = admin_actor;
+        const std::string actor_role = body.value("actor_role", "ENGINEER");
+        const std::string reason_code = body.value("reason_code", "");
+        const std::string comment = body.value("comment", "");
+        send_json(res, 200, red_rabbit_.unlock_hard_lock(actor_id, actor_role, reason_code, comment));
+    }));
+
+    svr_.Get("/api/red_rabbit/audit", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const int limit = get_int_query(req, "limit", 30);
+        send_json(res, 200, red_rabbit_.audit_summary_json(limit));
+    }));
+
+    // 11. Industrial HAL DIO & Fail-Safe Watchdog Telemetry (v4.3 ADAM-6050/6060)
+    svr_.Get("/api/hal/dio", wrap([this](const httplib::Request&, httplib::Response& res) {
+        const DioHealthStatus dio = interlock_ ? interlock_->health_status() : DioHealthStatus{};
+        send_json(res, 200, dio_health_to_json(dio));
+    }));
+
+    svr_.Post("/api/hal/dio/reset_weld_fault", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const std::string actor = auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        const bool reset_done = interlock_ ? interlock_->acknowledge_relay_fault() : false;
+        if (reset_done) {
+            try {
+                db_.rr_append_lock_audit(
+                    "ENGINEER_UNLOCK",
+                    actor,
+                    "ENGINEER",
+                    "RELAY_WELD_FAULT_RESET",
+                    "工程师现场检查继电器触点状态并复位粘连告警",
+                    std::nullopt,
+                    default_wall_clock_ms()
+                );
+            } catch (...) {
+            }
+        }
+        const DioHealthStatus dio = interlock_ ? interlock_->health_status() : DioHealthStatus{};
+        json out = dio_health_to_json(dio);
+        out["reset_applied"] = reset_done;
+        send_json(res, 200, out);
+    }));
 }
 
 void StationHttpServer::register_static_and_spa_routes() {
@@ -2233,6 +2532,10 @@ void StationHttpServer::start_maintenance_thread() {
                 (void)db_.enforce_evidence_quota();
             } catch (...) {
             }
+            try {
+                red_rabbit_.evaluate_periodic_triggers();
+            } catch (...) {
+            }
             lk.lock();
         }
     });
@@ -2248,6 +2551,9 @@ void StationHttpServer::stop_maintenance_thread() {
 void StationHttpServer::stop() {
     stopping_.store(true);
     maintenance_cv_.notify_all();
+    if (interlock_) {
+        interlock_->stop();
+    }
     if (svr_.is_running()) {
         svr_.stop();
     }

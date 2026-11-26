@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -25,6 +26,33 @@ inline std::string interlock_signal_to_string(InterlockSignal sig) {
     return "LOCKED";
 }
 
+struct DioInputSnapshot {
+    bool estop_active{false};
+    bool part_sensor_active{false};
+    bool relay_aux_closed{false};
+    bool esd_ground_ok{true};
+    uint16_t raw_di_mask{0};
+};
+
+struct DioHealthStatus {
+    std::string backend{"shadow_noop"};
+    bool configured{false};
+    bool connected{false};
+    bool hardware_ready{false};
+    bool fault_locked{false};
+    std::string fault_reason;
+    InterlockSignal commanded_signal{InterlockSignal::LOCKED};
+    uint8_t commanded_do_mask{0};
+    DioInputSnapshot inputs{};
+    int consecutive_timeouts{0};
+    int64_t total_heartbeats{0};
+    int64_t total_comm_errors{0};
+    int64_t last_rtt_ms{0};
+    int64_t last_ok_mono_ms{0};
+    bool vision_stalled{false};
+    bool relay_weld_fault{false};
+};
+
 /**
  * Abstract hardware digital I/O interlock and watchdog interface (Wave 3 HAL).
  */
@@ -36,6 +64,16 @@ public:
     virtual bool is_hardware_ready() const = 0;
     virtual bool is_esd_ground_ok() const = 0;
     virtual std::string backend_name() const = 0;
+
+    virtual DioHealthStatus health_status() const {
+        DioHealthStatus st;
+        st.backend = backend_name();
+        st.hardware_ready = is_hardware_ready();
+        st.inputs.esd_ground_ok = is_esd_ground_ok();
+        return st;
+    }
+    virtual bool acknowledge_relay_fault() { return false; }
+    virtual void stop() {}
 };
 
 /**

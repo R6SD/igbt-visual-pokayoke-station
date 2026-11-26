@@ -22,6 +22,7 @@ import {
   RefreshCw,
   RotateCcw,
   ShieldAlert,
+  ShieldCheck,
   Sliders,
   Sparkles,
   Square,
@@ -41,6 +42,8 @@ import { Filmstrip, type FilmstripItem } from "@/components/Filmstrip"
 import { OpticalGauges } from "@/components/OpticalGauges"
 import { OperatorView } from "@/components/OperatorView"
 import { ShowcasePage } from "@/components/ShowcasePage"
+import { RedRabbitOverlay } from "@/features/red-rabbit/RedRabbitOverlay"
+import type { RedRabbitStatus } from "@/features/red-rabbit/types"
 import {
   C_LIMIT_MS,
   type Data,
@@ -469,6 +472,7 @@ function App() {
   const [storageLoading, setStorageLoading] = useState(false)
   const [storageError, setStorageError] = useState("")
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null)
+  const [rrAuditOpen, setRrAuditOpen] = useState(false)
   const [connected, setConnected] = useState(false)
   const [error, setError] = useState("")
   const [selectedCycleId, setSelectedCycleId] = useState<string>("")
@@ -1141,6 +1145,10 @@ function App() {
   const isTraining = trainingStatus.state === "TRAINING" || trainingStatus.state === "EXPORTING_ONNX"
   const camW = Number(state.camera_width) || DEFAULT_CAMERA_WIDTH
   const camH = Number(state.camera_height) || DEFAULT_CAMERA_HEIGHT
+  const redRabbit = (state.red_rabbit as RedRabbitStatus | undefined) ?? null
+  const rrState = redRabbit?.state ?? "PROD_READY"
+  const rrBadgeTone = rrState === "CHALLENGE_HARD_LOCK" ? "bad" : rrState === "CHALLENGE_REQUIRED" ? "warn" : "ok"
+  const rrBadgeLabel = rrState === "CHALLENGE_HARD_LOCK" ? "红兔硬锁" : rrState === "CHALLENGE_REQUIRED" ? "红兔待检" : "红兔合格"
 
   if (showShowcase) {
     return (
@@ -1164,6 +1172,15 @@ function App() {
             <h1>晶界智检</h1>
           </div>
           <div className="spacer" />
+          <div className="meta" title="Red Rabbit 换班挑战状态">
+            {rrState === "PROD_READY" ? (
+              <ShieldCheck size={16} aria-hidden="true" />
+            ) : (
+              <ShieldAlert size={16} aria-hidden="true" />
+            )}
+            <span className={`lamp ${rrBadgeTone}`} aria-hidden="true" />
+            <span>{rrBadgeLabel}</span>
+          </div>
           <div className="meta">
             <span className={`lamp ${connected ? "ok" : "bad"}`} aria-hidden="true" />
             <span>{connected ? "在线" : "离线"}</span>
@@ -1230,6 +1247,19 @@ function App() {
           <div className="spacer" />
 
           <span className="tag plain mono">C++20 · 720P 25FPS</span>
+          <button
+            type="button"
+            className="btn ghost sm"
+            title="查看红兔点检与 SHA-256 哈希链审计"
+            onClick={() => setRrAuditOpen(true)}
+          >
+            {rrState === "PROD_READY" ? (
+              <ShieldCheck size={16} aria-hidden="true" />
+            ) : (
+              <ShieldAlert size={16} aria-hidden="true" />
+            )}
+            红兔审计
+          </button>
           <div className="meta">
             <span className={`lamp ${connected ? "ok" : "bad"}`} aria-hidden="true" />
             <span>{connected ? "在线" : "离线"}</span>
@@ -1286,6 +1316,17 @@ function App() {
           <AlertTriangle size={16} aria-hidden="true" />
           <span>工位服务离线闭锁</span>
           <code>{error}</code>
+        </div>
+      )}
+
+      {!error && state.hardware_fault_locked && (
+        <div className="banner studio-banner" role="alert">
+          <AlertTriangle size={16} aria-hidden="true" />
+          <span>
+            DIO 硬件看门狗故障闭锁：
+            {reasonOf(state.hal_dio?.fault_reason || state.result_reason || "MODBUS_WATCHDOG_TIMEOUT")}
+          </span>
+          <code>{String(state.hal_dio?.fault_reason || state.result_reason || "FAULT")}</code>
         </div>
       )}
 
@@ -1426,6 +1467,17 @@ function App() {
           </footer>
         </>
       )}
+
+      <RedRabbitOverlay
+        state={state}
+        redRabbit={redRabbit}
+        adminToken={adminToken}
+        manualOpen={rrAuditOpen}
+        onCloseManual={() => setRrAuditOpen(false)}
+        onOpenEngineerAuth={() => setAuthModalOpen(true)}
+        onUpdated={() => refresh(true)}
+        flash={flash}
+      />
 
       <EngineerAuthModal
         open={authModalOpen}

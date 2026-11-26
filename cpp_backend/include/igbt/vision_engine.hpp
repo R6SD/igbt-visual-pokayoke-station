@@ -370,6 +370,12 @@ public:
     // Deterministic synthetic frame injection hook (used by unit/integration tests without hardware camera)
     bool process_injected_frame(const cv::Mat& raw_bgr, std::optional<double> capture_ts = std::nullopt);
 
+    // Monotonic millisecond timestamp updated on every processed vision frame for Fail-Safe Watchdog
+    int64_t last_vision_tick_ms() const noexcept { return last_vision_tick_ms_.load(std::memory_order_relaxed); }
+    void set_last_vision_tick_ms_for_test(int64_t mono_ms) noexcept {
+        last_vision_tick_ms_.store(mono_ms, std::memory_order_relaxed);
+    }
+
     // Pacer helper exposed for unit verification of 40ms (25.0 FPS) drift-compensated cadence
     static std::chrono::steady_clock::time_point next_pacer_deadline(
         std::chrono::steady_clock::time_point prev_deadline,
@@ -603,6 +609,7 @@ private:
     std::optional<double> active_cycle_end_asymmetry_;
     int bare_hand_violation_streak_{0};
     int consecutive_detach_count_{0};
+    std::atomic<int64_t> last_vision_tick_ms_{0};
 };
 
 }  // namespace igbt

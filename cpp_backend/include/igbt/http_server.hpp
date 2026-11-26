@@ -13,13 +13,16 @@
 
 #include "igbt/common.hpp"
 #include "igbt/database.hpp"
+#include "igbt/hal/adam_modbus_dio.hpp"
 #include "igbt/industrial_hal.hpp"
+#include "igbt/red_rabbit.hpp"
 #include "igbt/training_manager.hpp"
 #include "igbt/vision_engine.hpp"
 
 #include <atomic>
 #include <condition_variable>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -79,6 +82,7 @@ struct StationServerOptions {
     std::filesystem::path assets_dir;
     bool enable_live_camera{false};
     std::string initial_work_mode{"strict"};
+    std::optional<AdamModbusConfig> adam_config;
 };
 
 class StationHttpServer {
@@ -109,7 +113,9 @@ public:
 
     EngineerSessionAuth& auth() noexcept { return auth_; }
     const EngineerSessionAuth& auth() const noexcept { return auth_; }
-    const IDioInterlock& interlock() const noexcept { return interlock_; }
+    RedRabbitController& red_rabbit() noexcept { return red_rabbit_; }
+    const RedRabbitController& red_rabbit() const noexcept { return red_rabbit_; }
+    const IDioInterlock& interlock() const noexcept { return *interlock_; }
     const IMesClient& mes_client() const noexcept { return mes_client_; }
     httplib::Server& raw_server() noexcept { return svr_; }
 
@@ -142,8 +148,9 @@ private:
     TrainingManager& training_;
     StationServerOptions options_;
     EngineerSessionAuth auth_;
-    ShadowNoopInterlock interlock_;
+    std::unique_ptr<IDioInterlock> interlock_;
     OfflineNoopMesClient mes_client_;
+    RedRabbitController red_rabbit_;
 
     void start_maintenance_thread();
     void stop_maintenance_thread();

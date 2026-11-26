@@ -710,6 +710,56 @@ void StationDatabase::open_and_initialize() {
             changed_by TEXT NOT NULL,
             optics_json TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS red_rabbit_samples (
+            sample_uid TEXT PRIMARY KEY,
+            sample_type TEXT NOT NULL CHECK (sample_type IN ('OK_GOLDEN','NG_UNMARKED','NG_PARTIAL','NG_REVERSED','NG_OOD')),
+            expected_verdict TEXT NOT NULL CHECK (expected_verdict IN ('PASS','ALARM')),
+            product_family TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            calibrated_by TEXT NOT NULL,
+            expires_at_ms INTEGER NOT NULL,
+            created_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS red_rabbit_sessions (
+            session_id TEXT PRIMARY KEY,
+            station_id TEXT NOT NULL,
+            trigger_reason TEXT NOT NULL CHECK (trigger_reason IN ('SHIFT_CHANGE','INTERVAL_EXPIRED','LOT_CHANGE','COLD_BOOT','CRASH_RECOVERY','MODEL_OR_OPTICS_CHANGE','MANUAL_AUDIT')),
+            operator_id TEXT NOT NULL,
+            lot_id TEXT NOT NULL,
+            required_plan TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('IN_PROGRESS','PASSED','FAILED','TIMEOUT','ABORTED')),
+            started_at_ms INTEGER NOT NULL,
+            completed_at_ms INTEGER,
+            model_sha256 TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS red_rabbit_attempts (
+            attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES red_rabbit_sessions(session_id),
+            step_index INTEGER NOT NULL,
+            sample_uid TEXT NOT NULL REFERENCES red_rabbit_samples(sample_uid),
+            expected_verdict TEXT NOT NULL,
+            actual_verdict TEXT NOT NULL,
+            ood_energy REAL,
+            ood_mahalanobis REAL,
+            is_match INTEGER NOT NULL CHECK (is_match IN (0,1)),
+            evidence_dir TEXT NOT NULL,
+            recorded_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS station_lock_audit (
+            audit_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE,
+            event_type TEXT NOT NULL CHECK (event_type IN ('CHALLENGE_FAIL_LOCK','WATCHDOG_FAULT_LOCK','MES_OFFLINE_LOCK','ENGINEER_UNLOCK','POLICY_OVERRIDE')),
+            actor_id TEXT NOT NULL,
+            actor_role TEXT NOT NULL CHECK (actor_role IN ('SYSTEM','OPERATOR','ENGINEER','QE')),
+            reason_code TEXT NOT NULL,
+            comment TEXT NOT NULL,
+            related_session TEXT,
+            created_at_ms INTEGER NOT NULL,
+            prev_hash TEXT NOT NULL,
+            row_hash TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rr_sessions_time ON red_rabbit_sessions(started_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_lock_audit_time ON station_lock_audit(created_at_ms DESC);
     )SQL");
 
     if (!column_exists_unlocked("cycles", "source")) {
@@ -790,6 +840,46 @@ void StationDatabase::open_and_initialize() {
         StmtGuard chk(db_, "SELECT 1 FROM station_purge_state WHERE singleton_id=1;");
         if (sqlite3_step(chk.get()) != SQLITE_ROW) {
             exec_sql_unlocked("INSERT INTO station_purge_state(singleton_id, purge_generation, purged_at_utc, purged_monotonic_s) VALUES(1, 0, NULL, NULL);");
+        }
+    }
+
+    // Seed default Red Rabbit golden samples on fresh database
+    {
+        StmtGuard chk(db_, "SELECT COUNT(*) FROM red_rabbit_samples;");
+        if (sqlite3_step(chk.get()) == SQLITE_ROW && sqlite3_column_int(chk.get(), 0) == 0) {
+            const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count();
+            const int64_t expires_ms = now_ms + 365LL * 24 * 3600 * 1000;
+            struct SeedSample {
+                const char* uid;
+                const char* type;
+                const char* verdict;
+            };
+            constexpr SeedSample kSeeds[] = {
+                {"RR-OK-001", "OK_GOLDEN", "PASS"},
+                {"RR-NG-UNMARKED-001", "NG_UNMARKED", "ALARM"},
+                {"RR-NG-PARTIAL-001", "NG_PARTIAL", "ALARM"},
+                {"RR-NG-REVERSED-001", "NG_REVERSED", "ALARM"},
+            };
+            TransactionGuard tx(db_);
+            for (const auto& s : kSeeds) {
+                StmtGuard ins(
+                    db_,
+                    "INSERT INTO red_rabbit_samples(sample_uid, sample_type, expected_verdict, product_family, is_active, calibrated_by, expires_at_ms, created_at_ms) "
+                    "VALUES(?,?,?,?,1,'system',?,?);"
+                );
+                bind_text(ins.get(), 1, s.uid);
+                bind_text(ins.get(), 2, s.type);
+                bind_text(ins.get(), 3, s.verdict);
+                bind_text(ins.get(), 4, "IGBT_TO247");
+                sqlite3_bind_int64(ins.get(), 5, expires_ms);
+                sqlite3_bind_int64(ins.get(), 6, now_ms);
+                if (sqlite3_step(ins.get()) != SQLITE_DONE) {
+                    throw std::runtime_error(std::string("Failed to seed red_rabbit_samples: ") + sqlite3_errmsg(db_));
+                }
+            }
+            tx.commit();
         }
     }
 }

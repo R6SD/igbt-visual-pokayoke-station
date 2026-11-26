@@ -127,6 +127,22 @@ const reasonText: Record<string, string> = {
   LABEL_ROI_DRIFT_EXCEEDED: "标签定位框漂移超限",
   OPTICAL_DRIFT: "相机光学参数/亮度漂移告警",
   CAMERA_HANDLE_LOCKED_RESTART_REQUIRED: "相机采集句柄锁死，请重启工位服务或检查 USB 连接",
+  RED_RABBIT_CHALLENGE_REQUIRED: "等待完成红兔金样点检",
+  RED_RABBIT_HARD_LOCK: "红兔点检失败硬闭锁（需工程师解锁）",
+  CRITICAL_NG_MISSED_AS_PASS: "NG 金样误判为 PASS，工位硬闭锁",
+  GOLDEN_SAMPLE_MISMATCH: "金样实测结果与预期不符",
+  SESSION_TIMEOUT: "红兔点检会话超时闭锁",
+  SHIFT_CHANGE: "换班时间窗强制点检",
+  INTERVAL_EXPIRED: "周期超时强制点检",
+  LOT_CHANGE: "批次切换强制点检",
+  COLD_BOOT: "冷启动强制点检",
+  CRASH_RECOVERY: "异常恢复强制点检",
+  MODEL_OR_OPTICS_CHANGE: "模型或光学参数变更点检",
+  MANUAL_AUDIT: "工程师手动发起点检",
+  MODBUS_WATCHDOG_TIMEOUT: "ADAM DIO Modbus TCP 看门狗心跳超时闭锁",
+  HARDWARE_ESTOP_ACTIVE: "急停按钮 / 安全回路断开闭锁",
+  RELAY_CONTACT_WELD_FAULT: "安全继电器辅助触点粘连故障闭锁",
+  VISION_LOOP_STALL_WATCHDOG_STOP: "视觉推理循环停滞，看门狗主动停喂硬锁",
 }
 
 export const reasonOf = (code?: string) => (code ? reasonText[code] || fsmText[code] || code.replaceAll("_", " ") : "")
