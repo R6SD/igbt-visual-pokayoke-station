@@ -27,7 +27,9 @@ set(IGBT_CORE_SOURCES
     src/vision_engine.cpp
     src/vision/tube_geometry.cpp
     src/vision/hand_glove_detector.cpp
+    src/vision/label_ood_classifier.cpp
     src/training_manager.cpp
+    src/training/onnx_model_registry.cpp
     src/database.cpp
     src/db/red_rabbit_audit_repo.cpp
     src/red_rabbit.cpp

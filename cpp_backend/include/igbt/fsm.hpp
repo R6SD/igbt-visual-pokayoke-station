@@ -38,6 +38,7 @@ struct FSMConfig {
     int max_frame_gap_ms{200};
     int max_capture_age_ms{500};
     int hand_leave_stable_ms{250};
+    int ood_alarm_frames{5};
     double cycle_timeout_s{60.0};
     double action_timeout_s{40.0};
     std::size_t max_log_records{1000};
@@ -67,6 +68,10 @@ struct FSMEvent {
     bool hand_in_left_grip_zone{false};
     bool hand_in_right_grip_zone{false};
     bool marker_detected{false};
+    bool ood_rejected{false};
+    std::optional<double> ood_energy;
+    std::optional<double> ood_mahalanobis;
+    std::optional<std::string> ood_reason;
     std::optional<std::string> pipe_color;
     std::optional<std::string> reason;
     bool reset_authorized{false};
@@ -105,6 +110,8 @@ public:
     bool initial_complete_confirmed() const { return initial_complete_confirmed_; }
     bool contact_seen() const { return contact_seen_; }
     int c_timer_ms() const;
+    int ood_streak() const { return ood_streak_; }
+    void set_ood_alarm_frames(int n) { config_.ood_alarm_frames = std::max(1, n); }
     const FSMConfig& config() const { return config_; }
 
     const std::deque<json>& transition_records() const { return transition_records_; }
@@ -177,6 +184,7 @@ private:
 
     std::optional<double> c_absent_start_;
     std::optional<double> c_absent_last_;
+    int ood_streak_{0};
     FSMState resume_state_{FSMState::VERIFY_INITIAL};
 };
 

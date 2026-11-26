@@ -4,6 +4,7 @@
 #include <igbt/common.hpp>
 #include <igbt/fsm.hpp>
 #include <igbt/vision/hand_glove_detector.hpp>
+#include <igbt/vision/label_ood_classifier.hpp>
 #include <igbt/vision/tube_geometry.hpp>
 
 #include <atomic>
@@ -337,15 +338,32 @@ public:
     json load_mlp_model(
         const std::filesystem::path& xml_path,
         const std::string& model_version,
-        const std::string& expected_sha256 = ""
+        const std::string& expected_sha256 = "",
+        const std::filesystem::path& calibration_path = {}
     );
     json load_onnx_model(
         const std::filesystem::path& onnx_path,
         const std::string& model_version,
         const std::string& expected_sha256 = "",
-        int input_size = kDefaultInputSize
+        int input_size = kDefaultInputSize,
+        int input_height = 0,
+        const std::filesystem::path& calibration_path = {}
     );
     void clear_loaded_model();
+
+    // v4.5 OOD Dual-Gate Calibration & Runtime Controls
+    json load_ood_calibration(const vision::OodCalibration& cal);
+    json load_ood_calibration_file(const std::filesystem::path& path);
+    void clear_ood_calibration();
+    json set_ood_gate_config(const vision::OodGateConfig& cfg);
+    json label_ood_status_json() const;
+    vision::OodCalibration calibrate_active_model_ood(
+        const std::vector<std::pair<cv::Mat, int>>& labeled_crops,
+        double quantile = 0.98,
+        double prob_threshold = 0.85,
+        double reg_lambda = 1e-3,
+        bool fit_temperature = true
+    );
 
     // v4.4 P0-3 NanoDet-Plus-m Hand/Glove Detector & RANSAC Tube Alignment controls
     json load_hand_glove_onnx_model(
@@ -398,12 +416,6 @@ public:
     );
 
 private:
-    enum class ActiveModelKind {
-        NONE,
-        MLP_XML,
-        ONNX_DNN
-    };
-
     struct PendingTransition {
         std::string event_id;
         json snapshot;
@@ -439,6 +451,10 @@ private:
         double infer_ms{0.0};
         std::string model_version{kHeuristicModelVersion};
         std::string backend_label{kHeuristicBackendLabel};
+        bool ood_rejected{false};
+        std::string ood_reason;
+        std::optional<double> ood_energy;
+        std::optional<double> ood_mahalanobis;
     };
 
     void capture_loop();
@@ -604,15 +620,8 @@ private:
     std::string last_emitted_dedup_key_;
     std::unordered_map<std::string, double> last_evidence_emit_by_cycle_;
 
-    // Pure C++ Dual Model state (OpenCV ANN_MLP + OpenCV DNN ONNX)
-    mutable std::mutex model_mutex_;
-    ActiveModelKind active_model_kind_{ActiveModelKind::NONE};
-    cv::Ptr<cv::ml::ANN_MLP> mlp_model_;
-    cv::dnn::Net onnx_net_;
-    int onnx_input_size_{kDefaultInputSize};
-    std::string active_model_version_{kHeuristicModelVersion};
-    std::string active_model_path_;
-    std::string active_model_sha256_;
+    // Pure C++ Dual Model & OOD Dual-Gate Classifier (OpenCV ANN_MLP + OpenCV DNN ONNX)
+    vision::LabelOodClassifier label_classifier_;
     double inference_ms_{0.0};
 
     InspectionFSM fsm_;

@@ -124,25 +124,16 @@ double threshold_double(const json& thresholds, const char* key, double fallback
     return fallback;
 }
 
-std::string to_lower_trim(std::string s) {
-    auto not_space = [](unsigned char c) { return !std::isspace(c); };
-    s.erase(s.begin(), std::find_if(s.begin(), s.end(), not_space));
-    s.erase(std::find_if(s.rbegin(), s.rend(), not_space).base(), s.end());
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return s;
-}
-
 std::string label_cn(const std::string& cls) {
     if (cls == "complete") return "完整";
     if (cls == "crossed_out") return "A类·已划除";
     if (cls == "covered") return "B类·已遮挡";
     if (cls == "absent") return "C类·已脱落";
+    if (cls == "ood_unknown") return "OOD·未知异常";
     return "未入位/待定";
 }
 
-FSMConfig live_fsm_config() {
+FSMConfig live_fsm_config(int ood_alarm_frames = 5) {
     FSMConfig cfg{};
     cfg.initial_complete_ms = 350;
     cfg.stable_state_ms = 400;
@@ -151,6 +142,7 @@ FSMConfig live_fsm_config() {
     cfg.max_frame_gap_ms = 220;
     cfg.max_capture_age_ms = 600;
     cfg.hand_leave_stable_ms = 250;
+    cfg.ood_alarm_frames = std::max(1, ood_alarm_frames);
     return cfg;
 }
 
@@ -1286,6 +1278,12 @@ LiveCameraEngine::LiveCameraEngine(
         {"tube_align_failed", false},
         {"tube_alignment", tube_aligner_.last_status_json()},
         {"hand_glove_detector", hand_glove_detector_.status_json()},
+        {"ood_rejected", false},
+        {"ood_reason", nullptr},
+        {"ood_energy", nullptr},
+        {"ood_mahalanobis", nullptr},
+        {"ood_streak", 0},
+        {"label_ood_classifier", label_classifier_.status_json()},
         {"alarm_latched", false},
         {"label_contact_active", false},
         {"hand_contact_candidate", false},
@@ -1302,7 +1300,7 @@ LiveCameraEngine::LiveCameraEngine(
         {"operator_anon_id", "OP_STATION_01"},
         {"frame_id", 0},
         {"capture_monotonic_s", 0.0},
-        {"model_version", active_model_version_},
+        {"model_version", kHeuristicModelVersion},
         {"inference_backend", kHeuristicBackendLabel},
         {"inference_ms", 0.0},
         {"show_auxiliary_rois", false},
@@ -1476,7 +1474,7 @@ std::string LiveCameraEngine::set_work_mode(const std::string& mode) {
     } else if (prev_mode != "strict") {
         // Clear debug-earned PASS or partial debug cycle while preserving active ALARM latch
         if (!alarm_latched_ && fsm_.state() != FSMState::ALARM) {
-            fsm_ = InspectionFSM(live_fsm_config());
+            fsm_ = InspectionFSM(live_fsm_config(label_classifier_.gate_config().alarm_streak_threshold));
             contact_tracker_.reset();
             tube_aligner_.reset();
             hand_glove_detector_.reset_state();
@@ -1620,7 +1618,7 @@ json LiveCameraEngine::trigger_new_cycle(const std::string& pipe_color) {
     ++cycle_generation_;
     last_emitted_dedup_key_.clear();
     contact_tracker_.reset();
-    fsm_ = InspectionFSM(live_fsm_config());
+    fsm_ = InspectionFSM(live_fsm_config(label_classifier_.gate_config().alarm_streak_threshold));
 
     const std::string cid = generate_live_cycle_id();
     FSMEvent ev{};
@@ -1647,6 +1645,12 @@ json LiveCameraEngine::trigger_new_cycle(const std::string& pipe_color) {
     hand_glove_detector_.reset_state();
     state_["tube_alignment"] = tube_aligner_.last_status_json();
     state_["hand_glove_detector"] = hand_glove_detector_.status_json();
+    state_["ood_rejected"] = false;
+    state_["ood_reason"] = nullptr;
+    state_["ood_energy"] = nullptr;
+    state_["ood_mahalanobis"] = nullptr;
+    state_["ood_streak"] = 0;
+    state_["label_ood_classifier"] = label_classifier_.status_json();
     state_["updated_at_utc"] = utc_now_iso();
     return state_;
 }
@@ -1706,57 +1710,29 @@ std::size_t LiveCameraEngine::discard_pending_transitions(const std::vector<std:
 json LiveCameraEngine::load_mlp_model(
     const std::filesystem::path& xml_path,
     const std::string& model_version,
-    const std::string& expected_sha256
+    const std::string& expected_sha256,
+    const std::filesystem::path& calibration_path
 ) {
-    std::vector<uint8_t> bytes;
-    if (!read_file_bytes(xml_path, bytes) || bytes.empty()) {
-        throw std::runtime_error("MODEL_ARTIFACT_UNAVAILABLE: " + path_to_utf8(xml_path));
-    }
-    const std::string actual_sha = sha256_hex(bytes);
-    if (!expected_sha256.empty()) {
-        const std::string exp_norm = to_lower_trim(expected_sha256);
-        if (!constant_time_equals(actual_sha, exp_norm)) {
-            throw std::invalid_argument(
-                "MODEL_SHA256_MISMATCH: expected " + exp_norm + ", got " + actual_sha
-            );
+    std::string err;
+    if (!label_classifier_.load_mlp(xml_path, model_version, expected_sha256, calibration_path, err)) {
+        if (err.find("SHA256") != std::string::npos || err.find("sha256") != std::string::npos) {
+            throw std::invalid_argument(err);
         }
-    }
-
-    // Attempt to load ANN_MLP from XML string via cv::Algorithm::loadFromString (100% compatible with TrainingManager)
-    const std::string xml_str(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-    cv::Ptr<cv::ml::ANN_MLP> mlp;
-    try {
-        mlp = cv::Algorithm::loadFromString<cv::ml::ANN_MLP>(xml_str);
-    } catch (const std::exception& ex) {
-        throw std::runtime_error(std::string("MODEL_ARTIFACT_LOAD_FAILED: ") + ex.what());
-    }
-    if (mlp.empty() || !mlp->isTrained()) {
-        throw std::runtime_error("MODEL_ARTIFACT_LOAD_FAILED: ANN_MLP is empty or not trained");
-    }
-
-    // Sanity forward pass on 64-D feature vector -> 4 classes
-    cv::Mat dummy_in = cv::Mat::zeros(1, 64, CV_32F);
-    cv::Mat dummy_out;
-    mlp->predict(dummy_in, dummy_out);
-    if (dummy_out.empty() || dummy_out.total() != 4) {
-        throw std::runtime_error("MODEL_ARTIFACT_LOAD_FAILED: ANN_MLP output dimension must be 4");
+        throw std::runtime_error(err.empty() ? "MODEL_ARTIFACT_LOAD_FAILED" : err);
     }
 
     const std::string utf8_path = path_to_utf8(xml_path);
+    const std::string actual_sha = label_classifier_.active_model_sha256();
     const std::string backend_lbl = "OpenCV ANN_MLP (" + model_version + ")";
-    {
-        std::lock_guard<std::mutex> mlk(model_mutex_);
-        active_model_kind_ = ActiveModelKind::MLP_XML;
-        mlp_model_ = mlp;
-        onnx_net_ = cv::dnn::Net{};
-        active_model_version_ = model_version;
-        active_model_path_ = utf8_path;
-        active_model_sha256_ = actual_sha;
-    }
+    const json ood_st = label_classifier_.status_json();
     {
         std::lock_guard<std::mutex> lk(mutex_);
         state_["model_version"] = model_version;
         state_["inference_backend"] = backend_lbl;
+        state_["label_ood_classifier"] = ood_st;
+        raw_frame_state_["model_version"] = model_version;
+        raw_frame_state_["inference_backend"] = backend_lbl;
+        raw_frame_state_["label_ood_classifier"] = ood_st;
     }
 
     return json{
@@ -1766,6 +1742,7 @@ json LiveCameraEngine::load_mlp_model(
         {"onnx_path", utf8_path},
         {"input_size", kDefaultInputSize},
         {"sha256", actual_sha},
+        {"label_ood_classifier", ood_st},
     };
 }
 
@@ -1773,53 +1750,33 @@ json LiveCameraEngine::load_onnx_model(
     const std::filesystem::path& onnx_path,
     const std::string& model_version,
     const std::string& expected_sha256,
-    int input_size
+    int input_size,
+    int input_height,
+    const std::filesystem::path& calibration_path
 ) {
-    const int safe_size = std::clamp(input_size, 32, 1024);
-    std::vector<uint8_t> bytes;
-    if (!read_file_bytes(onnx_path, bytes) || bytes.empty()) {
-        throw std::runtime_error("MODEL_ARTIFACT_UNAVAILABLE: " + path_to_utf8(onnx_path));
-    }
-    const std::string actual_sha = sha256_hex(bytes);
-    if (!expected_sha256.empty()) {
-        const std::string exp_norm = to_lower_trim(expected_sha256);
-        if (!constant_time_equals(actual_sha, exp_norm)) {
-            throw std::invalid_argument(
-                "MODEL_SHA256_MISMATCH: expected " + exp_norm + ", got " + actual_sha
-            );
+    const int safe_w = std::clamp(input_size, 32, 1024);
+    const int safe_h = std::clamp(input_height > 0 ? input_height : safe_w, 32, 1024);
+    std::string err;
+    if (!label_classifier_.load_onnx(
+            onnx_path, model_version, expected_sha256, safe_w, safe_h, calibration_path, err)) {
+        if (err.find("SHA256") != std::string::npos || err.find("sha256") != std::string::npos) {
+            throw std::invalid_argument(err);
         }
-    }
-
-    cv::dnn::Net net = cv::dnn::readNetFromONNX(bytes);
-    if (net.empty()) {
-        throw std::runtime_error("MODEL_ARTIFACT_LOAD_FAILED: readNetFromONNX returned empty net");
-    }
-
-    // Verify 1x3xHxW forward pass produces >= 4 logits
-    const int dims[4] = {1, 3, safe_size, safe_size};
-    cv::Mat dummy_blob(4, dims, CV_32F, cv::Scalar(0));
-    net.setInput(dummy_blob);
-    cv::Mat dummy_out = net.forward();
-    if (dummy_out.empty() || dummy_out.total() < 4) {
-        throw std::runtime_error("MODEL_ARTIFACT_LOAD_FAILED: ONNX output dimension must be >= 4");
+        throw std::runtime_error(err.empty() ? "MODEL_ARTIFACT_LOAD_FAILED" : err);
     }
 
     const std::string utf8_path = path_to_utf8(onnx_path);
+    const std::string actual_sha = label_classifier_.active_model_sha256();
     const std::string backend_lbl = "OpenCV DNN ONNX (" + model_version + ")";
-    {
-        std::lock_guard<std::mutex> mlk(model_mutex_);
-        active_model_kind_ = ActiveModelKind::ONNX_DNN;
-        onnx_net_ = std::move(net);
-        mlp_model_.release();
-        onnx_input_size_ = safe_size;
-        active_model_version_ = model_version;
-        active_model_path_ = utf8_path;
-        active_model_sha256_ = actual_sha;
-    }
+    const json ood_st = label_classifier_.status_json();
     {
         std::lock_guard<std::mutex> lk(mutex_);
         state_["model_version"] = model_version;
         state_["inference_backend"] = backend_lbl;
+        state_["label_ood_classifier"] = ood_st;
+        raw_frame_state_["model_version"] = model_version;
+        raw_frame_state_["inference_backend"] = backend_lbl;
+        raw_frame_state_["label_ood_classifier"] = ood_st;
     }
 
     return json{
@@ -1827,26 +1784,95 @@ json LiveCameraEngine::load_onnx_model(
         {"artifact_format", "onnx"},
         {"model_path", utf8_path},
         {"onnx_path", utf8_path},
-        {"input_size", safe_size},
+        {"input_size", safe_w},
+        {"input_width", safe_w},
+        {"input_height", safe_h},
+        {"dual_output_available", label_classifier_.dual_output_available()},
         {"sha256", actual_sha},
+        {"label_ood_classifier", ood_st},
     };
 }
 
 void LiveCameraEngine::clear_loaded_model() {
-    {
-        std::lock_guard<std::mutex> mlk(model_mutex_);
-        active_model_kind_ = ActiveModelKind::NONE;
-        mlp_model_.release();
-        onnx_net_ = cv::dnn::Net{};
-        active_model_version_ = kHeuristicModelVersion;
-        active_model_path_.clear();
-        active_model_sha256_.clear();
+    label_classifier_.clear_model();
+    const json ood_st = label_classifier_.status_json();
+    std::lock_guard<std::mutex> lk(mutex_);
+    state_["model_version"] = kHeuristicModelVersion;
+    state_["inference_backend"] = kHeuristicBackendLabel;
+    state_["label_ood_classifier"] = ood_st;
+    raw_frame_state_["model_version"] = kHeuristicModelVersion;
+    raw_frame_state_["inference_backend"] = kHeuristicBackendLabel;
+    raw_frame_state_["label_ood_classifier"] = ood_st;
+}
+
+json LiveCameraEngine::load_ood_calibration(const vision::OodCalibration& cal) {
+    std::string err;
+    if (!label_classifier_.load_calibration(cal, err)) {
+        if (err.find("SHA256") != std::string::npos) {
+            throw std::invalid_argument(err);
+        }
+        throw std::runtime_error(err.empty() ? "OOD_CALIBRATION_LOAD_FAILED" : err);
     }
-    {
-        std::lock_guard<std::mutex> lk(mutex_);
-        state_["model_version"] = kHeuristicModelVersion;
-        state_["inference_backend"] = kHeuristicBackendLabel;
+    const json st = label_classifier_.status_json();
+    std::lock_guard<std::mutex> lk(mutex_);
+    state_["label_ood_classifier"] = st;
+    raw_frame_state_["label_ood_classifier"] = st;
+    return st;
+}
+
+json LiveCameraEngine::load_ood_calibration_file(const std::filesystem::path& path) {
+    std::string err;
+    if (!label_classifier_.load_calibration_file(path, err)) {
+        if (err.find("SHA256") != std::string::npos) {
+            throw std::invalid_argument(err);
+        }
+        throw std::runtime_error(err.empty() ? "OOD_CALIBRATION_LOAD_FAILED" : err);
     }
+    const json st = label_classifier_.status_json();
+    std::lock_guard<std::mutex> lk(mutex_);
+    state_["label_ood_classifier"] = st;
+    raw_frame_state_["label_ood_classifier"] = st;
+    return st;
+}
+
+void LiveCameraEngine::clear_ood_calibration() {
+    label_classifier_.clear_calibration();
+    const json st = label_classifier_.status_json();
+    std::lock_guard<std::mutex> lk(mutex_);
+    state_["label_ood_classifier"] = st;
+    raw_frame_state_["label_ood_classifier"] = st;
+}
+
+json LiveCameraEngine::set_ood_gate_config(const vision::OodGateConfig& cfg) {
+    label_classifier_.set_gate_config(cfg);
+    const auto effective_cfg = label_classifier_.gate_config();
+    const json st = label_classifier_.status_json();
+    std::lock_guard<std::mutex> lk(mutex_);
+    fsm_.set_ood_alarm_frames(effective_cfg.alarm_streak_threshold);
+    state_["label_ood_classifier"] = st;
+    raw_frame_state_["label_ood_classifier"] = st;
+    return st;
+}
+
+json LiveCameraEngine::label_ood_status_json() const {
+    return label_classifier_.status_json();
+}
+
+vision::OodCalibration LiveCameraEngine::calibrate_active_model_ood(
+    const std::vector<std::pair<cv::Mat, int>>& labeled_crops,
+    double quantile,
+    double prob_threshold,
+    double reg_lambda,
+    bool fit_temperature
+) {
+    vision::OodCalibration cal = label_classifier_.calibrate_from_crops(
+        labeled_crops, quantile, prob_threshold, reg_lambda, fit_temperature
+    );
+    const json st = label_classifier_.status_json();
+    std::lock_guard<std::mutex> lk(mutex_);
+    state_["label_ood_classifier"] = st;
+    raw_frame_state_["label_ood_classifier"] = st;
+    return cal;
 }
 
 json LiveCameraEngine::load_hand_glove_onnx_model(
@@ -3657,84 +3683,34 @@ LiveCameraEngine::ClassificationResult LiveCameraEngine::classify_live_label_roi
     std::string nn_version;
     std::string nn_backend;
 
-    {
-        std::lock_guard<std::mutex> mlk(model_mutex_);
-        if (active_model_kind_ == ActiveModelKind::MLP_XML && !mlp_model_.empty()) {
-            try {
-                const cv::Mat feat = extract_label_features(crop);
-                cv::Mat raw_out;
-                mlp_model_->predict(feat, raw_out);
-                if (!raw_out.empty() && raw_out.total() >= 4) {
-                    cv::Mat flat = raw_out.reshape(1, 1);
-                    flat.convertTo(flat, CV_32F);
-                    float max_v = flat.at<float>(0, 0);
-                    for (int i = 1; i < 4; ++i) max_v = std::max(max_v, flat.at<float>(0, i));
-                    // Temperature-calibrated softmax for SIGMOID_SYM [-1, +1] targets
-                    constexpr float kScale = 2.2f;
-                    std::array<double, 4> probs{};
-                    double sum_exp = 0.0;
-                    int best_idx = 0;
-                    for (int i = 0; i < 4; ++i) {
-                        probs[i] = std::exp(static_cast<double>(kScale * (flat.at<float>(0, i) - max_v)));
-                        sum_exp += probs[i];
-                        if (probs[i] > probs[best_idx]) best_idx = i;
-                    }
-                    if (sum_exp > 0.0) {
-                        nn_pred = kLabelClasses[best_idx];
-                        nn_conf = probs[best_idx] / sum_exp;
-                        nn_version = active_model_version_;
-                        nn_backend = "OpenCV ANN_MLP (" + active_model_version_ + ")";
-                    }
-                }
-            } catch (...) {
-            }
-        } else if (active_model_kind_ == ActiveModelKind::ONNX_DNN && !onnx_net_.empty()) {
-            try {
-                cv::Mat rgb, resized, f32;
-                cv::cvtColor(crop, rgb, cv::COLOR_BGR2RGB);
-                cv::resize(rgb, resized, cv::Size(onnx_input_size_, onnx_input_size_), 0, 0, cv::INTER_LINEAR);
-                resized.convertTo(f32, CV_32FC3, 1.0 / 255.0);
-
-                const int dims[4] = {1, 3, onnx_input_size_, onnx_input_size_};
-                cv::Mat blob(4, dims, CV_32F);
-                constexpr float kMean[3] = {0.485f, 0.456f, 0.406f};
-                constexpr float kStd[3] = {0.229f, 0.224f, 0.225f};
-                const int plane_sz = onnx_input_size_ * onnx_input_size_;
-                float* bp = blob.ptr<float>();
-                for (int y = 0; y < onnx_input_size_; ++y) {
-                    const auto* rp = f32.ptr<cv::Vec3f>(y);
-                    for (int x = 0; x < onnx_input_size_; ++x) {
-                        const int off = y * onnx_input_size_ + x;
-                        bp[0 * plane_sz + off] = (rp[x][0] - kMean[0]) / kStd[0];
-                        bp[1 * plane_sz + off] = (rp[x][1] - kMean[1]) / kStd[1];
-                        bp[2 * plane_sz + off] = (rp[x][2] - kMean[2]) / kStd[2];
-                    }
-                }
-                onnx_net_.setInput(blob);
-                cv::Mat logits = onnx_net_.forward();
-                if (!logits.empty() && logits.total() >= 4) {
-                    cv::Mat flat = logits.reshape(1, 1);
-                    flat.convertTo(flat, CV_32F);
-                    float max_l = flat.at<float>(0, 0);
-                    for (int i = 1; i < 4; ++i) max_l = std::max(max_l, flat.at<float>(0, i));
-                    std::array<double, 4> probs{};
-                    double sum_exp = 0.0;
-                    int best_idx = 0;
-                    for (int i = 0; i < 4; ++i) {
-                        probs[i] = std::exp(static_cast<double>(flat.at<float>(0, i) - max_l));
-                        sum_exp += probs[i];
-                        if (probs[i] > probs[best_idx]) best_idx = i;
-                    }
-                    if (sum_exp > 0.0) {
-                        nn_pred = kLabelClasses[best_idx];
-                        nn_conf = probs[best_idx] / sum_exp;
-                        nn_version = active_model_version_;
-                        nn_backend = "OpenCV DNN ONNX (" + active_model_version_ + ")";
-                    }
-                }
-            } catch (...) {
-            }
-        }
+    const vision::LabelOodEvalResult eval = label_classifier_.evaluate(crop);
+    if (eval.ood_rejected) {
+        out.label_status = "ood_unknown";
+        out.confidence = round_to(eval.max_prob, 3);
+        out.model_version = eval.model_version.empty() ? kHeuristicModelVersion : eval.model_version;
+        const std::string kind_prefix =
+            (label_classifier_.model_kind() == vision::LabelOodClassifier::ModelKind::ONNX_DNN)
+                ? "OpenCV DNN ONNX ("
+                : "OpenCV ANN_MLP (";
+        out.backend_label = eval.model_version.empty() ? kHeuristicBackendLabel : (kind_prefix + eval.model_version + ")");
+        out.ood_rejected = true;
+        out.ood_reason = eval.reject_reason;
+        out.ood_energy = eval.energy_score;
+        out.ood_mahalanobis = eval.mahalanobis_distance;
+        out.infer_ms = round_to((monotonic_seconds() - t0) * 1000.0, 2);
+        return out;
+    }
+    if (eval.valid) {
+        nn_pred = eval.raw_predicted_class;
+        nn_conf = eval.max_prob;
+        nn_version = eval.model_version;
+        const std::string kind_prefix =
+            (label_classifier_.model_kind() == vision::LabelOodClassifier::ModelKind::ONNX_DNN)
+                ? "OpenCV DNN ONNX ("
+                : "OpenCV ANN_MLP (";
+        nn_backend = kind_prefix + eval.model_version + ")";
+        out.ood_energy = eval.energy_score;
+        out.ood_mahalanobis = eval.mahalanobis_distance;
     }
 
     cv::Mat spec_mask = cv::Mat::zeros(small.rows, small.cols, CV_8U);
@@ -4020,6 +3996,9 @@ std::tuple<std::vector<uint8_t>, std::vector<uint8_t>, cv::Mat> LiveCameraEngine
         if (bare_hand_violation || alarm_latched) {
             label_color = cv::Scalar(35, 45, 210);
             label_tag = "违规闭锁";
+        } else if (label_status == "ood_unknown") {
+            label_color = cv::Scalar(35, 45, 210);
+            label_tag = "OOD·未知异常";
         } else if (contact_active) {
             label_color = cv::Scalar(15, 130, 230);
             label_tag = "手套接触中";
@@ -4479,6 +4458,11 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
             {"tube_align_failed", align_hard_failed},
             {"tube_alignment", tr.tube_align.to_json()},
             {"hand_glove_detector", tr.hand_detector_meta},
+            {"ood_rejected", cls.ood_rejected},
+            {"ood_reason", (cls.ood_rejected && !cls.ood_reason.empty()) ? json(cls.ood_reason) : json(nullptr)},
+            {"ood_energy", cls.ood_energy.has_value() ? json(round_to(*cls.ood_energy, 4)) : json(nullptr)},
+            {"ood_mahalanobis", cls.ood_mahalanobis.has_value() ? json(round_to(*cls.ood_mahalanobis, 4)) : json(nullptr)},
+            {"label_ood_classifier", label_classifier_.status_json()},
             {"pipe_color", cls.pipe_color},
             {"frame_id", current_frame_id},
             {"capture_monotonic_s", round_to(capture_ts, 3)},
@@ -4536,7 +4520,7 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                         if (!pass_target_lost_since_.has_value()) {
                             pass_target_lost_since_ = fsm_now;
                         } else if ((fsm_now - *pass_target_lost_since_) >= 0.5) {
-                            fsm_ = InspectionFSM(live_fsm_config());
+                            fsm_ = InspectionFSM(live_fsm_config(label_classifier_.gate_config().alarm_streak_threshold));
                             ++cycle_generation_;
                             pass_target_lost_since_.reset();
                             active_cycle_tube_center_.reset();
@@ -4551,7 +4535,7 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                         latched_cycle_id_ = fsm_.cycle_id();
                         changed = true;
                     } else if (fsm_.state() != FSMState::WAIT_PART) {
-                        fsm_ = InspectionFSM(live_fsm_config());
+                        fsm_ = InspectionFSM(live_fsm_config(label_classifier_.gate_config().alarm_streak_threshold));
                         active_cycle_tube_center_.reset();
                         active_cycle_pipe_color_.clear();
                         active_cycle_end_asymmetry_.reset();
@@ -4660,6 +4644,12 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                         obs_ev.hand_in_label_contact_roi = tracked.hand_contact_candidate;
                         obs_ev.hand_in_left_grip_zone = tracked.hand_contact_candidate ? false : left_active;
                         obs_ev.hand_in_right_grip_zone = tracked.hand_contact_candidate ? false : right_active;
+                        obs_ev.ood_rejected = cls.ood_rejected;
+                        obs_ev.ood_energy = cls.ood_energy;
+                        obs_ev.ood_mahalanobis = cls.ood_mahalanobis;
+                        if (!cls.ood_reason.empty()) {
+                            obs_ev.ood_reason = cls.ood_reason;
+                        }
                         obs_ev.pipe_color = cls.pipe_color;
                         if (align_hard_failed) {
                             obs_ev.reason = "TUBE_ALIGN_FAIL";
@@ -4699,6 +4689,14 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
                         active_fsm_state = fsm_.state_str();
                         active_outcome = fsm_.outcome();
                         active_reason = fsm_.result_reason();
+                        if (cls.ood_rejected &&
+                            active_fsm_state != "ALARM" &&
+                            active_outcome != "ALARM") {
+                            active_reason = std::string("OOD_GATE_HOLD");
+                            if (std::find(reasons.begin(), reasons.end(), "OOD_GATE_HOLD") == reasons.end()) {
+                                reasons.push_back("OOD_GATE_HOLD");
+                            }
+                        }
                         active_cycle_id = fsm_.cycle_id();
                         changed = (prev_fsm != active_fsm_state);
                     }
@@ -4714,6 +4712,13 @@ bool LiveCameraEngine::process_frame_internal(const cv::Mat& input_bgr, double c
             state_["bare_hand_violation"] = tr.bare_hand_violation_triggered ||
                                             (latched_reason_.value_or("") == "BARE_HAND_VIOLATION");
             state_["alarm_latched"] = alarm_latched_;
+            if (alarm_latched_ && latched_reason_.value_or("") == "STATE_OOD_UNKNOWN") {
+                state_["ood_rejected"] = true;
+                if (!state_.contains("ood_reason") || state_["ood_reason"].is_null()) {
+                    state_["ood_reason"] = cls.ood_reason.empty() ? "STATE_OOD_UNKNOWN" : cls.ood_reason;
+                }
+            }
+            state_["ood_streak"] = fsm_.ood_streak();
             state_["label_contact_active"] = tracked.hand_contact_candidate;
             state_["hand_contact_candidate"] = tracked.hand_contact_candidate;
             state_["fsm_state"] = active_fsm_state;

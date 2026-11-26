@@ -2495,6 +2495,728 @@ void test_v44_ransac_alignment_nanodet_and_hysteresis() {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Test 12: v4.5 ONNX Label Classifier, Energy/Mahalanobis OOD Dual Gate & Registry
+// ----------------------------------------------------------------------------
+std::vector<uint8_t> build_synthetic_label_onnx(int in_w, int in_h, bool dual_output) {
+    auto pb_varint = [](std::vector<uint8_t>& out, uint64_t v) {
+        while (v >= 0x80ULL) {
+            out.push_back(static_cast<uint8_t>((v & 0x7FULL) | 0x80ULL));
+            v >>= 7;
+        }
+        out.push_back(static_cast<uint8_t>(v));
+    };
+    auto pb_tag = [&](std::vector<uint8_t>& out, int field, int wire) {
+        pb_varint(out, static_cast<uint64_t>((field << 3) | wire));
+    };
+    auto pb_bytes = [&](std::vector<uint8_t>& out, int field, const void* data, std::size_t len) {
+        pb_tag(out, field, 2);
+        pb_varint(out, len);
+        const auto* p = static_cast<const uint8_t*>(data);
+        out.insert(out.end(), p, p + len);
+    };
+    auto pb_str = [&](std::vector<uint8_t>& out, int field, const std::string& s) {
+        pb_bytes(out, field, s.data(), s.size());
+    };
+    auto pb_int64 = [&](std::vector<uint8_t>& out, int field, int64_t v) {
+        pb_tag(out, field, 0);
+        pb_varint(out, static_cast<uint64_t>(v));
+    };
+    auto pb_attr_int = [&](const std::string& name, int64_t val) {
+        std::vector<uint8_t> b;
+        pb_str(b, 1, name);
+        pb_int64(b, 3, val);
+        pb_int64(b, 20, 2);  // AttributeProto::INT
+        return b;
+    };
+    auto pb_tensor_f32 = [&](const std::string& name,
+                             const std::vector<int64_t>& dims,
+                             const std::vector<float>& vals) {
+        std::vector<uint8_t> b;
+        for (int64_t d : dims) pb_int64(b, 1, d);
+        pb_int64(b, 2, 1);  // TensorProto::FLOAT
+        pb_str(b, 8, name);
+        pb_bytes(b, 9, vals.data(), vals.size() * sizeof(float));
+        return b;
+    };
+    auto pb_value_info = [&](const std::string& name, const std::vector<int64_t>& dims) {
+        std::vector<uint8_t> shape;
+        for (int64_t d : dims) {
+            std::vector<uint8_t> dim;
+            pb_int64(dim, 1, d);
+            pb_bytes(shape, 1, dim.data(), dim.size());
+        }
+        std::vector<uint8_t> tensor_t;
+        pb_int64(tensor_t, 1, 1);  // FLOAT
+        pb_bytes(tensor_t, 2, shape.data(), shape.size());
+        std::vector<uint8_t> type_p;
+        pb_bytes(type_p, 1, tensor_t.data(), tensor_t.size());
+        std::vector<uint8_t> vi;
+        pb_str(vi, 1, name);
+        pb_bytes(vi, 2, type_p.data(), type_p.size());
+        return vi;
+    };
+    auto pb_node = [&](const std::string& op,
+                       const std::string& name,
+                       const std::vector<std::string>& inputs,
+                       const std::vector<std::string>& outputs,
+                       const std::vector<std::vector<uint8_t>>& attrs = {}) {
+        std::vector<uint8_t> n;
+        for (const auto& i : inputs) pb_str(n, 1, i);
+        for (const auto& o : outputs) pb_str(n, 2, o);
+        pb_str(n, 3, name);
+        pb_str(n, 4, op);
+        for (const auto& a : attrs) pb_bytes(n, 5, a.data(), a.size());
+        return n;
+    };
+
+    const std::vector<float> w1 = {
+        1.0f,  0.0f,  0.0f,
+        0.0f,  1.0f,  0.0f,
+        0.0f,  0.0f,  1.0f,
+        0.5f,  0.5f,  0.5f,
+        0.5f, -0.5f,  0.0f,
+        0.0f,  0.5f, -0.5f,
+        0.5f,  0.0f, -0.5f,
+       -0.25f, 0.5f, -0.25f,
+    };
+    const std::vector<float> b1(8, 0.0f);
+    const std::vector<float> w2 = {
+         2.0f,  2.0f,  2.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+        -2.2f, -2.2f, -2.2f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+        -2.5f,  0.0f,  2.5f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+         2.5f,  0.0f, -2.5f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+    };
+    const std::vector<float> b2 = {-5.0f, -3.5f, -3.0f, -3.0f};
+    const std::vector<float> w_single = {
+         2.0f,  2.0f,  2.0f,
+        -2.2f, -2.2f, -2.2f,
+        -2.5f,  0.0f,  2.5f,
+         2.5f,  0.0f, -2.5f,
+    };
+
+    std::vector<uint8_t> graph;
+    auto n_gap = pb_node("GlobalAveragePool", "gap", {"input"}, {"gap_out"});
+    auto n_flat = pb_node("Flatten", "flat", {"gap_out"}, {"flat_out"}, {pb_attr_int("axis", 1)});
+    pb_bytes(graph, 1, n_gap.data(), n_gap.size());
+    pb_bytes(graph, 1, n_flat.data(), n_flat.size());
+
+    if (dual_output) {
+        auto n_feat = pb_node(
+            "Gemm", "penultimate_feat", {"flat_out", "W1", "B1"}, {"penultimate_feat"}, {pb_attr_int("transB", 1)});
+        auto n_logits = pb_node(
+            "Gemm", "logits", {"penultimate_feat", "W2", "B2"}, {"logits"}, {pb_attr_int("transB", 1)});
+        pb_bytes(graph, 1, n_feat.data(), n_feat.size());
+        pb_bytes(graph, 1, n_logits.data(), n_logits.size());
+        pb_str(graph, 2, "igbt_dual_label_net");
+        for (const auto& t : {
+                 pb_tensor_f32("W1", {8, 3}, w1),
+                 pb_tensor_f32("B1", {8}, b1),
+                 pb_tensor_f32("W2", {4, 8}, w2),
+                 pb_tensor_f32("B2", {4}, b2),
+             }) {
+            pb_bytes(graph, 5, t.data(), t.size());
+        }
+        auto vi_in = pb_value_info("input", {1, 3, in_h, in_w});
+        auto vi_logits = pb_value_info("logits", {1, 4});
+        auto vi_feat = pb_value_info("penultimate_feat", {1, 8});
+        pb_bytes(graph, 11, vi_in.data(), vi_in.size());
+        pb_bytes(graph, 12, vi_logits.data(), vi_logits.size());
+        pb_bytes(graph, 12, vi_feat.data(), vi_feat.size());
+    } else {
+        auto n_logits = pb_node(
+            "Gemm", "logits", {"flat_out", "W_s", "B_s"}, {"logits"}, {pb_attr_int("transB", 1)});
+        pb_bytes(graph, 1, n_logits.data(), n_logits.size());
+        pb_str(graph, 2, "igbt_single_label_net");
+        for (const auto& t : {
+                 pb_tensor_f32("W_s", {4, 3}, w_single),
+                 pb_tensor_f32("B_s", {4}, b2),
+             }) {
+            pb_bytes(graph, 5, t.data(), t.size());
+        }
+        auto vi_in = pb_value_info("input", {1, 3, in_h, in_w});
+        auto vi_logits = pb_value_info("logits", {1, 4});
+        pb_bytes(graph, 11, vi_in.data(), vi_in.size());
+        pb_bytes(graph, 12, vi_logits.data(), vi_logits.size());
+    }
+
+    std::vector<uint8_t> opset;
+    pb_int64(opset, 2, 11);  // opset 11
+
+    std::vector<uint8_t> model;
+    pb_int64(model, 1, 7);  // ir_version = 7
+    pb_str(model, 2, "igbt-test");
+    pb_bytes(model, 7, graph.data(), graph.size());
+    pb_bytes(model, 8, opset.data(), opset.size());
+    return model;
+}
+
+void test_v45_onnx_label_ood_dual_gate_and_registry() {
+    ScopedTempDir tmp;
+
+    auto make_solid_crop = [](cv::Scalar bgr, int w = 160, int h = 96) {
+        return cv::Mat(h, w, CV_8UC3, bgr);
+    };
+
+    // 12A. Temperature Softmax + LogSumExp Overflow Guard + Mahalanobis + NaN/Inf Guard
+    {
+        std::array<double, 4> probs{};
+        double energy = 0.0;
+        REQUIRE(vision::compute_temperature_softmax_and_energy(
+            {1000.0, 999.0, 998.0, 997.0}, 1.0, probs, energy));
+        REQUIRE(std::isfinite(energy));
+        double sum_p = 0.0;
+        for (double p : probs) {
+            REQUIRE(std::isfinite(p) && p > 0.0);
+            sum_p += p;
+        }
+        REQUIRE(std::abs(sum_p - 1.0) < 1e-9);
+        REQUIRE(probs[0] > probs[1] && energy < -999.0);
+
+        REQUIRE(!vision::compute_temperature_softmax_and_energy(
+            {1.0, std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0}, 1.0, probs, energy));
+        REQUIRE(!vision::compute_temperature_softmax_and_energy(
+            {1.0, 2.0, std::numeric_limits<double>::infinity(), 0.0}, 1.0, probs, energy));
+        REQUIRE(!vision::compute_temperature_softmax_and_energy({1.0, 2.0, 3.0, 4.0}, 0.0, probs, energy));
+
+        vision::OodCalibration cal;
+        cal.model_sha256 = std::string(64, 'a');
+        cal.feature_dim = 2;
+        cal.class_means = {
+            std::vector<double>{0.0, 0.0},
+            std::vector<double>{5.0, 0.0},
+            std::vector<double>{0.0, 5.0},
+            std::vector<double>{5.0, 5.0},
+        };
+        cal.shared_precision_flat = {4.0, 0.0, 0.0, 4.0};
+        int nearest = -1;
+        double dist = 0.0;
+        REQUIRE(vision::compute_mahalanobis_distance({1.0, 0.0}, cal, nearest, dist));
+        REQUIRE_EQ(nearest, 0);
+        REQUIRE(std::abs(dist - 2.0) < 1e-9);
+    }
+
+    const std::vector<uint8_t> dual_onnx = build_synthetic_label_onnx(224, 64, true);
+    const std::vector<uint8_t> single_onnx = build_synthetic_label_onnx(224, 64, false);
+    const auto dual_path = tmp.path() / "dual_label.onnx";
+    const auto single_path = tmp.path() / "single_label.onnx";
+    REQUIRE(write_file_bytes_atomic(dual_path, dual_onnx.data(), dual_onnx.size()));
+    REQUIRE(write_file_bytes_atomic(single_path, single_onnx.data(), single_onnx.size()));
+    const std::string dual_sha = sha256_hex(dual_onnx);
+    const std::string single_sha = sha256_hex(single_onnx);
+
+    // 12B. Dual-Output FP32 ONNX (224x64) Probe + Single-Forward Extraction
+    {
+        const auto probe = vision::LabelOodClassifier::probe_onnx_bytes(dual_onnx, 224, 64);
+        REQUIRE(probe.valid);
+        REQUIRE(probe.dual_output);
+        REQUIRE_EQ(probe.logits_dim, 4);
+        REQUIRE_EQ(probe.feature_dim, 8);
+
+        vision::LabelOodClassifier clf;
+        std::string err;
+        REQUIRE(clf.load_onnx(dual_path, "dual_v1", dual_sha, 224, 64, {}, err));
+        REQUIRE(clf.dual_output_available());
+        REQUIRE_EQ(clf.input_width(), 224);
+        REQUIRE_EQ(clf.input_height(), 64);
+
+        const auto ev = clf.evaluate(make_solid_crop(cv::Scalar(195, 195, 195)), true);
+        REQUIRE(ev.valid);
+        REQUIRE(!ev.ood_rejected);
+        REQUIRE_EQ(ev.raw_predicted_class, "complete");
+        REQUIRE_EQ(ev.feature_vec.size(), 8u);
+        REQUIRE_EQ(ev.backend_mode, "onnx_uncalibrated");
+    }
+
+    // 12C. Single-Output FP32 ONNX Auto-Degrades to Energy-Only
+    {
+        vision::LabelOodClassifier clf_single;
+        std::string err;
+        REQUIRE(clf_single.load_onnx(single_path, "single_v1", single_sha, 224, 64, {}, err));
+        REQUIRE(!clf_single.dual_output_available());
+
+        std::vector<std::pair<cv::Mat, int>> crops;
+        for (int i = 0; i < 6; ++i) {
+            const int d = i - 2;
+            crops.emplace_back(make_solid_crop(cv::Scalar(195 + d, 195 + d, 195 + d)), 0);
+            crops.emplace_back(make_solid_crop(cv::Scalar(40 + d, 40 + d, 40 + d)), 1);
+            crops.emplace_back(make_solid_crop(cv::Scalar(210 + d, 80, 35)), 2);
+            crops.emplace_back(make_solid_crop(cv::Scalar(35, 195 + d, 235)), 3);
+        }
+        const auto cal = clf_single.calibrate_from_crops(crops, 0.99, 0.85, 1e-3, false);
+        REQUIRE(!cal.dual_output_available);
+        REQUIRE(!cal.has_mahalanobis_params());
+        REQUIRE_EQ(clf_single.status_json().value("backend_mode", ""), "onnx_energy_only");
+
+        const auto id_ev = clf_single.evaluate(make_solid_crop(cv::Scalar(195, 195, 195)));
+        REQUIRE(id_ev.valid && !id_ev.ood_rejected);
+        REQUIRE(!id_ev.mahalanobis_distance.has_value());
+
+        const auto ood_ev = clf_single.evaluate(make_solid_crop(cv::Scalar(125, 125, 125)));
+        REQUIRE(ood_ev.valid && ood_ev.ood_rejected);
+        REQUIRE_EQ(ood_ev.final_label_class, "ood_unknown");
+    }
+
+    // 12D. Built-in Offline Calibrator (4 ID + OOD negatives) & Dual-Gate Blind-Spot Catch (AUROC >= 0.90)
+    vision::OodCalibration dual_cal;
+    {
+        vision::LabelOodClassifier clf;
+        std::string err;
+        REQUIRE(clf.load_onnx(dual_path, "dual_v1", dual_sha, 224, 64, {}, err));
+
+        std::vector<std::pair<cv::Mat, int>> crops;
+        for (int i = 0; i < 10; ++i) {
+            const int d = (i % 5) - 2;
+            crops.emplace_back(make_solid_crop(cv::Scalar(195 + d, 195 + d, 195 + d)), 0);
+            crops.emplace_back(make_solid_crop(cv::Scalar(40 + d, 40 + d, 40 + d)), 1);
+            crops.emplace_back(make_solid_crop(cv::Scalar(210 + d, 80 + d, 35)), 2);
+            crops.emplace_back(make_solid_crop(cv::Scalar(35, 195 + d, 235 - d)), 3);
+        }
+        // OOD negatives: mid-gray (high energy) + extreme saturated white (Mahalanobis blind-spot)
+        for (int i = 0; i < 6; ++i) {
+            crops.emplace_back(make_solid_crop(cv::Scalar(125 + i, 125, 125)), -1);
+            crops.emplace_back(make_solid_crop(cv::Scalar(255, 255, 255 - i)), -1);
+        }
+
+        dual_cal = clf.calibrate_from_crops(crops, 0.99, 0.85, 1e-3, false);
+        REQUIRE(dual_cal.has_mahalanobis_params());
+        REQUIRE(dual_cal.validation_auroc >= 0.90);
+        REQUIRE_EQ(clf.status_json().value("backend_mode", ""), "onnx_dual_ood");
+
+        // All 4 ID centers pass
+        REQUIRE(!clf.evaluate(make_solid_crop(cv::Scalar(195, 195, 195))).ood_rejected);
+        REQUIRE(!clf.evaluate(make_solid_crop(cv::Scalar(40, 40, 40))).ood_rejected);
+        REQUIRE(!clf.evaluate(make_solid_crop(cv::Scalar(210, 80, 35))).ood_rejected);
+        REQUIRE(!clf.evaluate(make_solid_crop(cv::Scalar(35, 195, 235))).ood_rejected);
+
+        // High-Energy OOD caught
+        const auto high_e = clf.evaluate(make_solid_crop(cv::Scalar(125, 125, 125)));
+        REQUIRE(high_e.ood_rejected);
+        REQUIRE(high_e.energy_score > dual_cal.energy_threshold);
+
+        // High-Logit / Low-Energy blind-spot (saturated white 255,255,255) caught by Mahalanobis!
+        const auto blindspot = clf.evaluate(make_solid_crop(cv::Scalar(255, 255, 255)));
+        REQUIRE(blindspot.max_prob >= 0.85);
+        REQUIRE(blindspot.energy_score <= dual_cal.energy_threshold);
+        REQUIRE(blindspot.mahalanobis_distance.has_value());
+        REQUIRE(*blindspot.mahalanobis_distance > dual_cal.mahalanobis_threshold);
+        REQUIRE(blindspot.ood_rejected);
+        REQUIRE_EQ(blindspot.reject_reason, "OOD_MAHALANOBIS_HIGH");
+        REQUIRE_EQ(blindspot.final_label_class, "ood_unknown");
+    }
+
+    // 12E. Calibration JSON SHA-256 Tamper Rejection
+    {
+        vision::LabelOodClassifier clf;
+        std::string err;
+        REQUIRE(clf.load_onnx(dual_path, "dual_v1", dual_sha, 224, 64, {}, err));
+
+        vision::OodCalibration tampered = dual_cal;
+        tampered.model_sha256 = std::string(64, 'f');
+        REQUIRE(!clf.load_calibration(tampered, err));
+        REQUIRE_EQ(err, "OOD_CALIBRATION_SHA256_MISMATCH");
+
+        const auto tampered_file = tmp.path() / "tampered_cal.json";
+        const std::string cal_dump = tampered.to_json(true).dump(2);
+        REQUIRE(write_file_bytes_atomic(tampered_file, cal_dump.data(), cal_dump.size()));
+        REQUIRE(!clf.load_calibration_file(tampered_file, err));
+        REQUIRE_EQ(err, "OOD_CALIBRATION_SHA256_MISMATCH");
+    }
+
+    // 12F. FSM 1.2s c_timer_ms Freeze (Frames 1..4 OOD_GATE_HOLD) -> Frame 5 ALARM (STATE_OOD_UNKNOWN)
+    //      + LiveCameraEngine Burst Capture + RedRabbit ood_energy/ood_mahalanobis Persistence
+    {
+        FSMConfig fcfg{};
+        fcfg.initial_complete_ms = 200;
+        fcfg.stable_state_ms = 200;
+        fcfg.min_stable_frames = 2;
+        fcfg.c_absent_duration_ms = 1200;
+        fcfg.ood_alarm_frames = 5;
+        double sim_t = 100.0;
+        InspectionFSM fsm(fcfg, [&sim_t]() { return sim_t; });
+
+        FSMEvent nc{};
+        nc.kind = "new_cycle";
+        nc.cycle_id = "CYC_OOD_FSM";
+        nc.capture_monotonic_s = sim_t;
+        REQUIRE(fsm.process(nc, sim_t) == FSMState::VERIFY_INITIAL);
+
+        auto make_obs = [&](int64_t fid, const std::string& lbl, bool ood, bool contact = false) {
+            FSMEvent ev{};
+            ev.kind = "observation";
+            ev.cycle_id = "CYC_OOD_FSM";
+            ev.capture_monotonic_s = sim_t;
+            ev.frame_id = fid;
+            ev.label_class = lbl;
+            ev.view_valid = true;
+            ev.quality_ok = true;
+            ev.camera_healthy = true;
+            ev.camera_settings_locked = true;
+            ev.config_match = true;
+            ev.tube_present = true;
+            ev.label_window_present = true;
+            ev.label_roi_clear = !contact;
+            ev.hand_occluded = contact;
+            ev.hand_contact_candidate = contact;
+            ev.hand_in_contact_roi = contact;
+            ev.ood_rejected = ood;
+            if (ood) {
+                ev.ood_energy = 1.5;
+                ev.ood_mahalanobis = 18.2;
+                ev.ood_reason = "OOD_DUAL_EXCEEDED";
+            }
+            return ev;
+        };
+
+        int64_t fid = 1;
+        for (int i = 0; i < 6; ++i) {
+            sim_t += 0.05;
+            fsm.process(make_obs(fid++, "complete", false), sim_t);
+        }
+        REQUIRE(fsm.state() == FSMState::READY);
+        FSMEvent si{};
+        si.kind = "start_inspection";
+        si.capture_monotonic_s = sim_t;
+        fsm.process(si, sim_t);
+        REQUIRE(fsm.state() == FSMState::INSPECTING);
+
+        // Contact candidate -> leave -> start C timer up to 900 ms
+        sim_t += 0.05;
+        fsm.process(make_obs(fid++, "complete", false, true), sim_t);
+        for (int i = 0; i < 6; ++i) {
+            sim_t += 0.05;
+            fsm.process(make_obs(fid++, "absent", false, false), sim_t);
+        }
+        for (int i = 0; i < 18; ++i) {
+            sim_t += 0.05;
+            fsm.process(make_obs(fid++, "absent", false, false), sim_t);
+        }
+        REQUIRE(fsm.state() == FSMState::VERIFY_C_ABSENT);
+        REQUIRE(fsm.c_timer_ms() >= 800 && fsm.c_timer_ms() < 1200);
+
+        // Frames 1..4 OOD freeze & clear C timer, do NOT trigger ALARM yet
+        for (int i = 0; i < 4; ++i) {
+            sim_t += 0.05;
+            const FSMState st = fsm.process(make_obs(fid++, "ood_unknown", true, false), sim_t);
+            REQUIRE(st != FSMState::PASS);
+            REQUIRE(st != FSMState::ALARM);
+            REQUIRE_EQ(fsm.c_timer_ms(), 0);
+            REQUIRE_EQ(fsm.ood_streak(), i + 1);
+        }
+        // Frame 5 triggers ALARM (STATE_OOD_UNKNOWN)
+        sim_t += 0.05;
+        REQUIRE(fsm.process(make_obs(fid++, "ood_unknown", true, false), sim_t) == FSMState::ALARM);
+        REQUIRE_EQ(fsm.result_reason().value_or(""), "STATE_OOD_UNKNOWN");
+
+        // End-to-end LiveCameraEngine + AsyncEvidenceWriter burst + RedRabbit attempt audit
+        const auto e2e_dir = tmp.path() / "e2e_ood";
+        StationDatabase db(e2e_dir);
+        const json cur_cfg = db.get_config();
+        json thresholds = cur_cfg.at("thresholds");
+        thresholds["expected_tube_width_norm"] = 0.14;
+        db.update_config(
+            json{
+                {"camera_device_id", cur_cfg.at("camera_device_id")},
+                {"camera_width", 1280},
+                {"camera_height", 720},
+                {"camera_covers_both_ends", true},
+                {"rois", json{
+                    {"tube_roi", {0.16, 0.42, 0.84, 0.58}},
+                    {"label_roi", {0.43, 0.45, 0.57, 0.55}},
+                    {"label_contact_roi", {0.40, 0.38, 0.60, 0.62}},
+                    {"left_grip_zone", {0.16, 0.34, 0.31, 0.82}},
+                    {"right_grip_zone", {0.69, 0.34, 0.84, 0.82}}
+                }},
+                {"thresholds", thresholds},
+            },
+            "test_calib"
+        );
+
+        RedRabbitController rr(db, "STATION_01", RedRabbitPolicy{true, 1, 1}, []() { return int64_t(1795900000000LL); }, false);
+        db.rr_upsert_sample(json{{"sample_uid", "OK_01"}, {"sample_type", "OK_GOLDEN"}, {"expected_verdict", "PASS"},
+                                 {"product_family", "IGBT"}, {"is_active", 1}, {"calibrated_by", "QE"},
+                                 {"expires_at_ms", int64_t(1895900000000LL)}, {"created_at_ms", int64_t(1795800000000LL)}},
+                            "QE");
+        db.rr_upsert_sample(json{{"sample_uid", "NG_OOD_01"}, {"sample_type", "NG_OOD"}, {"expected_verdict", "ALARM"},
+                                 {"product_family", "IGBT"}, {"is_active", 1}, {"calibrated_by", "QE"},
+                                 {"expires_at_ms", int64_t(1895900000000LL)}, {"created_at_ms", int64_t(1795800000000LL)}},
+                            "QE");
+        const json sess = rr.start_session("OP01", "LOT01", dual_sha);
+        const std::string sid = sess.at("session").value("session_id", "");
+        std::string ng_uid;
+        for (const auto& step : sess.at("session").at("required_plan")) {
+            if (step.value("expected_verdict", "") == "ALARM") {
+                ng_uid = step.value("sample_uid", "");
+                break;
+            }
+        }
+        REQUIRE(!ng_uid.empty());
+        // Advance plan to the NG_OOD step if OK step came first
+        for (const auto& step : sess.at("session").at("required_plan")) {
+            const std::string uid = step.value("sample_uid", "");
+            if (uid != ng_uid) {
+                rr.arm_sample(sid, uid);
+                rr.record_attempt(sid, uid, "PASS", "");
+            } else {
+                rr.arm_sample(sid, uid);
+                break;
+            }
+        }
+
+        LiveCameraEngine cam(0, [&db]() { return db.get_config(); });
+        cam.update_config(db.get_config());
+        cam.set_evidence_root(e2e_dir / "evidence");
+        cam.set_cycle_callback([&rr](const json& snap, const std::optional<std::string>&, const std::vector<uint8_t>&) {
+            const std::string outc = snap.value("outcome", "");
+            if (outc == "PASS" || outc == "ALARM") {
+                std::optional<double> oe;
+                if (snap.contains("ood_energy") && snap["ood_energy"].is_number()) oe = snap["ood_energy"].get<double>();
+                std::optional<double> om;
+                if (snap.contains("ood_mahalanobis") && snap["ood_mahalanobis"].is_number()) om = snap["ood_mahalanobis"].get<double>();
+                rr.try_consume_live_verdict(outc, snap.value("latest_evidence_url", ""), oe, om);
+            }
+            return true;
+        });
+
+        // Build empty bg + clean station frame (wide clear white label so rectified crop is ID 'complete')
+        cv::Mat empty_bg(kDefaultCameraHeight, kDefaultCameraWidth, CV_8UC3, cv::Scalar(48, 52, 56));
+        for (int y = 0; y < empty_bg.rows; y += 8) {
+            cv::line(empty_bg, cv::Point(0, y), cv::Point(empty_bg.cols, y), cv::Scalar(58, 62, 66), 1);
+        }
+        cv::Mat id_frame = make_synthetic_station_frame(1280, 720, "complete", false, false);
+        const cv::Rect lbl_px(static_cast<int>(0.40 * 1280), static_cast<int>(0.43 * 720),
+                              static_cast<int>(0.20 * 1280), static_cast<int>(0.14 * 720));
+        cv::rectangle(id_frame, lbl_px, cv::Scalar(222, 224, 226), cv::FILLED);
+        cv::rectangle(id_frame, lbl_px, cv::Scalar(65, 70, 75), 2);
+        for (int x = lbl_px.x + 12; x < lbl_px.x + lbl_px.width - 12; x += 10) {
+            cv::line(id_frame, cv::Point(x, lbl_px.y + 12), cv::Point(x, lbl_px.y + lbl_px.height - 12),
+                     cv::Scalar(75, 78, 82), 2);
+        }
+
+        vision::TubeGeometryAligner tmp_aligner;
+        const auto align_res = tmp_aligner.align(
+            id_frame,
+            Box{0.284, 0.421, 0.716, 0.579},
+            {Box{0.18, 0.40, 0.29, 0.76}, Box{0.71, 0.40, 0.82, 0.76}},
+            Box{0.41, 0.44, 0.59, 0.56},
+            0.14
+        );
+        cv::Mat id_crop = !align_res.rectified_label_bgr.empty()
+                              ? align_res.rectified_label_bgr.clone()
+                              : id_frame(lbl_px).clone();
+        cam.load_onnx_model(dual_path, "dual_e2e_v1", dual_sha, 224, 64);
+
+        std::vector<std::pair<cv::Mat, int>> cal_crops;
+        const std::array<cv::Scalar, 8> jitter_offsets = {
+            cv::Scalar(-6, -4, -5), cv::Scalar(6, 4, 5),
+            cv::Scalar(-5, 5, -3),  cv::Scalar(5, -5, 3),
+            cv::Scalar(-3, -6, 5),  cv::Scalar(3, 6, -5),
+            cv::Scalar(0, 0, 0),    cv::Scalar(4, 2, -4)
+        };
+        for (const auto& jo : jitter_offsets) {
+            cv::Mat j_crop = id_crop.clone();
+            j_crop += jo;
+            cal_crops.emplace_back(std::move(j_crop), 0);
+        }
+        for (const auto& jo : jitter_offsets) {
+            cal_crops.emplace_back(make_solid_crop(cv::Scalar(40, 40, 40) + jo), 1);
+            cal_crops.emplace_back(make_solid_crop(cv::Scalar(210, 80, 35) + jo), 2);
+            cal_crops.emplace_back(make_solid_crop(cv::Scalar(35, 195, 235) + jo), 3);
+        }
+        cam.calibrate_active_model_ood(cal_crops, 0.99, 0.70, 1e-3, false);
+
+        // OOD synthetic station frame: sharp mid-gray stripes over label ROI (passes quality_ok, triggers high energy OOD)
+        cv::Mat ood_frame = id_frame.clone();
+        cv::rectangle(ood_frame, lbl_px, cv::Scalar(115, 115, 115), cv::FILLED);
+        for (int x = lbl_px.x + 8; x < lbl_px.x + lbl_px.width - 8; x += 8) {
+            cv::line(ood_frame, cv::Point(x, lbl_px.y + 8), cv::Point(x, lbl_px.y + lbl_px.height - 8),
+                     cv::Scalar(80, 85, 90), 2);
+            cv::line(ood_frame, cv::Point(x + 4, lbl_px.y + 8), cv::Point(x + 4, lbl_px.y + lbl_px.height - 8),
+                     cv::Scalar(150, 155, 160), 2);
+        }
+
+        double ts = monotonic_seconds();
+        for (int i = 0; i < 4; ++i) {
+            ts += 0.04;
+            REQUIRE(cam.process_injected_frame(empty_bg, ts));
+        }
+        for (int i = 0; i < 4; ++i) {
+            ts += 0.04;
+            REQUIRE(cam.process_injected_frame(id_frame, ts));
+        }
+        {
+            const json st_id = cam.get_state_json();
+            if (st_id.value("outcome", "") == "ALARM" || st_id.value("ood_rejected", false)) {
+                throw std::runtime_error("ID_FRAME_UNEXPECTED: " + st_id.dump());
+            }
+        }
+        // Feed 4 OOD frames -> still OOD_GATE_HOLD, not ALARM
+        for (int i = 0; i < 4; ++i) {
+            ts += 0.04;
+            REQUIRE(cam.process_injected_frame(ood_frame, ts));
+            const json st = cam.get_state_json();
+            if (!st.value("ood_rejected", false) || st.value("outcome", "") == "ALARM") {
+                throw std::runtime_error("OOD_HOLD_UNEXPECTED at i=" + std::to_string(i) + ": " + st.dump());
+            }
+        }
+        // Frame 5 latches ALARM(STATE_OOD_UNKNOWN), feeds burst writer & RedRabbit audit
+        ts += 0.04;
+        REQUIRE(cam.process_injected_frame(ood_frame, ts));
+        {
+            const json st5 = cam.get_state_json();
+            REQUIRE_EQ(st5.value("outcome", ""), "ALARM");
+            REQUIRE_EQ(st5.value("result_reason", ""), "STATE_OOD_UNKNOWN");
+            REQUIRE(st5.value("alarm_latched", false));
+            REQUIRE(st5.at("ood_energy").is_number());
+            REQUIRE(st5.at("ood_mahalanobis").is_number());
+        }
+        // Drain async burst writer
+        for (int i = 0; i < 55; ++i) {
+            ts += 0.04;
+            REQUIRE(cam.process_injected_frame(ood_frame, ts));
+        }
+        cam.stop_async_writer();
+        REQUIRE(cam.async_evidence_stats().at("writer").value("written_bursts", uint64_t{0}) >= 1);
+
+        const json rr_attempts = db.rr_list_attempts(sid);
+        bool found_rr_ood = false;
+        for (const auto& att : rr_attempts) {
+            if (att.value("sample_uid", "") == ng_uid &&
+                att.value("actual_verdict", "") == "ALARM" &&
+                att.contains("ood_energy") && att["ood_energy"].is_number() &&
+                att.contains("ood_mahalanobis") && att["ood_mahalanobis"].is_number()) {
+                found_rr_ood = true;
+                break;
+            }
+        }
+        REQUIRE(found_rr_ood);
+    }
+
+    // 12G. HTTP E2E Contract: import_onnx (224x64), /api/models/ood/*, 401/409/422, RedRabbit trigger
+    {
+        const auto srv_dir = tmp.path() / "srv_ood";
+        StationDatabase db(srv_dir);
+        LiveCameraEngine cam(0, [&db]() { return db.get_config(); });
+        TrainingManager tm(srv_dir);
+        StationServerOptions opts{};
+        opts.port = 0;
+        opts.data_dir = srv_dir;
+        opts.web_dist_dir = tmp.path() / "web_dist";
+        opts.assets_dir = StationHttpServer::detect_default_assets_dir();
+        std::filesystem::create_directories(opts.web_dist_dir);
+        write_file_bytes_atomic(opts.web_dist_dir / "index.html", "<html></html>", 13);
+
+        StationHttpServer server(db, cam, tm, opts);
+        server.auth().set_env_override("IGBT_ENGINEER_PIN", "778899");
+        const int port = server.start_background();
+        REQUIRE(port > 0);
+        httplib::Client cli("127.0.0.1", port);
+
+        // Unauthorized requests blocked
+        REQUIRE_EQ(cli.Post("/api/models/ood/calibrate", "{}", "application/json")->status, 401);
+        REQUIRE_EQ(cli.Post("/api/models/ood/config", R"({"gate_enabled":true})", "application/json")->status, 401);
+
+        auto auth_res = cli.Post("/api/auth/verify", R"({"passcode":"778899"})", "application/json");
+        REQUIRE(auth_res && auth_res->status == 200);
+        httplib::Headers hdrs{{"X-Admin-Token", json::parse(auth_res->body).value("admin_token", "")}};
+
+        // Calibrate before loading neural model -> 409 NO_ACTIVE_NEURAL_MODEL
+        auto no_mdl = cli.Post("/api/models/ood/calibrate", hdrs, "{}", "application/json");
+        REQUIRE(no_mdl && no_mdl->status == 409);
+
+        // Import rectangular 224x64 dual-output ONNX via HTTP
+        httplib::Headers imp_hdrs = hdrs;
+        imp_hdrs.emplace("X-Model-Version", "rect_dual_v45");
+        imp_hdrs.emplace("X-Input-Size", "224");
+        imp_hdrs.emplace("X-Input-Height", "64");
+        std::string raw_onnx(reinterpret_cast<const char*>(dual_onnx.data()), dual_onnx.size());
+        auto imp_res = cli.Post("/api/models/import_onnx", imp_hdrs, raw_onnx, "application/octet-stream");
+        REQUIRE(imp_res && imp_res->status == 200);
+        const json imp_j = json::parse(imp_res->body);
+        REQUIRE_EQ(imp_j.value("input_width", 0), 224);
+        REQUIRE_EQ(imp_j.value("input_height", 0), 64);
+        REQUIRE_EQ(imp_j.value("dual_output_available", false), true);
+
+        // Calibrate with insufficient dataset -> 422
+        auto insuff = cli.Post("/api/models/ood/calibrate", hdrs, "{}", "application/json");
+        REQUIRE(insuff && insuff->status == 422);
+
+        // Populate minimal 4-class + OOD dataset via TrainingManager and calibrate via HTTP
+        for (int i = 0; i < 4; ++i) {
+            tm.capture_sample(make_solid_crop(cv::Scalar(195 + i, 195 + i, 195 + i)), "complete", "yellow", "T1");
+            tm.capture_sample(make_solid_crop(cv::Scalar(40 + i, 40 + i, 40 + i)), "crossed_out", "yellow", "T2");
+            tm.capture_sample(make_solid_crop(cv::Scalar(210 + i, 80, 35)), "covered", "blue", "T3");
+            tm.capture_sample(make_solid_crop(cv::Scalar(35, 195 + i, 235)), "absent", "yellow", "T4");
+            tm.capture_sample(make_solid_crop(cv::Scalar(125 + i, 125, 125)), "unknown_challenge", "yellow", "T5");
+        }
+
+        // First clear RedRabbit challenge manually via DB/session simulation or verify trigger_reason flips on calibrate
+        auto cal_res = cli.Post("/api/models/ood/calibrate", hdrs,
+                                R"({"quantile":0.98,"prob_threshold":0.85,"persist":true})", "application/json");
+        REQUIRE(cal_res && cal_res->status == 200);
+        const json cal_j = json::parse(cal_res->body);
+        REQUIRE(cal_j.value("calibrated", false));
+        REQUIRE(cal_j.at("label_ood_classifier").value("calibrated", false));
+        REQUIRE_EQ(cal_j.at("label_ood_classifier").value("backend_mode", ""), "onnx_dual_ood");
+        REQUIRE(!cal_j.at("calibration").contains("shared_precision_flat"));
+        REQUIRE(std::filesystem::is_regular_file(tm.runs_dir() / "rect_dual_v45" / "ood_calibration.json"));
+
+        // Tampered calibration upload -> 409
+        json bad_cal = dual_cal.to_json(true);
+        bad_cal["model_sha256"] = std::string(64, 'e');
+        auto bad_cal_res = cli.Post("/api/models/ood/calibration", hdrs, bad_cal.dump(), "application/json");
+        REQUIRE(bad_cal_res && bad_cal_res->status == 409);
+
+        // Config update -> 200 & RedRabbit blocking active
+        auto cfg_res = cli.Post("/api/models/ood/config", hdrs,
+                                R"({"gate_enabled":true,"alarm_streak_threshold":5})", "application/json");
+        REQUIRE(cfg_res && cfg_res->status == 200);
+        REQUIRE(server.red_rabbit().state() == RedRabbitState::CHALLENGE_REQUIRED);
+
+        // Runtime & pipeline status expose label_ood_classifier
+        auto ps_res = cli.Get("/api/vision/pipeline_status");
+        REQUIRE(ps_res && ps_res->status == 200);
+        REQUIRE_EQ(json::parse(ps_res->body).at("label_ood_classifier").value("backend_mode", ""), "onnx_dual_ood");
+
+        auto diag_res = cli.Get("/api/diagnostics/runtime");
+        REQUIRE(diag_res && diag_res->status == 200);
+        REQUIRE_EQ(json::parse(diag_res->body).at("label_ood_classifier").value("backend_mode", ""), "onnx_dual_ood");
+
+        server.stop();
+    }
+
+    // 12H. 720P Full Vision Pipeline Benchmark with Dual-Output 224x64 ONNX + OOD Dual Gate (P95 <= 15.0 ms)
+    {
+        LiveCameraEngine bench_cam(0);
+        bench_cam.load_onnx_model(dual_path, "dual_bench_v1", dual_sha, 224, 64);
+        bench_cam.load_ood_calibration(dual_cal);
+
+        const cv::Mat bench_frame = make_synthetic_station_frame(1280, 720, "complete", false, false);
+        double ts = 300.0;
+        for (int i = 0; i < 4; ++i) {
+            ts += 0.04;
+            REQUIRE(bench_cam.process_injected_frame(bench_frame, ts));
+        }
+        std::vector<double> vision_ms;
+        vision_ms.reserve(25);
+        for (int i = 0; i < 25; ++i) {
+            ts += 0.04;
+            REQUIRE(bench_cam.process_injected_frame(bench_frame, ts));
+            const json st = bench_cam.get_state_json();
+            const double align_ms = st.at("tube_alignment").value("align_ms", 0.0);
+            const double hand_ms = st.at("hand_glove_detector").value("last_infer_ms", 0.0);
+            const double cls_ms = st.value("inference_ms", 0.0);
+            vision_ms.push_back(align_ms + hand_ms + cls_ms);
+        }
+        std::sort(vision_ms.begin(), vision_ms.end());
+        const double p50 = vision_ms[vision_ms.size() / 2];
+        const double p95 = vision_ms[(vision_ms.size() * 95) / 100];
+        std::cout << "       [BENCH] 720P vision+ONNX(224x64)+OOD dual gate: P50="
+                  << p50 << " ms, P95=" << p95 << " ms" << std::endl;
+        REQUIRE(p95 <= 15.0);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -2516,6 +3238,7 @@ int main() {
         {"9. v4.3 Red Rabbit Mandatory Challenge, Anti-Cheat & SHA-256 Audit Chain", test_red_rabbit_challenge_and_hash_chain_audit},
         {"10. v4.3 ADAM-6050/6060 Native Winsock2 Modbus TCP Watchdog & Fail-Safe", test_adam_modbus_dio_watchdog_and_failsafe},
         {"11. v4.4 P0-3 RANSAC Tube Alignment, TUBE_ALIGN_FAIL Gate, NanoDet GFL & 2/10 Hysteresis", test_v44_ransac_alignment_nanodet_and_hysteresis},
+        {"12. v4.5 ONNX Label Classifier, Energy/Mahalanobis Dual-Gate OOD & Model Registry", test_v45_onnx_label_ood_dual_gate_and_registry},
     };
 
     int passed = 0;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "igbt/common.hpp"
+#include "igbt/training/onnx_model_registry.hpp"
 
 #include <atomic>
 #include <filesystem>
@@ -22,31 +23,6 @@ inline constexpr const char* kChallengeLabel = "unknown_challenge";
 
 inline const std::array<std::string, 5> kAllDatasetLabels = {
     "complete", "crossed_out", "covered", "absent", "unknown_challenge"
-};
-
-struct VerifiedModelRun {
-    std::string model_version;
-    std::string model_name;
-    std::string artifact_format;  // "opencv_mlp" or "onnx"
-    std::filesystem::path model_path;
-    std::string sha256;
-    int input_size{kDefaultInputSize};
-    json metrics;
-
-    json to_json() const {
-        const std::string path_str = path_to_utf8(model_path);
-        return json{
-            {"model_version", model_version},
-            {"model_name", model_name},
-            {"artifact_format", artifact_format},
-            {"model_path", path_str},
-            {"onnx_path", path_str},
-            {"sha256", sha256},
-            {"onnx_sha256", sha256},
-            {"input_size", input_size},
-            {"metrics", metrics},
-        };
-    }
 };
 
 class TrainingManager {
@@ -157,13 +133,15 @@ public:
     json import_onnx_bytes(
         const std::vector<uint8_t>& onnx_bytes,
         const std::string& version_name = "",
-        int input_size = kDefaultInputSize
+        int input_size = kDefaultInputSize,
+        int input_height = 0
     );
 
     json import_onnx_bytes(
         const std::string& onnx_bytes,
         const std::string& version_name = "",
-        int input_size = kDefaultInputSize
+        int input_size = kDefaultInputSize,
+        int input_height = 0
     );
 
     std::vector<VerifiedModelRun> find_verified_runs() const;
@@ -171,6 +149,13 @@ public:
     std::optional<VerifiedModelRun> resolve_verified_run(
         const std::string& model_version,
         const std::string& expected_sha256 = ""
+    ) const;
+
+    std::vector<std::pair<cv::Mat, int>> collect_ood_calibration_crops(int max_per_class = 150) const;
+
+    std::filesystem::path save_ood_calibration_for_version(
+        const std::string& model_version,
+        const vision::OodCalibration& cal
     ) const;
 
 private:

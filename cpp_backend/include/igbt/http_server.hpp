@@ -136,7 +136,9 @@ private:
         const std::string& artifact_format,
         const std::string& model_version,
         const std::string& expected_sha256,
-        int input_size
+        int input_size,
+        int input_height = 0,
+        const std::filesystem::path& ood_calibration_path = {}
     );
 
     json build_current_state_response();

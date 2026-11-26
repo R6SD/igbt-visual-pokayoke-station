@@ -790,9 +790,21 @@ StationHttpServer::StationHttpServer(
             const bool saved = db_.record_live_transition(snap, prev_fsm, ev_jpg);
             const std::string outcome = snap.value("outcome", "");
             if (outcome == "PASS" || outcome == "ALARM") {
+                std::optional<double> ood_energy;
+                if (snap.contains("ood_energy") && snap["ood_energy"].is_number()) {
+                    const double v = snap["ood_energy"].get<double>();
+                    if (std::isfinite(v)) ood_energy = v;
+                }
+                std::optional<double> ood_maha;
+                if (snap.contains("ood_mahalanobis") && snap["ood_mahalanobis"].is_number()) {
+                    const double v = snap["ood_mahalanobis"].get<double>();
+                    if (std::isfinite(v)) ood_maha = v;
+                }
                 (void)red_rabbit_.try_consume_live_verdict(
                     outcome,
-                    snap.value("latest_evidence_url", "")
+                    snap.value("latest_evidence_url", ""),
+                    ood_energy,
+                    ood_maha
                 );
             }
             if (interlock_) {
@@ -1010,7 +1022,9 @@ json StationHttpServer::load_verified_model_into_camera(
     const std::string& artifact_format,
     const std::string& model_version,
     const std::string& expected_sha256,
-    int input_size
+    int input_size,
+    int input_height,
+    const std::filesystem::path& ood_calibration_path
 ) {
     std::error_code ec;
     if (!std::filesystem::is_regular_file(model_path, ec)) {
@@ -1032,9 +1046,11 @@ json StationHttpServer::load_verified_model_into_camera(
     const bool is_mlp = (artifact_format == "opencv_mlp" || ext == ".xml");
     try {
         if (is_mlp) {
-            return camera_.load_mlp_model(model_path, model_version, expected_norm);
+            return camera_.load_mlp_model(model_path, model_version, expected_norm, ood_calibration_path);
         }
-        return camera_.load_onnx_model(model_path, model_version, expected_norm, input_size);
+        return camera_.load_onnx_model(
+            model_path, model_version, expected_norm, input_size, input_height, ood_calibration_path
+        );
     } catch (const DatabaseHttpError&) {
         throw;
     } catch (const std::exception& exc) {
@@ -1091,7 +1107,9 @@ bool StationHttpServer::autoload_latest_verified_model() {
                     run.artifact_format,
                     run.model_version,
                     run.sha256,
-                    run.input_size
+                    run.input_width,
+                    run.input_height,
+                    run.ood_calibration_path
                 );
                 return true;
             } catch (...) {
@@ -1224,14 +1242,16 @@ void StationHttpServer::register_routes() {
             {"red_rabbit", red_rabbit_.status_json()},
             {"hal_dio", dio_health_to_json(dio)},
             {"tube_alignment", camera_.tube_alignment_status_json()},
-            {"hand_glove_detector", camera_.hand_glove_detector_status_json()}
+            {"hand_glove_detector", camera_.hand_glove_detector_status_json()},
+            {"label_ood_classifier", camera_.label_ood_status_json()}
         });
     }));
 
     svr_.Get("/api/vision/pipeline_status", wrap([this](const httplib::Request&, httplib::Response& res) {
         send_json(res, 200, json{
             {"tube_alignment", camera_.tube_alignment_status_json()},
-            {"hand_glove_detector", camera_.hand_glove_detector_status_json()}
+            {"hand_glove_detector", camera_.hand_glove_detector_status_json()},
+            {"label_ood_classifier", camera_.label_ood_status_json()}
         });
     }));
 
@@ -1568,21 +1588,30 @@ void StationHttpServer::register_routes() {
             input_size = parse_optional_input_size(json(req.get_param_value("input_size")), kDefaultInputSize);
         }
 
-        json imported = training_.import_onnx_bytes(req.body, version_name, input_size);
+        int input_height = 0;
+        if (auto hh = clean_optional_header(get_opt_header(req, "X-Input-Height"), 16); hh.has_value()) {
+            input_height = parse_optional_input_size(json(*hh), 0);
+        } else if (req.has_param("input_height")) {
+            input_height = parse_optional_input_size(json(req.get_param_value("input_height")), 0);
+        }
+
+        json imported = training_.import_onnx_bytes(req.body, version_name, input_size, input_height);
         const std::string model_version = imported.value("model_version", "");
         const std::string model_name = imported.value("model_name", "onnx-imported-cpp-igbt");
         std::string sha = to_lower_ascii(imported.value("sha256", ""));
         if (sha.empty()) sha = to_lower_ascii(imported.value("onnx_sha256", ""));
         std::string path_str = imported.value("model_path", "");
         if (path_str.empty()) path_str = imported.value("onnx_path", "");
-        const int actual_size = imported.value("input_size", input_size);
+        const int actual_w = imported.value("input_width", imported.value("input_size", input_size));
+        const int actual_h = imported.value("input_height", input_height > 0 ? input_height : actual_w);
 
         json load_info = load_verified_model_into_camera(
             path_from_utf8(path_str),
             "onnx",
             model_version,
             sha,
-            actual_size
+            actual_w,
+            actual_h
         );
         red_rabbit_.trigger_challenge("MODEL_OR_OPTICS_CHANGE", "", actor);
         json reg = db_.register_model(
@@ -1655,6 +1684,283 @@ void StationHttpServer::register_routes() {
         }
     }));
 
+    svr_.Get("/api/models/ood/status", wrap([this](const httplib::Request&, httplib::Response& res) {
+        send_json(res, 200, camera_.label_ood_status_json());
+    }));
+
+    svr_.Post("/api/models/ood/calibration", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const std::string actor = auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        const json body = parse_json_body_or_throw(req);
+        if (!body.is_object()) {
+            throw DatabaseHttpError(422, "INVALID_OOD_CALIBRATION_PAYLOAD");
+        }
+
+        const json cur_status = camera_.label_ood_status_json();
+        if (cur_status.value("model_kind", "heuristic") == "heuristic") {
+            throw DatabaseHttpError(409, "NO_ACTIVE_NEURAL_MODEL");
+        }
+
+        json next_status;
+        std::filesystem::path saved_cal_path;
+        if (body.contains("calibration_path") && body["calibration_path"].is_string()) {
+            const std::string raw_path = body["calibration_path"].get<std::string>();
+            if (raw_path.empty()) {
+                throw DatabaseHttpError(422, "INVALID_OOD_CALIBRATION_PATH");
+            }
+            std::filesystem::path target_path = path_from_utf8(raw_path);
+            if (target_path.is_relative() && !options_.data_dir.empty()) {
+                target_path = options_.data_dir / "models" / target_path;
+            }
+            try {
+                next_status = camera_.load_ood_calibration_file(target_path);
+            } catch (const std::invalid_argument& ex) {
+                throw DatabaseHttpError(409, ex.what());
+            } catch (const std::exception& ex) {
+                const std::string msg = ex.what();
+                if (msg.find("NOT_FOUND") != std::string::npos) {
+                    throw DatabaseHttpError(404, msg);
+                }
+                if (msg.find("NO_ACTIVE_NEURAL_MODEL") != std::string::npos) {
+                    throw DatabaseHttpError(409, msg);
+                }
+                throw DatabaseHttpError(422, msg);
+            }
+        } else {
+            std::string parse_err;
+            auto parsed = vision::OodCalibration::from_json(body, parse_err);
+            if (!parsed.has_value()) {
+                throw DatabaseHttpError(422, parse_err.empty() ? "INVALID_OOD_CALIBRATION_PAYLOAD" : parse_err);
+            }
+            try {
+                next_status = camera_.load_ood_calibration(*parsed);
+            } catch (const std::invalid_argument& ex) {
+                throw DatabaseHttpError(409, ex.what());
+            } catch (const std::exception& ex) {
+                const std::string msg = ex.what();
+                if (msg.find("NO_ACTIVE_NEURAL_MODEL") != std::string::npos) {
+                    throw DatabaseHttpError(409, msg);
+                }
+                throw DatabaseHttpError(422, msg);
+            }
+            const std::string active_ver = cur_status.value("model_version", "");
+            if (!active_ver.empty()) {
+                try {
+                    saved_cal_path = training_.save_ood_calibration_for_version(active_ver, *parsed);
+                } catch (...) {
+                }
+            }
+        }
+
+        red_rabbit_.trigger_challenge("MODEL_OR_OPTICS_CHANGE", "", actor);
+        send_json(res, 200, json{
+            {"loaded", true},
+            {"calibration_path", path_to_utf8(saved_cal_path)},
+            {"label_ood_classifier", next_status}
+        });
+    }));
+
+    svr_.Post("/api/models/ood/calibrate", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const std::string actor = auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        const json cur_status = camera_.label_ood_status_json();
+        if (cur_status.value("model_kind", "heuristic") == "heuristic") {
+            throw DatabaseHttpError(409, "NO_ACTIVE_NEURAL_MODEL");
+        }
+
+        json body = json::object();
+        if (!req.body.empty()) {
+            try {
+                body = json::parse(req.body);
+            } catch (...) {
+                throw DatabaseHttpError(422, "INVALID_JSON_BODY");
+            }
+            if (!body.is_object()) {
+                throw DatabaseHttpError(422, "INVALID_OOD_CALIBRATE_PAYLOAD");
+            }
+        }
+
+        double quantile = 0.98;
+        if (body.contains("quantile")) {
+            if (!body["quantile"].is_number() || body["quantile"].is_boolean()) {
+                throw DatabaseHttpError(422, "INVALID_OOD_QUANTILE");
+            }
+            quantile = body["quantile"].get<double>();
+            if (!std::isfinite(quantile) || quantile < 0.5 || quantile >= 1.0) {
+                throw DatabaseHttpError(422, "INVALID_OOD_QUANTILE");
+            }
+        }
+
+        double prob_threshold = 0.85;
+        if (body.contains("prob_threshold")) {
+            if (!body["prob_threshold"].is_number() || body["prob_threshold"].is_boolean()) {
+                throw DatabaseHttpError(422, "INVALID_OOD_PROB_THRESHOLD");
+            }
+            prob_threshold = body["prob_threshold"].get<double>();
+            if (!std::isfinite(prob_threshold) || prob_threshold < 0.0 || prob_threshold > 1.0) {
+                throw DatabaseHttpError(422, "INVALID_OOD_PROB_THRESHOLD");
+            }
+        }
+
+        double reg_lambda = 1e-3;
+        if (body.contains("reg_lambda")) {
+            if (!body["reg_lambda"].is_number() || body["reg_lambda"].is_boolean()) {
+                throw DatabaseHttpError(422, "INVALID_OOD_REG_LAMBDA");
+            }
+            reg_lambda = body["reg_lambda"].get<double>();
+            if (!std::isfinite(reg_lambda) || reg_lambda <= 0.0) {
+                throw DatabaseHttpError(422, "INVALID_OOD_REG_LAMBDA");
+            }
+        }
+
+        bool fit_temperature = true;
+        if (body.contains("fit_temperature")) {
+            if (!body["fit_temperature"].is_boolean()) {
+                throw DatabaseHttpError(422, "INVALID_FIT_TEMPERATURE");
+            }
+            fit_temperature = body["fit_temperature"].get<bool>();
+        }
+
+        int max_per_class = 150;
+        if (body.contains("max_samples_per_class")) {
+            if (!body["max_samples_per_class"].is_number_integer()) {
+                throw DatabaseHttpError(422, "INVALID_MAX_SAMPLES_PER_CLASS");
+            }
+            max_per_class = std::clamp(body["max_samples_per_class"].get<int>(), 1, 2000);
+        }
+
+        bool persist = true;
+        if (body.contains("persist")) {
+            if (!body["persist"].is_boolean()) {
+                throw DatabaseHttpError(422, "INVALID_PERSIST_FLAG");
+            }
+            persist = body["persist"].get<bool>();
+        }
+
+        const auto crops = training_.collect_ood_calibration_crops(max_per_class);
+        vision::OodCalibration cal;
+        try {
+            cal = camera_.calibrate_active_model_ood(
+                crops, quantile, prob_threshold, reg_lambda, fit_temperature
+            );
+        } catch (const std::invalid_argument& ex) {
+            throw DatabaseHttpError(422, ex.what());
+        } catch (const std::exception& ex) {
+            const std::string msg = ex.what();
+            if (msg.find("NO_ACTIVE_NEURAL_MODEL") != std::string::npos) {
+                throw DatabaseHttpError(409, msg);
+            }
+            throw DatabaseHttpError(422, msg);
+        }
+
+        std::filesystem::path saved_path;
+        if (persist && !cal.model_version.empty()) {
+            try {
+                saved_path = training_.save_ood_calibration_for_version(cal.model_version, cal);
+            } catch (...) {
+            }
+        }
+
+        red_rabbit_.trigger_challenge("MODEL_OR_OPTICS_CHANGE", "", actor);
+        send_json(res, 200, json{
+            {"calibrated", true},
+            {"calibration_path", path_to_utf8(saved_path)},
+            {"calibration", cal.to_json(false)},
+            {"label_ood_classifier", camera_.label_ood_status_json()}
+        });
+    }));
+
+    svr_.Post("/api/models/ood/config", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const std::string actor = auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        const json body = parse_json_body_or_throw(req);
+        if (!body.is_object()) {
+            throw DatabaseHttpError(422, "INVALID_OOD_CONFIG_PAYLOAD");
+        }
+
+        const json cur = camera_.label_ood_status_json();
+        const json cur_cfg = cur.value("gate_config", json::object());
+        vision::OodGateConfig cfg{};
+        cfg.gate_enabled = cur_cfg.value("gate_enabled", true);
+        cfg.alarm_streak_threshold = cur_cfg.value("alarm_streak_threshold", 5);
+        cfg.require_calibration_for_onnx = cur_cfg.value("require_calibration_for_onnx", false);
+        if (cur_cfg.contains("prob_threshold_override") && cur_cfg["prob_threshold_override"].is_number()) {
+            cfg.prob_threshold_override = cur_cfg["prob_threshold_override"].get<double>();
+        }
+        if (cur_cfg.contains("energy_threshold_override") && cur_cfg["energy_threshold_override"].is_number()) {
+            cfg.energy_threshold_override = cur_cfg["energy_threshold_override"].get<double>();
+        }
+        if (cur_cfg.contains("mahalanobis_threshold_override") && cur_cfg["mahalanobis_threshold_override"].is_number()) {
+            cfg.mahalanobis_threshold_override = cur_cfg["mahalanobis_threshold_override"].get<double>();
+        }
+
+        if (body.contains("gate_enabled")) {
+            if (!body["gate_enabled"].is_boolean()) {
+                throw DatabaseHttpError(422, "INVALID_GATE_ENABLED");
+            }
+            cfg.gate_enabled = body["gate_enabled"].get<bool>();
+        }
+        if (body.contains("alarm_streak_threshold")) {
+            if (!body["alarm_streak_threshold"].is_number_integer()) {
+                throw DatabaseHttpError(422, "INVALID_ALARM_STREAK_THRESHOLD");
+            }
+            const int v = body["alarm_streak_threshold"].get<int>();
+            if (v < 1 || v > 30) {
+                throw DatabaseHttpError(422, "INVALID_ALARM_STREAK_THRESHOLD");
+            }
+            cfg.alarm_streak_threshold = v;
+        }
+        if (body.contains("require_calibration_for_onnx")) {
+            if (!body["require_calibration_for_onnx"].is_boolean()) {
+                throw DatabaseHttpError(422, "INVALID_REQUIRE_CALIBRATION_FLAG");
+            }
+            cfg.require_calibration_for_onnx = body["require_calibration_for_onnx"].get<bool>();
+        }
+        if (body.contains("prob_threshold_override")) {
+            if (body["prob_threshold_override"].is_null()) {
+                cfg.prob_threshold_override.reset();
+            } else if (body["prob_threshold_override"].is_number() && !body["prob_threshold_override"].is_boolean()) {
+                const double v = body["prob_threshold_override"].get<double>();
+                if (!std::isfinite(v) || v < 0.0 || v > 1.0) {
+                    throw DatabaseHttpError(422, "INVALID_PROB_THRESHOLD_OVERRIDE");
+                }
+                cfg.prob_threshold_override = v;
+            } else {
+                throw DatabaseHttpError(422, "INVALID_PROB_THRESHOLD_OVERRIDE");
+            }
+        }
+        if (body.contains("energy_threshold_override")) {
+            if (body["energy_threshold_override"].is_null()) {
+                cfg.energy_threshold_override.reset();
+            } else if (body["energy_threshold_override"].is_number() && !body["energy_threshold_override"].is_boolean()) {
+                const double v = body["energy_threshold_override"].get<double>();
+                if (!std::isfinite(v)) {
+                    throw DatabaseHttpError(422, "INVALID_ENERGY_THRESHOLD_OVERRIDE");
+                }
+                cfg.energy_threshold_override = v;
+            } else {
+                throw DatabaseHttpError(422, "INVALID_ENERGY_THRESHOLD_OVERRIDE");
+            }
+        }
+        if (body.contains("mahalanobis_threshold_override")) {
+            if (body["mahalanobis_threshold_override"].is_null()) {
+                cfg.mahalanobis_threshold_override.reset();
+            } else if (body["mahalanobis_threshold_override"].is_number() && !body["mahalanobis_threshold_override"].is_boolean()) {
+                const double v = body["mahalanobis_threshold_override"].get<double>();
+                if (!std::isfinite(v) || v < 0.0) {
+                    throw DatabaseHttpError(422, "INVALID_MAHALANOBIS_THRESHOLD_OVERRIDE");
+                }
+                cfg.mahalanobis_threshold_override = v;
+            } else {
+                throw DatabaseHttpError(422, "INVALID_MAHALANOBIS_THRESHOLD_OVERRIDE");
+            }
+        }
+
+        const json st = camera_.set_ood_gate_config(cfg);
+        red_rabbit_.trigger_challenge("MODEL_OR_OPTICS_CHANGE", "", actor);
+        send_json(res, 200, json{
+            {"updated", true},
+            {"label_ood_classifier", st}
+        });
+    }));
+
     svr_.Post("/api/models/:model_id/activate", wrap([this](const httplib::Request& req, httplib::Response& res) {
         const std::string actor = auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
         const std::string model_id = req.path_params.at("model_id");
@@ -1679,6 +1985,7 @@ void StationHttpServer::register_routes() {
         }
 
         int input_size = kDefaultInputSize;
+        int input_height = 0;
         std::string artifact_format;
         const auto metrics_path = run_dir / "metrics.json";
         std::vector<uint8_t> meta_bytes;
@@ -1686,8 +1993,13 @@ void StationHttpServer::register_routes() {
             try {
                 json meta = json::parse(meta_bytes.begin(), meta_bytes.end());
                 if (meta.is_object()) {
-                    if (meta.contains("input_size")) {
+                    if (meta.contains("input_width")) {
+                        input_size = parse_optional_input_size(meta["input_width"], kDefaultInputSize);
+                    } else if (meta.contains("input_size")) {
                         input_size = parse_optional_input_size(meta["input_size"], kDefaultInputSize);
+                    }
+                    if (meta.contains("input_height")) {
+                        input_height = parse_optional_input_size(meta["input_height"], 0);
                     }
                     artifact_format = meta.value("artifact_format", "");
                 }
@@ -1717,7 +2029,14 @@ void StationHttpServer::register_routes() {
             throw DatabaseHttpError(404, "MODEL_ARTIFACT_UNAVAILABLE");
         }
 
-        json info = load_verified_model_into_camera(chosen_path, chosen_format, version, expected_sha, input_size);
+        std::filesystem::path cal_candidate = run_dir / L"ood_calibration.json";
+        if (!std::filesystem::is_regular_file(cal_candidate, ec)) {
+            cal_candidate.clear();
+        }
+
+        json info = load_verified_model_into_camera(
+            chosen_path, chosen_format, version, expected_sha, input_size, input_height, cal_candidate
+        );
         red_rabbit_.trigger_challenge("MODEL_OR_OPTICS_CHANGE", "", actor);
         json resp{
             {"activated", true},

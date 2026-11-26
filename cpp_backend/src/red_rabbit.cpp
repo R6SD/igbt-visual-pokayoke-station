@@ -582,7 +582,9 @@ json RedRabbitController::record_attempt(
 
 bool RedRabbitController::try_consume_live_verdict(
     const std::string& outcome,
-    const std::string& evidence_dir
+    const std::string& evidence_dir,
+    std::optional<double> ood_energy,
+    std::optional<double> ood_mahalanobis
 ) {
     if (outcome != "PASS" && outcome != "ALARM") {
         return false;
@@ -602,7 +604,7 @@ bool RedRabbitController::try_consume_live_verdict(
     }
 
     try {
-        record_attempt(session_id, armed_uid, outcome, evidence_dir);
+        record_attempt(session_id, armed_uid, outcome, evidence_dir, ood_energy, ood_mahalanobis);
         return true;
     } catch (...) {
         return false;

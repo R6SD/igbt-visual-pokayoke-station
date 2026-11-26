@@ -47,6 +47,7 @@ export const labelText: Record<string, string> = {
   covered: "已遮挡",
   absent: "已脱落",
   unknown_challenge: "挑战样本",
+  ood_unknown: "未知异常(OOD)",
   unknown: "未识别",
 }
 
@@ -152,6 +153,14 @@ const reasonText: Record<string, string> = {
   PARALLEL_DIFF_EXCEEDED: "料管上下壁面平行度偏差超限",
   WIDTH_DEV_EXCEEDED: "料管实测宽度与标定先验偏差超限",
   ANGLE_JUMP_EXCEEDED: "料管帧间倾角跳变超限",
+  STATE_OOD_UNKNOWN: "连续检出未知异常样本(OOD)，已连拍闭锁",
+  OOD_GATE_HOLD: "疑似未知异常(OOD)，已暂停放行计时",
+  OOD_PROB_LOW: "OOD 门控：温度校准后类别概率低于下限",
+  OOD_ENERGY_HIGH: "OOD 门控：Energy 分数超过分布阈值",
+  OOD_MAHALANOBIS_HIGH: "OOD 门控：Mahalanobis 特征距离越界",
+  OOD_DUAL_EXCEEDED: "OOD 双门控：Energy 与 Mahalanobis 同时越界",
+  OOD_CALIBRATION_SHA256_MISMATCH: "OOD 标定文件与当前模型哈希不匹配",
+  OOD_NON_FINITE: "神经网络输出存在异常非有限值",
 }
 
 export const reasonOf = (code?: string) => (code ? reasonText[code] || fsmText[code] || code.replaceAll("_", " ") : "")
@@ -170,8 +179,14 @@ export function guidanceFor(state: Data) {
   if (state.bare_hand_violation || state.result_reason === "BARE_HAND_VIOLATION") {
     return { title: "裸手违规闭锁" }
   }
+  if (state.result_reason === "STATE_OOD_UNKNOWN") {
+    return { title: "未知异常(OOD)闭锁" }
+  }
   if (state.alarm_latched || outcome === "ALARM") {
     return { title: "防呆报警闭锁" }
+  }
+  if (state.ood_rejected || state.result_reason === "OOD_GATE_HOLD") {
+    return { title: "OOD 未知异常·暂停放行" }
   }
   if (state.bare_hand_detected || state.result_reason === "BARE_HAND_WARNING_NO_GLOVE") {
     return { title: "请佩戴防静电手套" }

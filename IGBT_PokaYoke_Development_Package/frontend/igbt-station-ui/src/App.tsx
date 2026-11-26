@@ -44,6 +44,7 @@ import { OperatorView } from "@/components/OperatorView"
 import { ShowcasePage } from "@/components/ShowcasePage"
 import { RedRabbitOverlay } from "@/features/red-rabbit/RedRabbitOverlay"
 import type { RedRabbitStatus } from "@/features/red-rabbit/types"
+import { LabelOodCard } from "@/features/training/LabelOodCard"
 import {
   C_LIMIT_MS,
   type Data,
@@ -1341,6 +1342,19 @@ function App() {
             {fmt(state.tube_alignment?.parallel_diff_deg, 1)}°）
           </span>
           <code>{String(state.tube_alignment?.fail_reason || "TUBE_ALIGN_FAIL")}</code>
+        </div>
+      )}
+
+      {!error && !state.hardware_fault_locked && !state.tube_align_failed && (state.ood_rejected || state.result_reason === "STATE_OOD_UNKNOWN") && (
+        <div className="banner studio-banner" role="alert">
+          <AlertTriangle size={16} aria-hidden="true" />
+          <span>
+            未知异常(OOD)门控拒识：
+            {reasonOf(state.ood_reason || state.result_reason || "STATE_OOD_UNKNOWN")}
+            （E={fmt(state.ood_energy, 2)} · Dₘ={fmt(state.ood_mahalanobis, 2)} · 连续{" "}
+            {Number(state.ood_streak || 0)} 帧）
+          </span>
+          <code>{String(state.ood_reason || state.result_reason || "STATE_OOD_UNKNOWN")}</code>
         </div>
       )}
 
@@ -3367,6 +3381,7 @@ function TrainDeployStep({
   const [bootstrapping, setBootstrapping] = useState(false)
 
   const [onnxFile, setOnnxFile] = useState<File | null>(null)
+  const [onnxInputHeight, setOnnxInputHeight] = useState("")
   const [importingOnnx, setImportingOnnx] = useState(false)
 
   const [name, setName] = useState("opencv-mlp-cpp-igbt")
@@ -3463,7 +3478,11 @@ function TrainDeployStep({
       .slice(0, 60)
     const headers: Record<string, string> = {
       "Content-Type": "application/octet-stream",
-      "X-Input-Size": String(Math.max(64, Math.min(320, Math.round(Number(inputSize) || 96)))),
+      "X-Input-Size": String(Math.max(32, Math.min(1024, Math.round(Number(inputSize) || 96)))),
+    }
+    const parsedHeight = Number(onnxInputHeight)
+    if (onnxInputHeight.trim() && Number.isInteger(parsedHeight) && parsedHeight >= 32 && parsedHeight <= 1024) {
+      headers["X-Input-Height"] = String(parsedHeight)
     }
     if (safeVersion) {
       headers["X-Model-Version"] = safeVersion
@@ -3701,6 +3720,8 @@ function TrainDeployStep({
             )}
           </div>
         </section>
+
+        <LabelOodCard state={state} token={token} flash={flash} onUpdated={onSaved} />
       </div>
 
       {/* 右侧超参与模型部署检查器 */}
@@ -3882,6 +3903,20 @@ function TrainDeployStep({
                     type="file"
                     accept=".onnx,application/octet-stream"
                     onChange={(e) => setOnnxFile(e.target.files?.[0] || null)}
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="onnx-import-height">可选输入高度（留空同宽，如 64）</label>
+                  <Input
+                    id="onnx-import-height"
+                    type="number"
+                    min="32"
+                    max="1024"
+                    step="1"
+                    value={onnxInputHeight}
+                    placeholder="默认同输入尺寸"
+                    onChange={(e) => setOnnxInputHeight(e.target.value)}
+                    className="mono"
                   />
                 </div>
                 <button type="submit" className="btn block" disabled={importingOnnx || !onnxFile}>

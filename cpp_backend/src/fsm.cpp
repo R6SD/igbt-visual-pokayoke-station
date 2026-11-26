@@ -57,6 +57,9 @@ void FSMConfig::validate() const {
     if (max_log_records < 1) {
         throw std::invalid_argument("Log retention limit must be positive.");
     }
+    if (ood_alarm_frames < 1) {
+        throw std::invalid_argument("OOD alarm frame threshold must be positive.");
+    }
 }
 
 namespace {
@@ -94,6 +97,10 @@ json FSMEvent::to_json() const {
         {"hand_in_left_grip_zone", hand_in_left_grip_zone},
         {"hand_in_right_grip_zone", hand_in_right_grip_zone},
         {"marker_detected", marker_detected},
+        {"ood_rejected", ood_rejected},
+        {"ood_energy", opt_to_json(ood_energy)},
+        {"ood_mahalanobis", opt_to_json(ood_mahalanobis)},
+        {"ood_reason", opt_to_json(ood_reason)},
         {"pipe_color", opt_to_json(pipe_color)},
         {"reason", opt_to_json(reason)},
         {"reset_authorized", reset_authorized},
@@ -365,6 +372,18 @@ std::string InspectionFSM::handle_observation(const FSMEvent& event, double now)
         transition_to(target, "VIEW_RESTORED", event.kind, now, event.capture_monotonic_s, event.frame_id);
     }
 
+    if (event.ood_rejected || event.label_class == "ood_unknown") {
+        clear_stability();
+        clear_c_timer();
+        ++ood_streak_;
+        if (ood_streak_ >= config_.ood_alarm_frames) {
+            transition_to(FSMState::ALARM, "STATE_OOD_UNKNOWN", event.kind, now, event.capture_monotonic_s, event.frame_id);
+            return "STATE_OOD_UNKNOWN";
+        }
+        return "OOD_GATE_HOLD";
+    }
+    ood_streak_ = 0;
+
     if (event.label_class == "unknown") {
         clear_stability();
         clear_c_timer();
@@ -596,6 +615,7 @@ void InspectionFSM::clear_cycle_data() {
     hand_left_start_.reset();
     hand_left_confirmed_ = false;
     resume_state_ = FSMState::VERIFY_INITIAL;
+    ood_streak_ = 0;
     clear_stability();
     clear_c_timer();
 }
@@ -710,6 +730,14 @@ ReasonExplanationZh explain_reason_zh(
         {"TUBE_ALIGN_FAIL", {"料管对齐失败：请摆正料管并避开中段强反光（已阻断放行）", "RANSAC 平行壁面拟合连续失败 ≥3 帧或几何门控越界，严禁回退无拉平分类"}},
         {"TUBE_ALIGN_LOW_CONF", {"料管姿态波动：暂借上一帧矩阵，请保持料管平稳以恢复核验", "料管对齐连续失败 ≤2 帧，复用上一有效矩阵并冻结 PASS 达标计时"}},
         {"WHITE_GLOVE_OVEREXPOSED", {"白色手套反光过强：请检查补光角度并确认合规佩戴", "白色 ESD 手套区域 V>=245 过曝占比超过 35%，已触发光学护栏告警"}},
+        {"STATE_OOD_UNKNOWN", {"异常闭锁：连续检出未知异常样本(OOD)，已连拍取证，请工程师复核", "连续达到阈值帧数触发 Energy/Mahalanobis OOD 双门控拒识，按故障安全原则闭锁报警"}},
+        {"OOD_GATE_HOLD", {"疑似未知异常样本(OOD)，已暂停放行计时并复核中", "单帧触发 OOD 双门控拒识，已清零稳定性与 1.2s 脱落计时"}},
+        {"OOD_PROB_LOW", {"标签分类置信度不足，已拒绝放行", "温度缩放后最大类别概率低于阈值 τ_p"}},
+        {"OOD_ENERGY_HIGH", {"标签能量分数越界（疑似未见异常或强干扰），已拒识", "LogSumExp Energy Score 高于标定阈值 τ_E"}},
+        {"OOD_MAHALANOBIS_HIGH", {"特征空间偏离已知分布（马氏距离超限），已拒识", "倒数第二层特征向量距最近已知类中心的 Mahalanobis 距离高于 τ_M"}},
+        {"OOD_DUAL_EXCEEDED", {"Energy 与 Mahalanobis 双门控同时越界，判定未知异常", "Energy Score 与特征马氏距离均超标定阈值"}},
+        {"OOD_CALIBRATION_SHA256_MISMATCH", {"OOD 标定参数与当前模型权重哈希不匹配，已拒绝加载", "ood_calibration.json 的 model_sha256 与当前激活模型不一致"}},
+        {"OOD_NON_FINITE", {"神经网络推理输出非有限数值，已安全拒识", "检测到 NaN/Inf logits 或特征张量"}},
         {"AUTHORIZED_RESET", {"人工复位完成，请放入下一支待检料管", "已执行授权复位，状态机回到 WAIT_PART"}},
         {"STRICT_MODE_REVERIFY_REQUIRED", {"已切换至车间严格模式，请重新放入料管执行完整核验", "从调试模式切入严格模式，已清除未闭锁调试周期状态"}},
     };

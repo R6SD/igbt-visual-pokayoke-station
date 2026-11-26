@@ -1,6 +1,5 @@
 #include "igbt/training_manager.hpp"
 
-#include <opencv2/dnn.hpp>
 #include <opencv2/ml.hpp>
 
 #include <algorithm>
@@ -24,7 +23,6 @@ constexpr const char* kManifestHeader =
     "sample_id,path,label,physical_tube_id,batch_id,video_group_id,pipe_color,box_xyxy,crop_box_xyxy,source_digest,captured_at_utc";
 
 constexpr std::size_t kMaxSampleUploadBytes = 10 * 1024 * 1024;
-constexpr std::size_t kMaxOnnxImportBytes = 64 * 1024 * 1024;
 constexpr int kMaxDecodedDimension = 8192;
 constexpr int64_t kMaxDecodedPixels = 33554432;
 
@@ -354,17 +352,6 @@ std::string sanitize_identifier(const std::string& raw, std::size_t max_len = 64
     }
     if (out == "." || out == "_") return {};
     return out;
-}
-
-bool is_strict_version_name(const std::string& s) {
-    if (s.empty() || s.size() > 64) return false;
-    if (s == "." || s == ".." || s.find("..") != std::string::npos) return false;
-    for (char c : s) {
-        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == '.')) {
-            return false;
-        }
-    }
-    return true;
 }
 
 std::pair<cv::Mat, Box> synthesize_roi_sample_with_box(
@@ -2841,256 +2828,89 @@ void TrainingManager::run_training_worker(
 json TrainingManager::import_onnx_bytes(
     const std::vector<uint8_t>& onnx_bytes,
     const std::string& version_name,
-    int input_size
+    int input_size,
+    int input_height
 ) {
-    if (onnx_bytes.empty()) {
-        throw std::invalid_argument("EMPTY_ONNX_MODEL_BYTES");
-    }
-    if (onnx_bytes.size() > kMaxOnnxImportBytes) {
-        throw std::invalid_argument("ONNX_MODEL_EXCEEDS_MAX_SIZE");
-    }
-    if (input_size < 32 || input_size > 1024) {
-        throw std::invalid_argument("INVALID_ONNX_INPUT_SIZE");
-    }
-
-    std::string clean_version = trim_copy(version_name);
-    if (!clean_version.empty() && !is_strict_version_name(clean_version)) {
-        throw std::invalid_argument("INVALID_MODEL_VERSION_NAME");
-    }
-
-    // Validate ONNX graph and run dummy 1x3xinput_sizexinput_size forward pass via OpenCV DNN
-    cv::Mat forward_out;
-    try {
-        cv::dnn::Net net = cv::dnn::readNetFromONNX(onnx_bytes);
-        if (net.empty()) {
-            throw std::invalid_argument("EMPTY_ONNX_NETWORK");
-        }
-        net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-        net.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
-
-        cv::Mat dummy_bgr(input_size, input_size, CV_8UC3, cv::Scalar(128, 128, 128));
-        cv::Mat blob = cv::dnn::blobFromImage(
-            dummy_bgr,
-            1.0 / 255.0,
-            cv::Size(input_size, input_size),
-            cv::Scalar(0.0, 0.0, 0.0),
-            true,
-            false,
-            CV_32F
-        );
-        net.setInput(blob);
-        forward_out = net.forward();
-    } catch (const std::invalid_argument&) {
-        throw;
-    } catch (const std::exception& ex) {
-        throw std::invalid_argument(std::string("INVALID_ONNX_MODEL:") + ex.what());
-    }
-
-    if (forward_out.empty() || forward_out.total() < kLabelClasses.size()) {
-        throw std::invalid_argument("ONNX_OUTPUT_CLASSES_MISMATCH");
-    }
-    cv::Mat flat_out;
-    forward_out.reshape(1, 1).convertTo(flat_out, CV_32F);
-    for (int i = 0; i < flat_out.cols; ++i) {
-        if (!std::isfinite(flat_out.at<float>(0, i))) {
-            throw std::invalid_argument("ONNX_NON_FINITE_DUMMY_OUTPUT");
-        }
-    }
-
-    const std::string onnx_sha = sha256_hex(onnx_bytes);
     const auto r_dir = runs_dir();
-    std::filesystem::path run_dir;
-    std::string allocated_version;
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (clean_version.empty()) {
-            std::tie(allocated_version, run_dir) = allocate_run_dir_unlocked("onnx_import");
-        } else {
-            allocated_version = clean_version;
-            run_dir = r_dir / path_from_utf8(allocated_version);
-            if (!is_path_within(r_dir, run_dir)) {
-                throw std::invalid_argument("ONNX_VERSION_OUTSIDE_RUNS_DIR");
-            }
-            std::error_code ec;
-            if (std::filesystem::exists(run_dir, ec)) {
-                allocated_version = clean_version + "_" + random_token_hex(2);
-                run_dir = r_dir / path_from_utf8(allocated_version);
-            }
-            std::filesystem::create_directories(run_dir, ec);
-            if (ec) {
-                throw std::runtime_error("Failed to create ONNX run directory: " + ec.message());
-            }
+    return training::OnnxModelRegistry::import_onnx_bytes(
+        r_dir,
+        onnx_bytes,
+        version_name,
+        input_size,
+        input_height,
+        [this](const std::string& prefix) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return allocate_run_dir_unlocked(prefix);
         }
-    }
-
-    const auto onnx_path = run_dir / L"label_classifier.onnx";
-    if (!write_file_bytes_atomic(onnx_path, onnx_bytes.data(), onnx_bytes.size())) {
-        throw std::runtime_error("Failed to persist label_classifier.onnx");
-    }
-
-    const std::string path_str = path_to_utf8(onnx_path);
-    const std::string now_iso = utc_now_iso();
-    const json metrics = json{
-        {"model_name", "onnx-imported-igbt"},
-        {"model_version", allocated_version},
-        {"architecture", "opencv_dnn_onnx"},
-        {"artifact_format", "onnx"},
-        {"input_size", input_size},
-        {"output_dim", flat_out.cols},
-        {"model_path", path_str},
-        {"onnx_path", path_str},
-        {"sha256", onnx_sha},
-        {"onnx_sha256", onnx_sha},
-        {"onnx_parity_ok", true},
-        {"onnx_parity_passed", true},
-        {"artifact_verified", true},
-        {"exported", true},
-        {"completed_at_utc", now_iso},
-    };
-
-    if (!write_json_atomic(run_dir / L"metrics.json", metrics)) {
-        throw std::runtime_error("Failed to persist ONNX metrics.json");
-    }
-
-    return metrics;
+    );
 }
 
 json TrainingManager::import_onnx_bytes(
     const std::string& onnx_bytes,
     const std::string& version_name,
-    int input_size
+    int input_size,
+    int input_height
 ) {
     const std::vector<uint8_t> vec(
         reinterpret_cast<const uint8_t*>(onnx_bytes.data()),
         reinterpret_cast<const uint8_t*>(onnx_bytes.data()) + onnx_bytes.size()
     );
-    return import_onnx_bytes(vec, version_name, input_size);
+    return import_onnx_bytes(vec, version_name, input_size, input_height);
 }
 
 std::vector<VerifiedModelRun> TrainingManager::find_verified_runs() const {
-    const auto r_dir = runs_dir();
-    std::error_code ec;
-    if (!std::filesystem::is_directory(r_dir, ec)) {
-        return {};
-    }
-
-    struct CandidateItem {
-        std::filesystem::file_time_type mtime;
-        VerifiedModelRun run;
-    };
-    std::vector<CandidateItem> items;
-
-    for (const auto& entry : std::filesystem::directory_iterator(r_dir, ec)) {
-        std::error_code d_ec;
-        if (!entry.is_directory(d_ec)) continue;
-        const auto sub_dir = entry.path();
-        if (!is_path_within(r_dir, sub_dir)) continue;
-
-        const auto metrics_path = sub_dir / L"metrics.json";
-        if (!std::filesystem::is_regular_file(metrics_path, d_ec)) continue;
-        const auto meta_opt = read_json_file(metrics_path);
-        if (!meta_opt.has_value() || !meta_opt->is_object()) continue;
-        const json& meta = *meta_opt;
-
-        // Require affirmative parity / verification flags
-        bool verified_flag = false;
-        for (const char* k : {"artifact_verified", "onnx_parity_ok", "onnx_parity_passed"}) {
-            if (meta.contains(k)) {
-                if (!meta[k].is_boolean() || !meta[k].get<bool>()) {
-                    verified_flag = false;
-                    break;
-                }
-                verified_flag = true;
-            }
-        }
-        if (!verified_flag) continue;
-
-        const auto xml_cand = sub_dir / L"label_classifier.xml";
-        const auto onnx_cand = sub_dir / L"label_classifier.onnx";
-        std::filesystem::path artifact_path;
-        std::string fmt;
-        const std::string declared_fmt = meta.value("artifact_format", "");
-
-        if (declared_fmt == "opencv_mlp" && std::filesystem::is_regular_file(xml_cand, d_ec)) {
-            artifact_path = xml_cand;
-            fmt = "opencv_mlp";
-        } else if (declared_fmt == "onnx" && std::filesystem::is_regular_file(onnx_cand, d_ec)) {
-            artifact_path = onnx_cand;
-            fmt = "onnx";
-        } else if (std::filesystem::is_regular_file(xml_cand, d_ec)) {
-            artifact_path = xml_cand;
-            fmt = "opencv_mlp";
-        } else if (std::filesystem::is_regular_file(onnx_cand, d_ec)) {
-            artifact_path = onnx_cand;
-            fmt = "onnx";
-        } else {
-            continue;
-        }
-
-        if (!is_path_within(r_dir, artifact_path)) continue;
-        const std::string actual_sha = to_lower_copy(sha256_file_hex(artifact_path));
-        if (actual_sha.size() != 64) continue;
-
-        std::string recorded_sha = meta.value("sha256", "");
-        if (recorded_sha.empty()) recorded_sha = meta.value("onnx_sha256", "");
-        recorded_sha = to_lower_copy(trim_copy(recorded_sha));
-        if (recorded_sha.empty() || !constant_time_equals(actual_sha, recorded_sha)) {
-            continue;
-        }
-
-        int in_sz = kDefaultInputSize;
-        if (meta.contains("input_size") && meta["input_size"].is_number_integer()) {
-            const int v = meta["input_size"].get<int>();
-            if (v >= 32 && v <= 1024) in_sz = v;
-        }
-
-        const auto mt = std::filesystem::last_write_time(artifact_path, d_ec);
-        if (d_ec) continue;
-
-        VerifiedModelRun run;
-        run.model_version = path_to_utf8(sub_dir.filename());
-        run.model_name = meta.value("model_name", fmt == "opencv_mlp" ? "opencv-mlp-cpp-igbt" : "mobilenetv3-small-igbt-roi");
-        run.artifact_format = fmt;
-        run.model_path = artifact_path;
-        run.sha256 = actual_sha;
-        run.input_size = in_sz;
-        run.metrics = meta;
-
-        items.push_back(CandidateItem{mt, std::move(run)});
-    }
-
-    std::sort(items.begin(), items.end(), [](const CandidateItem& a, const CandidateItem& b) {
-        if (a.mtime != b.mtime) return a.mtime > b.mtime;
-        return a.run.model_version > b.run.model_version;
-    });
-
-    std::vector<VerifiedModelRun> result;
-    result.reserve(items.size());
-    for (auto& it : items) {
-        result.push_back(std::move(it.run));
-    }
-    return result;
+    return training::OnnxModelRegistry::find_verified_runs(runs_dir());
 }
 
 std::optional<VerifiedModelRun> TrainingManager::resolve_verified_run(
     const std::string& model_version,
     const std::string& expected_sha256
 ) const {
-    const std::string clean_ver = trim_copy(model_version);
-    if (!is_strict_version_name(clean_ver)) return std::nullopt;
-    const std::string clean_sha = to_lower_copy(trim_copy(expected_sha256));
+    return training::OnnxModelRegistry::resolve_verified_run(runs_dir(), model_version, expected_sha256);
+}
 
-    const auto runs = find_verified_runs();
-    for (const auto& r : runs) {
-        if (r.model_version == clean_ver) {
-            if (!clean_sha.empty() && !constant_time_equals(r.sha256, clean_sha)) {
-                return std::nullopt;
-            }
-            return r;
-        }
+std::vector<std::pair<cv::Mat, int>> TrainingManager::collect_ood_calibration_crops(int max_per_class) const {
+    const int limit = std::clamp(max_per_class, 1, 2000);
+    std::vector<ManifestRow> rows;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        rows = read_manifest_rows_unlocked();
     }
-    return std::nullopt;
+
+    std::array<int, 4> id_counts{0, 0, 0, 0};
+    int ood_count = 0;
+    std::vector<std::pair<cv::Mat, int>> out;
+
+    for (const auto& r : rows) {
+        int cls_idx = label_class_index(r.label);
+        if (cls_idx >= 0 && cls_idx < 4) {
+            if (id_counts[static_cast<std::size_t>(cls_idx)] >= limit) continue;
+        } else if (r.label == kChallengeLabel) {
+            cls_idx = -1;
+            if (ood_count >= limit) continue;
+        } else {
+            continue;
+        }
+
+        if (r.abs_path.empty()) continue;
+        cv::Mat img = imread_unicode(r.abs_path, cv::IMREAD_COLOR);
+        if (img.empty()) continue;
+
+        if (cls_idx >= 0) {
+            ++id_counts[static_cast<std::size_t>(cls_idx)];
+        } else {
+            ++ood_count;
+        }
+        out.emplace_back(std::move(img), cls_idx);
+    }
+    return out;
+}
+
+std::filesystem::path TrainingManager::save_ood_calibration_for_version(
+    const std::string& model_version,
+    const vision::OodCalibration& cal
+) const {
+    return training::OnnxModelRegistry::save_ood_calibration(runs_dir(), model_version, cal);
 }
 
 }  // namespace igbt

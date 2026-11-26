@@ -91,7 +91,9 @@ public:
 
     bool try_consume_live_verdict(
         const std::string& outcome,
-        const std::string& evidence_dir = ""
+        const std::string& evidence_dir = "",
+        std::optional<double> ood_energy = std::nullopt,
+        std::optional<double> ood_mahalanobis = std::nullopt
     );
 
     json unlock_hard_lock(
