@@ -15,6 +15,7 @@
 #include "igbt/database.hpp"
 #include "igbt/hal/adam_modbus_dio.hpp"
 #include "igbt/industrial_hal.hpp"
+#include "igbt/mes/mes_sync_worker.hpp"
 #include "igbt/red_rabbit.hpp"
 #include "igbt/training_manager.hpp"
 #include "igbt/vision_engine.hpp"
@@ -83,6 +84,7 @@ struct StationServerOptions {
     bool enable_live_camera{false};
     std::string initial_work_mode{"strict"};
     std::optional<AdamModbusConfig> adam_config;
+    std::optional<MesClientConfig> mes_config;
 };
 
 class StationHttpServer {
@@ -116,7 +118,9 @@ public:
     RedRabbitController& red_rabbit() noexcept { return red_rabbit_; }
     const RedRabbitController& red_rabbit() const noexcept { return red_rabbit_; }
     const IDioInterlock& interlock() const noexcept { return *interlock_; }
-    const IMesClient& mes_client() const noexcept { return mes_client_; }
+    const IMesClient& mes_client() const noexcept { return *mes_worker_; }
+    MesSyncWorker& mes_worker() noexcept { return *mes_worker_; }
+    const MesSyncWorker& mes_worker() const noexcept { return *mes_worker_; }
     httplib::Server& raw_server() noexcept { return svr_; }
 
     static constexpr int kMaxConcurrentMjpegStreams = 6;
@@ -151,7 +155,7 @@ private:
     StationServerOptions options_;
     EngineerSessionAuth auth_;
     std::unique_ptr<IDioInterlock> interlock_;
-    OfflineNoopMesClient mes_client_;
+    std::unique_ptr<MesSyncWorker> mes_worker_;
     RedRabbitController red_rabbit_;
 
     void start_maintenance_thread();

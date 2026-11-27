@@ -3217,6 +3217,577 @@ void test_v45_onnx_label_ood_dual_gate_and_registry() {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Test 13: v4.6 MES Transactional Outbox, Lot Anti-Mix & Graded Offline Degradation
+// ----------------------------------------------------------------------------
+struct CapturedMesPassRequest {
+    std::string idempotency_key;
+    std::string station_id;
+    json body;
+};
+
+class MockMesGateway {
+public:
+    enum class Mode {
+        ONLINE_OK,
+        OFFLINE_503,
+        LOT_HOLD_RECALL,
+        DUPLICATE_409,
+    };
+
+    MockMesGateway() {
+        svr_.Get("/api/mes/v1/heartbeat", [this](const httplib::Request&, httplib::Response& res) {
+            const Mode m = mode.load();
+            if (m == Mode::OFFLINE_503) {
+                res.status = 503;
+                res.set_content(R"({"ok":false,"detail":"MES_MAINTENANCE"})", "application/json");
+                return;
+            }
+            if (m == Mode::LOT_HOLD_RECALL) {
+                res.status = 200;
+                res.set_content(
+                    R"({"ok":true,"lot_status":"HOLD","reason":"QE_HOLD_FROM_MES"})",
+                    "application/json"
+                );
+                return;
+            }
+            res.status = 200;
+            res.set_content(R"({"ok":true,"lot_status":"ACTIVE"})", "application/json");
+        });
+
+        svr_.Post("/api/mes/v1/lots/validate", [this](const httplib::Request& req, httplib::Response& res) {
+            const Mode m = mode.load();
+            if (m == Mode::OFFLINE_503) {
+                res.status = 503;
+                res.set_content(R"({"ok":false,"detail":"MES_OFFLINE"})", "application/json");
+                return;
+            }
+            json body = json::object();
+            try {
+                body = json::parse(req.body);
+            } catch (...) {
+            }
+            const std::string lot_id = body.value("lot_id", "");
+            const std::string wo_id = body.value("work_order_id", "");
+            const std::string part = body.value("part_number", "IGBT-TO247");
+            const std::string color = body.value("expected_pipe_color", "yellow");
+            if (m == Mode::LOT_HOLD_RECALL) {
+                res.status = 200;
+                res.set_content(
+                    json{
+                        {"ok", true},
+                        {"allowed", false},
+                        {"lot_status", "HOLD"},
+                        {"work_order_id", wo_id},
+                        {"lot_id", lot_id},
+                        {"reason", "LOT_ON_HOLD"},
+                    }
+                        .dump(),
+                    "application/json"
+                );
+                return;
+            }
+            res.status = 200;
+            res.set_content(
+                json{
+                    {"ok", true},
+                    {"allowed", true},
+                    {"lot_status", "ACTIVE"},
+                    {"work_order_id", wo_id},
+                    {"lot_id", lot_id},
+                    {"part_number", part.empty() ? "IGBT-TO247" : part},
+                    {"expected_pipe_color", color.empty() ? "yellow" : color},
+                }
+                    .dump(),
+                "application/json"
+            );
+        });
+
+        svr_.Post("/api/mes/v1/pass_records", [this](const httplib::Request& req, httplib::Response& res) {
+            const Mode m = mode.load();
+            if (m == Mode::OFFLINE_503) {
+                res.status = 503;
+                res.set_content(R"({"ok":false,"detail":"MES_OFFLINE"})", "application/json");
+                return;
+            }
+            json parsed = json::object();
+            try {
+                parsed = json::parse(req.body);
+            } catch (...) {
+            }
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                captured_.push_back(CapturedMesPassRequest{
+                    req.has_header("X-Idempotency-Key") ? req.get_header_value("X-Idempotency-Key") : "",
+                    req.has_header("X-Station-ID") ? req.get_header_value("X-Station-ID") : "",
+                    parsed,
+                });
+            }
+            if (m == Mode::DUPLICATE_409) {
+                res.status = 409;
+                res.set_content(
+                    R"({"ok":false,"duplicate":true,"already_acked":true})",
+                    "application/json"
+                );
+                return;
+            }
+            if (m == Mode::LOT_HOLD_RECALL) {
+                res.status = 200;
+                res.set_content(
+                    json{
+                        {"ok", true},
+                        {"lot_status", "HOLD"},
+                        {"lot_id", parsed.value("lot_id", "")},
+                        {"work_order_id", parsed.value("work_order_id", "")},
+                        {"reason", "MES_REMOTE_HOLD_RECALL"},
+                    }
+                        .dump(),
+                    "application/json"
+                );
+                return;
+            }
+            res.status = 200;
+            res.set_content(R"({"ok":true,"lot_status":"ACTIVE"})", "application/json");
+        });
+
+        port_ = svr_.bind_to_any_port("127.0.0.1");
+        REQUIRE(port_ > 0);
+        thread_ = std::thread([this]() { svr_.listen_after_bind(); });
+        for (int i = 0; i < 60 && !svr_.is_running(); ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        REQUIRE(svr_.is_running());
+    }
+
+    ~MockMesGateway() {
+        svr_.stop();
+        if (thread_.joinable()) thread_.join();
+    }
+
+    int port() const noexcept { return port_; }
+
+    std::vector<CapturedMesPassRequest> captured_snapshot() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return captured_;
+    }
+
+    std::atomic<Mode> mode{Mode::ONLINE_OK};
+
+private:
+    httplib::Server svr_;
+    int port_{0};
+    std::thread thread_;
+    mutable std::mutex mu_;
+    std::vector<CapturedMesPassRequest> captured_;
+};
+
+void test_v46_mes_outbox_antimix_and_degradation() {
+    MockMesGateway mock;
+    ScopedTempDir tmp;
+    const auto web_dir = tmp.path() / "web_dist";
+    std::filesystem::create_directories(web_dir);
+    const std::string html = "<!doctype html><html><body>MES v4.6 OK</body></html>";
+    REQUIRE(write_file_bytes_atomic(web_dir / "index.html", html.data(), html.size()));
+
+    StationDatabase db(tmp.path());
+    LiveCameraEngine cam(0);
+    TrainingManager training(tmp.path());
+
+    StationServerOptions opts;
+    opts.host = "127.0.0.1";
+    opts.port = 0;
+    opts.data_dir = tmp.path();
+    opts.web_dist_dir = web_dir;
+    opts.enable_live_camera = false;
+
+    std::atomic<int64_t> fake_clock_ms{1764200000000LL};
+    StationHttpServer server(db, cam, training, opts);
+    server.red_rabbit().set_wall_clock_for_test([&]() { return fake_clock_ms.load(); });
+    server.mes_worker().set_wall_clock_for_test([&]() { return fake_clock_ms.load(); });
+    server.auth().set_env_override("IGBT_ENGINEER_PIN", "271828");
+
+    const int port = server.start_background();
+    REQUIRE(port > 0);
+    httplib::Client cli("127.0.0.1", port);
+
+    auto run_rr_challenge = [&]() {
+        auto s_res = cli.Post(
+            "/api/red_rabbit/sessions/start",
+            R"({"operator_id":"OP_46","lot_id":"LOT_RR_46"})",
+            "application/json"
+        );
+        REQUIRE(s_res != nullptr && s_res->status == 200);
+        json sj = json::parse(s_res->body);
+        const std::string sid = sj["session"].value("session_id", "");
+        const json& plan = sj["session"]["required_plan"];
+        REQUIRE_EQ(plan.size(), 3u);
+        json last_resp;
+        for (const auto& step : plan) {
+            const std::string suid = step.value("sample_uid", "");
+            const std::string exp = step.value("expected_verdict", "");
+            REQUIRE_EQ(
+                cli.Post("/api/red_rabbit/sessions/" + sid + "/arm", json{{"sample_uid", suid}}.dump(), "application/json")->status,
+                200
+            );
+            auto a_res = cli.Post(
+                "/api/red_rabbit/sessions/" + sid + "/attempt",
+                json{{"sample_uid", suid}, {"actual_verdict", exp}}.dump(),
+                "application/json"
+            );
+            REQUIRE(a_res != nullptr && a_res->status == 200);
+            last_resp = json::parse(a_res->body);
+        }
+        REQUIRE_EQ(last_resp.value("state", ""), "PROD_READY");
+    };
+
+    // 13A. Default disabled MES -> silent local compatibility
+    {
+        auto st_res = cli.Get("/api/mes/status");
+        REQUIRE(st_res != nullptr && st_res->status == 200);
+        const json sj = json::parse(st_res->body);
+        REQUIRE_EQ(sj.value("enabled", true), false);
+        REQUIRE_EQ(sj.value("blocking", true), false);
+        REQUIRE_EQ(sj.value("degradation_mode", ""), "DISABLED");
+    }
+    run_rr_challenge();
+
+    auto pin_res = cli.Post("/api/auth/verify", R"({"passcode":"271828"})", "application/json");
+    REQUIRE(pin_res != nullptr && pin_res->status == 200);
+    const std::string admin_tok = json::parse(pin_res->body).value("admin_token", "");
+    httplib::Headers admin_hdrs = {{"X-Admin-Token", admin_tok}};
+
+    // 13B. Enable MES -> unbound lot blocks PASS; online bind signs lot + triggers RedRabbit LOT_CHANGE; pipe-color anti-mix
+    {
+        const json cfg_body{
+            {"enabled", true},
+            {"base_url", "http://127.0.0.1:" + std::to_string(mock.port())},
+            {"station_id", "STATION_01"},
+            {"heartbeat_period_ms", 60000},
+            {"heartbeat_fail_lock_ms", 60000},
+            {"outbox_poll_ms", 30000},
+        };
+        auto cfg_res = cli.Post("/api/mes/config", admin_hdrs, cfg_body.dump(), "application/json");
+        REQUIRE(cfg_res != nullptr && cfg_res->status == 200);
+        const json cfg_j = json::parse(cfg_res->body);
+        REQUIRE_EQ(cfg_j.value("enabled", false), true);
+        REQUIRE_EQ(cfg_j.value("lot_bound", true), false);
+        REQUIRE_EQ(cfg_j.value("blocking", false), true);
+        REQUIRE_EQ(cfg_j.value("block_reason", ""), "MES_LOT_UNBOUND_LOCK");
+
+        auto bind_res = cli.Post(
+            "/api/mes/lot/bind",
+            admin_hdrs,
+            R"({"work_order_id":"WO-46-01","lot_id":"LOT-YEL-01","part_number":"IGBT-1200V","expected_pipe_color":"yellow","actor_id":"OP_46"})",
+            "application/json"
+        );
+        REQUIRE(bind_res != nullptr && bind_res->status == 200);
+        const json bind_j = json::parse(bind_res->body);
+        REQUIRE_EQ(bind_j.value("lot_bound", false), true);
+        REQUIRE_EQ(bind_j.value("signature_valid", false), true);
+        REQUIRE_EQ(bind_j.value("lot_changed", false), true);
+        REQUIRE_EQ(bind_j.value("red_rabbit_triggered", false), true);
+        REQUIRE(server.red_rabbit().state() == RedRabbitState::CHALLENGE_REQUIRED);
+
+        auto rr_st = cli.Get("/api/red_rabbit/status");
+        REQUIRE(rr_st != nullptr && rr_st->status == 200);
+        REQUIRE_EQ(json::parse(rr_st->body).value("trigger_reason", ""), "LOT_CHANGE");
+
+        run_rr_challenge();
+
+        REQUIRE_EQ(server.mes_worker().check_pipe_color_mismatch("yellow"), false);
+        REQUIRE_EQ(server.mes_worker().check_pipe_color_mismatch("blue"), true);
+
+        json blue_snap{
+            {"cycle_id", "CYC_BLUE_BAD"},
+            {"state_source", "simulated"},
+            {"camera_status", "ONLINE"},
+            {"outcome", "PASS"},
+            {"fsm_state", "PASS"},
+            {"pipe_color", "blue"},
+            {"label_status", "crossed_out"},
+            {"view_valid", true},
+            {"quality_ok", true},
+        };
+        db.set_persisted_station_state(blue_snap);
+        auto st_mismatch = cli.Get("/api/state");
+        REQUIRE(st_mismatch != nullptr && st_mismatch->status == 200);
+        const json mm_j = json::parse(st_mismatch->body);
+        REQUIRE_EQ(mm_j.value("mes_pipe_color_mismatch", false), true);
+        REQUIRE_EQ(mm_j.value("outcome", ""), "ALARM");
+        REQUIRE_EQ(mm_j.value("result_reason", ""), "MES_PIPE_COLOR_MISMATCH");
+
+        db.set_persisted_station_state(StationDatabase::default_station_state());
+    }
+
+    // 13C. Transactional Outbox atomic commit, duplicate idempotency ignore, exact header/body match & 409 duplicate ACK
+    {
+        json pass_snap{
+            {"cycle_id", "LIVE_MES_01"},
+            {"transition_event_id", "EVT_MES_01"},
+            {"outcome", "PASS"},
+            {"fsm_state", "PASS"},
+            {"pipe_color", "yellow"},
+            {"label_status", "crossed_out"},
+            {"model_version", "v46_test"},
+        };
+        auto req1 = server.mes_worker().prepare_cycle_outbox_request(pass_snap, "sha_v46");
+        REQUIRE(req1.has_value());
+        REQUIRE_EQ(
+            req1->idempotency_key,
+            compute_mes_idempotency_key("STATION_01", "LOT-YEL-01", "EVT_MES_01", req1->tube_seq)
+        );
+        REQUIRE(db.record_live_transition(pass_snap, std::string("INSPECTING"), {}, req1));
+
+        // Duplicate enqueue with identical idempotency_key must be safely ignored
+        (void)db.mes_enqueue_outbox(*req1);
+        REQUIRE_EQ(db.mes_outbox_counts().value("total", 0), 1);
+        REQUIRE_EQ(db.mes_outbox_counts().value("pending", 0), 1);
+
+        auto fl_res = cli.Post("/api/mes/outbox/flush", admin_hdrs, "{}", "application/json");
+        REQUIRE(fl_res != nullptr && fl_res->status == 200);
+        const json fl_j = json::parse(fl_res->body);
+        REQUIRE_EQ(fl_j["outbox_counts"].value("acked", 0), 1);
+        REQUIRE_EQ(fl_j["outbox_counts"].value("pending", 1), 0);
+
+        const auto cap = mock.captured_snapshot();
+        REQUIRE_EQ(cap.size(), 1u);
+        REQUIRE_EQ(cap[0].idempotency_key, req1->idempotency_key);
+        REQUIRE_EQ(cap[0].body.value("event_id", ""), req1->idempotency_key);
+        REQUIRE_EQ(cap[0].body.value("lot_id", ""), "LOT-YEL-01");
+
+        // 409 duplicate=true idempotent ACK
+        mock.mode.store(MockMesGateway::Mode::DUPLICATE_409);
+        json pass_snap2{
+            {"cycle_id", "LIVE_MES_02"},
+            {"transition_event_id", "EVT_MES_02"},
+            {"outcome", "PASS"},
+            {"fsm_state", "PASS"},
+            {"pipe_color", "yellow"},
+            {"label_status", "covered"},
+        };
+        auto req2 = server.mes_worker().prepare_cycle_outbox_request(pass_snap2, "sha_v46");
+        REQUIRE(req2.has_value());
+        REQUIRE(db.record_live_transition(pass_snap2, std::string("INSPECTING"), {}, req2));
+        auto fl_res2 = cli.Post("/api/mes/outbox/flush", admin_hdrs, "{}", "application/json");
+        REQUIRE(fl_res2 != nullptr && fl_res2->status == 200);
+        REQUIRE_EQ(json::parse(fl_res2->body)["outbox_counts"].value("acked", 0), 2);
+        mock.mode.store(MockMesGateway::Mode::ONLINE_OK);
+    }
+
+    // 13D. Offline > 60s -> Fail-Closed MES_HEARTBEAT_TIMEOUT lock, audit entry & offline lot change 409
+    {
+        mock.mode.store(MockMesGateway::Mode::OFFLINE_503);
+        auto fl_off0 = cli.Post("/api/mes/outbox/flush", admin_hdrs, "{}", "application/json");
+        REQUIRE(fl_off0 != nullptr && fl_off0->status == 200);
+        const json j0 = json::parse(fl_off0->body);
+        REQUIRE_EQ(j0.value("connected", true), false);
+        REQUIRE_EQ(j0.value("offline_locked", true), false);
+
+        auto bad_bind = cli.Post(
+            "/api/mes/lot/bind",
+            admin_hdrs,
+            R"({"work_order_id":"WO-46-02","lot_id":"LOT-YEL-02","expected_pipe_color":"yellow"})",
+            "application/json"
+        );
+        REQUIRE(bad_bind != nullptr && bad_bind->status == 409);
+        REQUIRE_EQ(json::parse(bad_bind->body).value("detail", ""), "MES_OFFLINE_LOT_CHANGE_FORBIDDEN");
+
+        fake_clock_ms.fetch_add(61000LL);
+        auto fl_off1 = cli.Post("/api/mes/outbox/flush", admin_hdrs, "{}", "application/json");
+        REQUIRE(fl_off1 != nullptr && fl_off1->status == 200);
+        const json j1 = json::parse(fl_off1->body);
+        REQUIRE_EQ(j1.value("offline_locked", false), true);
+        REQUIRE_EQ(j1.value("blocking", false), true);
+        REQUIRE_EQ(j1.value("block_reason", ""), "MES_HEARTBEAT_TIMEOUT");
+        REQUIRE_EQ(j1.value("degradation_mode", ""), "FAIL_CLOSED_LOCKED");
+
+        auto aud_res = cli.Get("/api/red_rabbit/audit");
+        REQUIRE(aud_res != nullptr && aud_res->status == 200);
+        const json aud_j = json::parse(aud_res->body);
+        REQUIRE_EQ(aud_j["chain_verification"].value("valid", false), true);
+        bool found_off_lock = false;
+        for (const auto& row : aud_j["lock_audit"]) {
+            if (row.value("event_type", "") == "MES_OFFLINE_LOCK" &&
+                row.value("reason_code", "") == "MES_HEARTBEAT_TIMEOUT") {
+                found_off_lock = true;
+                break;
+            }
+        }
+        REQUIRE(found_off_lock);
+    }
+
+    // 13E. QE Controlled Whitelist: clamp 999/120 -> 50/30, quota=2 lock & duration>30m lock
+    {
+        auto wl_clamp = cli.Post(
+            "/api/mes/whitelist",
+            admin_hdrs,
+            R"({"approved":true,"actor_id":"QE_46","actor_role":"QE","max_tubes":999,"max_duration_minutes":120,"reason":"Core switch maintenance"})",
+            "application/json"
+        );
+        REQUIRE(wl_clamp != nullptr && wl_clamp->status == 200);
+        const json wc_j = json::parse(wl_clamp->body);
+        REQUIRE_EQ(wc_j["whitelist"].value("max_tubes", 0), 50);
+        REQUIRE_EQ(wc_j["whitelist"].value("max_duration_ms", int64_t{0}), int64_t{1800000});
+
+        auto wl_two = cli.Post(
+            "/api/mes/whitelist",
+            admin_hdrs,
+            R"({"approved":true,"actor_id":"QE_46","actor_role":"QE","max_tubes":2,"max_duration_minutes":30,"reason":"Controlled 2 tubes"})",
+            "application/json"
+        );
+        REQUIRE(wl_two != nullptr && wl_two->status == 200);
+        const json wt_j = json::parse(wl_two->body);
+        REQUIRE_EQ(wt_j.value("blocking", true), false);
+        REQUIRE_EQ(wt_j.value("degradation_mode", ""), "WHITELIST_ACTIVE");
+
+        // Offline lot change MUST remain forbidden even with whitelist active
+        auto bad_bind2 = cli.Post(
+            "/api/mes/lot/bind",
+            admin_hdrs,
+            R"({"work_order_id":"WO-46-02","lot_id":"LOT-YEL-02","expected_pipe_color":"yellow"})",
+            "application/json"
+        );
+        REQUIRE(bad_bind2 != nullptr && bad_bind2->status == 409);
+
+        // Offline tube #1 -> allowed
+        json off1{
+            {"cycle_id", "LIVE_OFF_01"},
+            {"transition_event_id", "EVT_OFF_01"},
+            {"outcome", "PASS"},
+            {"fsm_state", "PASS"},
+            {"pipe_color", "yellow"},
+        };
+        auto oreq1 = server.mes_worker().prepare_cycle_outbox_request(off1, "sha_v46");
+        REQUIRE(oreq1.has_value());
+        REQUIRE(oreq1->increment_offline_used);
+        REQUIRE(db.record_live_transition(off1, std::string("INSPECTING"), {}, oreq1));
+        server.mes_worker().evaluate_offline_policy_now();
+        REQUIRE_EQ(server.mes_worker().is_blocking(), false);
+        REQUIRE_EQ(server.mes_worker().status_json()["whitelist"].value("remaining_tubes", -1), 1);
+
+        // Offline tube #2 -> hits max_tubes=2 and locks
+        json off2{
+            {"cycle_id", "LIVE_OFF_02"},
+            {"transition_event_id", "EVT_OFF_02"},
+            {"outcome", "PASS"},
+            {"fsm_state", "PASS"},
+            {"pipe_color", "yellow"},
+        };
+        auto oreq2 = server.mes_worker().prepare_cycle_outbox_request(off2, "sha_v46");
+        REQUIRE(oreq2.has_value());
+        REQUIRE(db.record_live_transition(off2, std::string("INSPECTING"), {}, oreq2));
+        server.mes_worker().evaluate_offline_policy_now();
+        REQUIRE_EQ(server.mes_worker().is_blocking(), true);
+        REQUIRE_EQ(server.mes_worker().block_reason(), "MES_WHITELIST_QUOTA_EXCEEDED");
+
+        // Duration > 30 min -> locks on duration limit even if count reset
+        db.mes_reset_offline_usage(fake_clock_ms.load());
+        fake_clock_ms.fetch_add(31LL * 60 * 1000);
+        server.mes_worker().evaluate_offline_policy_now();
+        REQUIRE_EQ(server.mes_worker().is_blocking(), true);
+        REQUIRE_EQ(server.mes_worker().block_reason(), "MES_WHITELIST_DURATION_EXCEEDED");
+    }
+
+    // 13F. Reconnect with LOT_HOLD_RECALL -> persistent recall lock, 401 guard, QE unlock & hash-chain verification
+    {
+        mock.mode.store(MockMesGateway::Mode::LOT_HOLD_RECALL);
+        auto fl_rec = cli.Post("/api/mes/outbox/flush", admin_hdrs, "{}", "application/json");
+        REQUIRE(fl_rec != nullptr && fl_rec->status == 200);
+        const json rec_j = json::parse(fl_rec->body);
+        REQUIRE_EQ(rec_j.value("recall_locked", false), true);
+        REQUIRE_EQ(rec_j.value("blocking", false), true);
+        REQUIRE_EQ(rec_j.value("block_reason", ""), "MES_LOT_HOLD_RECALL");
+        REQUIRE_EQ(rec_j.value("degradation_mode", ""), "RECALL_LOCKED");
+        REQUIRE(!rec_j["recall"]["affected_keys"].empty());
+
+        // Survives worker restart / reload on same SQLite DB
+        MesSyncWorker reloaded_worker(
+            db,
+            server.mes_worker().config(),
+            tmp.path() / "mes_config.json",
+            [&]() { return fake_clock_ms.load(); }
+        );
+        REQUIRE_EQ(reloaded_worker.is_recall_locked(), true);
+        REQUIRE_EQ(reloaded_worker.block_reason(), "MES_LOT_HOLD_RECALL");
+
+        mock.mode.store(MockMesGateway::Mode::ONLINE_OK);
+        auto unauth_unlock = cli.Post(
+            "/api/mes/recall/unlock",
+            R"({"actor_id":"QE_46","actor_role":"QE","reason_code":"MES_RECALL_QUARANTINED","comment":"Quarantined tubes"})",
+            "application/json"
+        );
+        REQUIRE(unauth_unlock != nullptr && unauth_unlock->status == 401);
+
+        auto auth_unlock = cli.Post(
+            "/api/mes/recall/unlock",
+            admin_hdrs,
+            R"({"actor_id":"QE_46","actor_role":"QE","reason_code":"MES_RECALL_QUARANTINED","comment":"Quarantined 4 tubes and cleared hold"})",
+            "application/json"
+        );
+        REQUIRE(auth_unlock != nullptr && auth_unlock->status == 200);
+        REQUIRE_EQ(json::parse(auth_unlock->body).value("recall_locked", true), false);
+
+        auto aud_res = cli.Get("/api/red_rabbit/audit");
+        REQUIRE(aud_res != nullptr && aud_res->status == 200);
+        REQUIRE_EQ(json::parse(aud_res->body)["chain_verification"].value("valid", false), true);
+    }
+
+    // 13G. Stale IN_FLIGHT crash recovery & DEAD_LETTER manual requeue
+    {
+        json crash_snap{
+            {"cycle_id", "LIVE_CRASH_01"},
+            {"transition_event_id", "EVT_CRASH_01"},
+            {"outcome", "PASS"},
+            {"fsm_state", "PASS"},
+            {"pipe_color", "yellow"},
+        };
+        auto creq = server.mes_worker().prepare_cycle_outbox_request(crash_snap, "sha_v46");
+        REQUIRE(creq.has_value());
+        (void)db.mes_enqueue_outbox(*creq);
+
+        auto claimed = db.mes_claim_next_pending(fake_clock_ms.load(), 5000);
+        REQUIRE(claimed.has_value());
+        REQUIRE_EQ(claimed->value("status", ""), "IN_FLIGHT");
+
+        // Flush before lease expires must NOT re-claim yet
+        const std::size_t before_cnt = mock.captured_snapshot().size();
+        (void)server.mes_worker().tick_once(true);
+        REQUIRE_EQ(mock.captured_snapshot().size(), before_cnt);
+
+        // Advance past stale_inflight_ms=5000 -> re-claims & delivers identical X-Idempotency-Key
+        fake_clock_ms.fetch_add(6000LL);
+        (void)server.mes_worker().tick_once(true);
+        const auto after_cap = mock.captured_snapshot();
+        REQUIRE_EQ(after_cap.size(), before_cnt + 1);
+        REQUIRE_EQ(after_cap.back().idempotency_key, creq->idempotency_key);
+
+        // DEAD_LETTER requeue flow
+        json dlq_snap{
+            {"cycle_id", "LIVE_DLQ_01"},
+            {"transition_event_id", "EVT_DLQ_01"},
+            {"outcome", "PASS"},
+            {"fsm_state", "PASS"},
+            {"pipe_color", "yellow"},
+        };
+        auto dreq = server.mes_worker().prepare_cycle_outbox_request(dlq_snap, "sha_v46");
+        REQUIRE(dreq.has_value());
+        const json inserted = db.mes_enqueue_outbox(*dreq);
+        const int64_t dlq_id = inserted["id"].get<int64_t>();
+        db.mes_mark_retry(dlq_id, 500, "SIMULATED_GATEWAY_ERR", fake_clock_ms.load(), true);
+        REQUIRE_EQ(db.mes_outbox_counts().value("dead_letter", 0), 1);
+
+        auto rq_res = cli.Post("/api/mes/outbox/" + std::to_string(dlq_id) + "/requeue", admin_hdrs, "{}", "application/json");
+        REQUIRE(rq_res != nullptr && rq_res->status == 200);
+        REQUIRE_EQ(json::parse(rq_res->body)["item"].value("status", ""), "PENDING");
+
+        auto fl_dlq = cli.Post("/api/mes/outbox/flush", admin_hdrs, "{}", "application/json");
+        REQUIRE(fl_dlq != nullptr && fl_dlq->status == 200);
+        REQUIRE_EQ(json::parse(fl_dlq->body)["outbox_counts"].value("dead_letter", 1), 0);
+    }
+
+    server.stop();
+}
+
 }  // namespace
 
 int main() {
@@ -3239,6 +3810,7 @@ int main() {
         {"10. v4.3 ADAM-6050/6060 Native Winsock2 Modbus TCP Watchdog & Fail-Safe", test_adam_modbus_dio_watchdog_and_failsafe},
         {"11. v4.4 P0-3 RANSAC Tube Alignment, TUBE_ALIGN_FAIL Gate, NanoDet GFL & 2/10 Hysteresis", test_v44_ransac_alignment_nanodet_and_hysteresis},
         {"12. v4.5 ONNX Label Classifier, Energy/Mahalanobis Dual-Gate OOD & Model Registry", test_v45_onnx_label_ood_dual_gate_and_registry},
+        {"13. v4.6 MES Transactional Outbox, Lot Anti-Mix & Graded Offline Degradation", test_v46_mes_outbox_antimix_and_degradation},
     };
 
     int passed = 0;

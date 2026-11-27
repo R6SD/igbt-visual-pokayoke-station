@@ -32,8 +32,10 @@ set(IGBT_CORE_SOURCES
     src/training/onnx_model_registry.cpp
     src/database.cpp
     src/db/red_rabbit_audit_repo.cpp
+    src/db/mes_outbox_repo.cpp
     src/red_rabbit.cpp
     src/hal/adam_modbus_dio.cpp
+    src/mes/mes_sync_worker.cpp
     src/http_server.cpp
 )
 

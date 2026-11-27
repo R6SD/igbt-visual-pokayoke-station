@@ -161,6 +161,17 @@ const reasonText: Record<string, string> = {
   OOD_DUAL_EXCEEDED: "OOD 双门控：Energy 与 Mahalanobis 同时越界",
   OOD_CALIBRATION_SHA256_MISMATCH: "OOD 标定文件与当前模型哈希不匹配",
   OOD_NON_FINITE: "神经网络输出存在异常非有限值",
+  MES_HEARTBEAT_TIMEOUT: "MES 断联超时锁机（默认 > 60s 车规 Fail-Closed）",
+  MES_OFFLINE_LOT_CHANGE_FORBIDDEN: "离线状态严禁切换工单或批次（Lot）",
+  MES_LOT_UNBOUND_LOCK: "尚未在线绑定当前工单与批次（Lot）",
+  MES_LOT_HOLD_RECALL: "MES 批次冻结（HOLD）追回硬闭锁",
+  MES_LOT_SCRAP_RECALL: "MES 批次报废（SCRAP）追回硬闭锁",
+  MES_WHITELIST_QUOTA_EXCEEDED: "受控离线白名单管数配额已耗尽（先到先锁）",
+  MES_WHITELIST_DURATION_EXCEEDED: "受控离线白名单时长已超限（先到先锁）",
+  MES_PIPE_COLOR_MISMATCH: "防混料：料管颜色与当前工单预期配方不符",
+  MES_LOT_SIGNATURE_INVALID: "离线批次缓存 SHA-256 签名校验失败",
+  MES_LOT_CACHE_EXPIRED: "离线批次缓存有效期已过，请联网重绑",
+  MES_DISABLED: "MES 网关未启用",
 }
 
 export const reasonOf = (code?: string) => (code ? reasonText[code] || fsmText[code] || code.replaceAll("_", " ") : "")
@@ -172,6 +183,15 @@ export function guidanceFor(state: Data) {
 
   if (outcome === "FAULT" || state.camera_status === "FAULT") {
     return { title: "工位异常闭锁" }
+  }
+  if (state.mes_recall_locked) {
+    return { title: "MES 批次追回闭锁" }
+  }
+  if (state.mes_pipe_color_mismatch || state.result_reason === "MES_PIPE_COLOR_MISMATCH") {
+    return { title: "防混料：料管颜色不符" }
+  }
+  if (state.mes_blocking) {
+    return { title: "MES 断网/批次闭锁" }
   }
   if (state.camera_status !== "ONLINE") {
     return { title: "相机未连接" }

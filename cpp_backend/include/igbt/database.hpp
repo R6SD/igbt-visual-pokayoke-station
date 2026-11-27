@@ -46,6 +46,19 @@ struct EvidenceFileResult {
     std::string mime_type;
 };
 
+struct MesOutboxEnqueueRequest {
+    std::string idempotency_key;
+    std::string cycle_id;
+    std::string work_order_id;
+    std::string lot_id;
+    int64_t tube_seq{0};
+    std::string endpoint_path{"/api/mes/v1/pass_records"};
+    json payload{json::object()};
+    int64_t created_at_ms{0};
+    bool increment_offline_used{false};
+    std::optional<int64_t> offline_started_at_ms;
+};
+
 class StationDatabase {
 public:
     explicit StationDatabase(
@@ -91,7 +104,8 @@ public:
     bool record_live_transition(
         const json& state_data,
         const std::optional<std::string>& state_before,
-        const std::vector<uint8_t>& evidence_jpeg = {}
+        const std::vector<uint8_t>& evidence_jpeg = {},
+        const std::optional<MesOutboxEnqueueRequest>& mes_outbox = std::nullopt
     );
 
     json save_manual_capture(
@@ -189,6 +203,31 @@ public:
     json rr_list_lock_audit(int limit = 50) const;
     json rr_verify_lock_audit_chain() const;
 
+    // MES Transactional Outbox, Signed Active Lot & Runtime Policy (v4.6)
+    json mes_enqueue_outbox(const MesOutboxEnqueueRequest& req);
+    std::optional<json> mes_claim_next_pending(int64_t now_ms, int64_t stale_inflight_ms = 30000);
+    void mes_mark_acked(int64_t row_id, int http_code, const std::string& response_body, int64_t acked_at_ms);
+    void mes_mark_retry(
+        int64_t row_id,
+        int http_code,
+        const std::string& error_msg,
+        int64_t next_retry_at_ms,
+        bool dead_letter
+    );
+    json mes_requeue_dead_letter(int64_t row_id, int64_t now_ms);
+    json mes_list_outbox(int limit = 50, const std::string& status_filter = "") const;
+    json mes_outbox_counts() const;
+    std::vector<std::string> mes_list_lot_outbox_keys(const std::string& lot_id, int limit = 200) const;
+
+    std::optional<json> mes_get_active_lot() const;
+    json mes_save_active_lot(const json& lot_obj);
+    void mes_update_active_lot_status(const std::string& lot_status, int64_t now_ms);
+    void mes_reset_offline_usage(int64_t now_ms);
+    int64_t mes_peek_next_tube_seq() const;
+
+    json mes_get_runtime_policy() const;
+    json mes_save_runtime_policy(const json& policy_obj);
+
 private:
     void open_and_initialize();
     void exec_sql_unlocked(const std::string& sql) const;
@@ -218,6 +257,7 @@ private:
     std::vector<std::filesystem::path> snapshot_evidence_files() const;
     int safe_clean_evidence_dir(const std::vector<std::filesystem::path>& allowed_files) const;
     std::optional<std::filesystem::path> safe_model_run_dir(const std::string& version) const;
+    void mes_insert_outbox_unlocked(const MesOutboxEnqueueRequest& req);
 
     std::filesystem::path data_root_;
     std::filesystem::path db_path_;

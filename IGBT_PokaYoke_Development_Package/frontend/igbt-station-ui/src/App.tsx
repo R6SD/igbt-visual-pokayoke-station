@@ -21,6 +21,7 @@ import {
   Play,
   RefreshCw,
   RotateCcw,
+  Server,
   ShieldAlert,
   ShieldCheck,
   Sliders,
@@ -44,6 +45,9 @@ import { OperatorView } from "@/components/OperatorView"
 import { ShowcasePage } from "@/components/ShowcasePage"
 import { RedRabbitOverlay } from "@/features/red-rabbit/RedRabbitOverlay"
 import type { RedRabbitStatus } from "@/features/red-rabbit/types"
+import { MesOutboxPanel } from "@/features/audit/MesOutboxPanel"
+import { MesRecallOverlay } from "@/features/audit/MesRecallOverlay"
+import type { MesStatus } from "@/features/audit/types"
 import { LabelOodCard } from "@/features/training/LabelOodCard"
 import {
   C_LIMIT_MS,
@@ -62,7 +66,7 @@ import {
 
 type Role = "operator" | "engineer"
 type EngineerStep = "monitor" | "collect" | "train" | "records_settings"
-type RecordsSettingsTab = "records" | "storage" | "settings"
+type RecordsSettingsTab = "records" | "storage" | "mes" | "settings"
 type CycleFilter = "ALL" | "PASS" | "ALARM" | "VIEW_INVALID"
 type SampleLabel = "complete" | "crossed_out" | "covered" | "absent" | "unknown_challenge"
 type AutoCaptureLabel = "complete" | "crossed_out" | "covered" | "absent"
@@ -1331,6 +1335,33 @@ function App() {
         </div>
       )}
 
+      {!error && !state.hardware_fault_locked && state.mes_blocking && (
+        <div className="banner studio-banner" role="alert">
+          <AlertTriangle size={16} aria-hidden="true" />
+          <span>
+            MES 管控闭锁：
+            {reasonOf(state.mes_block_reason || state.result_reason || "MES_HEARTBEAT_TIMEOUT")}
+          </span>
+          <code>{String(state.mes_block_reason || "MES_BLOCKED")}</code>
+        </div>
+      )}
+
+      {!error && !state.hardware_fault_locked && !state.mes_blocking && state.mes?.degradation_mode === "WHITELIST_ACTIVE" && (
+        <div
+          className="banner studio-banner"
+          role="status"
+          style={{ background: "var(--warn-tint)", color: "var(--warn)" }}
+        >
+          <AlertTriangle size={16} aria-hidden="true" />
+          <span>
+            受控白名单离线作业中（Lot：{state.mes?.active_lot?.lot_id || "—"}）：剩余{" "}
+            {Number(state.mes?.whitelist?.remaining_tubes ?? 0)} 管 · 剩余{" "}
+            {Math.ceil(Number(state.mes?.whitelist?.remaining_ms ?? 0) / 60000)} 分钟
+          </span>
+          <code>WHITELIST_ACTIVE</code>
+        </div>
+      )}
+
       {!error && !state.hardware_fault_locked && state.tube_align_failed && (
         <div className="banner studio-banner" role="alert">
           <AlertTriangle size={16} aria-hidden="true" />
@@ -1502,6 +1533,14 @@ function App() {
         adminToken={adminToken}
         manualOpen={rrAuditOpen}
         onCloseManual={() => setRrAuditOpen(false)}
+        onOpenEngineerAuth={() => setAuthModalOpen(true)}
+        onUpdated={() => refresh(true)}
+        flash={flash}
+      />
+
+      <MesRecallOverlay
+        mes={(state.mes as MesStatus | undefined) ?? null}
+        adminToken={adminToken}
         onOpenEngineerAuth={() => setAuthModalOpen(true)}
         onUpdated={() => refresh(true)}
         flash={flash}
@@ -3992,6 +4031,7 @@ function TrainDeployStep({
 const step4SubTabs: { id: RecordsSettingsTab; label: string; icon: typeof ClipboardList }[] = [
   { id: "records", label: "周期记录", icon: ClipboardList },
   { id: "storage", label: "存储管理", icon: HardDrive },
+  { id: "mes", label: "MES 发件箱", icon: Server },
   { id: "settings", label: "系统参数", icon: Sliders },
 ]
 
@@ -4178,6 +4218,14 @@ function RecordsSettingsStep({
               <RefreshCw size={14} aria-hidden="true" />
               {storageLoading ? "刷新中…" : "刷新统计"}
             </button>
+          ) : activeSubTab === "mes" ? (
+            <span className={`tag ${state.mes?.connected ? "pass" : state.mes?.enabled ? "warn" : "plain"} mono`}>
+              {!state.mes?.enabled
+                ? "MES 未启用"
+                : state.mes?.connected
+                  ? `MES 在线 · ${state.mes?.active_lot?.lot_id || "未绑Lot"}`
+                  : `MES 离线 · 待传 ${state.mes?.outbox_counts?.pending ?? 0}`}
+            </span>
           ) : (
             <span className="tag plain mono">
               {!config.roi_config_version || config.roi_config_version === "ROI_UNCALIBRATED"
@@ -4231,6 +4279,8 @@ function RecordsSettingsStep({
             onChangeSubTab={onChangeSubTab}
             onGoStep={onGoStep}
           />
+        ) : activeSubTab === "mes" ? (
+          <MesOutboxPanel state={state} token={token} flash={flash} onUpdated={onSaved} />
         ) : (
           <SettingsSubView
             key={config.config_version ?? "initial"}

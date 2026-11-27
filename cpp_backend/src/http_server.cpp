@@ -444,6 +444,41 @@ AdamModbusConfig resolve_adam_config(
     return {};
 }
 
+MesClientConfig resolve_mes_config(
+    const StationServerOptions& options,
+    const std::filesystem::path& data_dir,
+    const EngineerSessionAuth& auth
+) {
+    if (options.mes_config.has_value()) {
+        return *options.mes_config;
+    }
+    const auto cfg_path = data_dir / "mes_config.json";
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(cfg_path, ec)) {
+        return load_mes_config_file(cfg_path);
+    }
+    const std::string env_url = auth.get_env_value("IGBT_MES_URL");
+    if (!env_url.empty()) {
+        MesClientConfig cfg;
+        cfg.enabled = true;
+        cfg.base_url = env_url;
+        if (const std::string st = auth.get_env_value("IGBT_MES_STATION_ID"); !st.empty()) {
+            cfg.station_id = st;
+        }
+        if (const std::string key = auth.get_env_value("IGBT_MES_API_KEY"); !key.empty()) {
+            cfg.api_key = key;
+        }
+        if (const std::string to = auth.get_env_value("IGBT_MES_HEARTBEAT_TIMEOUT_MS"); !to.empty()) {
+            try {
+                cfg.heartbeat_fail_lock_ms = std::clamp<int64_t>(std::stoll(to), 1000, 600000);
+            } catch (...) {
+            }
+        }
+        return cfg;
+    }
+    return {};
+}
+
 }  // namespace
 
 // ============================================================================
@@ -768,6 +803,28 @@ StationHttpServer::StationHttpServer(
         if (interlock_) interlock_->set_interlock(sig);
     });
 
+    const MesClientConfig mes_cfg = resolve_mes_config(options_, options_.data_dir, auth_);
+    mes_worker_ = std::make_unique<MesSyncWorker>(
+        db_,
+        mes_cfg,
+        options_.data_dir / "mes_config.json",
+        mes_default_wall_clock_ms,
+        [this](InterlockSignal sig) {
+            if (!interlock_) return;
+            const DioHealthStatus dio = interlock_->health_status();
+            if (!dio.fault_locked) {
+                interlock_->set_interlock(sig);
+            }
+        },
+        [this](const std::string& lot_id, const std::string& actor_id) {
+            try {
+                (void)red_rabbit_.trigger_challenge("LOT_CHANGE", lot_id, actor_id);
+            } catch (...) {
+            }
+        }
+    );
+    mes_worker_->start();
+
     // Wire LiveCameraEngine configuration loader & cycle persistence callback
     camera_.set_evidence_root(db_.evidence_root());
     camera_.set_config_loader([this]() { return db_.get_config(); });
@@ -787,7 +844,33 @@ StationHttpServer::StationHttpServer(
     });
     camera_.set_cycle_callback(
         [this](const json& snap, const std::optional<std::string>& prev_fsm, const std::vector<uint8_t>& ev_jpg) {
-            const bool saved = db_.record_live_transition(snap, prev_fsm, ev_jpg);
+            const std::string obs_pipe =
+                (snap.is_object() && snap.contains("pipe_color") && snap["pipe_color"].is_string())
+                    ? snap["pipe_color"].get<std::string>()
+                    : "";
+            const bool pipe_mismatch = mes_worker_ && mes_worker_->check_pipe_color_mismatch(obs_pipe);
+            const bool mes_blocking_before = mes_worker_ && mes_worker_->is_blocking();
+            std::optional<MesOutboxEnqueueRequest> mes_req;
+            if (mes_worker_) {
+                const json ood_st = camera_.label_ood_status_json();
+                std::string m_sha =
+                    (ood_st.is_object() && ood_st.contains("model_sha256") && ood_st["model_sha256"].is_string())
+                        ? ood_st["model_sha256"].get<std::string>()
+                        : "";
+                if (m_sha.empty()) {
+                    m_sha = (snap.is_object() && snap.contains("model_version") && snap["model_version"].is_string())
+                                ? snap["model_version"].get<std::string>()
+                                : "heuristic";
+                }
+                mes_req = mes_worker_->prepare_cycle_outbox_request(snap, m_sha);
+            }
+
+            const bool saved = db_.record_live_transition(snap, prev_fsm, ev_jpg, mes_req);
+            if (saved && mes_req.has_value() && mes_worker_) {
+                mes_worker_->notify_outbox_enqueued();
+                mes_worker_->evaluate_offline_policy_now();
+            }
+
             const std::string outcome = snap.value("outcome", "");
             if (outcome == "PASS" || outcome == "ALARM") {
                 std::optional<double> ood_energy;
@@ -812,9 +895,15 @@ StationHttpServer::StationHttpServer(
                 InterlockSignal sig = InterlockSignal::LOCKED;
                 if (dio.fault_locked) {
                     sig = InterlockSignal::FAULT_HALT;
-                } else if (outcome == "ALARM" || red_rabbit_.state() == RedRabbitState::CHALLENGE_HARD_LOCK) {
+                } else if (outcome == "ALARM" ||
+                           red_rabbit_.state() == RedRabbitState::CHALLENGE_HARD_LOCK ||
+                           (mes_worker_ && mes_worker_->is_recall_locked()) ||
+                           pipe_mismatch) {
                     sig = InterlockSignal::ALARM_LATCHED;
-                } else if (!red_rabbit_.is_blocking() && outcome == "PASS" && snap.value("view_valid", false)) {
+                } else if (!red_rabbit_.is_blocking() &&
+                           !mes_blocking_before &&
+                           outcome == "PASS" &&
+                           snap.value("view_valid", false)) {
                     sig = InterlockSignal::PASS_ALLOW;
                 }
                 interlock_->set_interlock(sig);
@@ -940,23 +1029,62 @@ json StationHttpServer::build_current_state_response() {
         rr.value("hard_locked", false) ? "RED_RABBIT_HARD_LOCK" : "RED_RABBIT_CHALLENGE_REQUIRED";
     const DioHealthStatus dio = interlock_ ? interlock_->health_status() : DioHealthStatus{};
     const json dio_json = dio_health_to_json(dio);
+    const json mes = mes_worker_ ? mes_worker_->status_json() : json::object();
+    const bool mes_enabled = mes.value("enabled", false);
+    const bool mes_blocking = mes_enabled && mes.value("blocking", false);
+    const bool mes_recall_locked = mes_enabled && mes.value("recall_locked", false);
+    const bool mes_offline_locked = mes_enabled && mes.value("offline_locked", false);
+    const std::string mes_block_reason = mes.value("block_reason", "");
 
     auto attach_red_rabbit = [&](json st, bool override_pass) -> json {
+        const std::string obs_pipe =
+            (st.is_object() && st.contains("pipe_color") && st["pipe_color"].is_string())
+                ? st["pipe_color"].get<std::string>()
+                : "";
+        const bool pipe_mismatch = mes_worker_ && mes_worker_->check_pipe_color_mismatch(obs_pipe);
+        const std::string cur_outcome =
+            (st.is_object() && st.contains("outcome") && st["outcome"].is_string())
+                ? st["outcome"].get<std::string>()
+                : "";
+
         st["red_rabbit"] = rr;
         st["red_rabbit_blocking"] = rr_blocking;
         st["hal_dio"] = dio_json;
         st["hardware_fault_locked"] = dio.fault_locked;
+        st["mes"] = mes;
+        st["mes_blocking"] = mes_blocking;
+        st["mes_recall_locked"] = mes_recall_locked;
+        st["mes_offline_locked"] = mes_offline_locked;
+        st["mes_block_reason"] = mes_block_reason;
+        st["mes_pipe_color_mismatch"] = pipe_mismatch;
+
         if (override_pass) {
             if (dio.fault_locked) {
                 st["interlock_output_enabled"] = false;
                 st["outcome"] = "FAULT";
                 st["fsm_state"] = "FAULT";
                 st["result_reason"] = dio.fault_reason.empty() ? "MODBUS_WATCHDOG_TIMEOUT" : dio.fault_reason;
+            } else if (mes_recall_locked) {
+                st["interlock_output_enabled"] = false;
+                st["outcome"] = "ALARM";
+                st["result_reason"] = mes_block_reason.empty() ? "MES_LOT_HOLD_RECALL" : mes_block_reason;
             } else if (rr_blocking) {
                 st["interlock_output_enabled"] = false;
-                if (st.value("outcome", "") == "PASS") {
+                if (cur_outcome == "PASS") {
                     st["outcome"] = "ALARM";
                     st["result_reason"] = rr_block_reason;
+                }
+            } else if (mes_blocking) {
+                st["interlock_output_enabled"] = false;
+                if (cur_outcome == "PASS") {
+                    st["outcome"] = "ALARM";
+                    st["result_reason"] = mes_block_reason.empty() ? "MES_HEARTBEAT_TIMEOUT" : mes_block_reason;
+                }
+            } else if (pipe_mismatch) {
+                st["interlock_output_enabled"] = false;
+                if (cur_outcome == "PASS") {
+                    st["outcome"] = "ALARM";
+                    st["result_reason"] = "MES_PIPE_COLOR_MISMATCH";
                 }
             } else if (dio.configured && dio.hardware_ready) {
                 st["mode"] = "hardware_interlock";
@@ -1226,7 +1354,7 @@ void StationHttpServer::register_routes() {
             {"interlock_backend", interlock_ ? interlock_->backend_name() : "shadow_noop"},
             {"interlock_hardware_ready", dio.hardware_ready},
             {"interlock_fault_locked", dio.fault_locked},
-            {"mes_connected", mes_client_.is_connected()},
+            {"mes_connected", mes_worker_ && mes_worker_->is_connected()},
             {"engine", "cpp20"}
         });
     }));
@@ -1241,6 +1369,7 @@ void StationHttpServer::register_routes() {
             {"camera_optics", camera_.get_camera_optics_json()},
             {"red_rabbit", red_rabbit_.status_json()},
             {"hal_dio", dio_health_to_json(dio)},
+            {"mes", mes_worker_ ? mes_worker_->status_json() : json::object()},
             {"tube_alignment", camera_.tube_alignment_status_json()},
             {"hand_glove_detector", camera_.hand_glove_detector_status_json()},
             {"label_ood_classifier", camera_.label_ood_status_json()}
@@ -2803,6 +2932,84 @@ void StationHttpServer::register_routes() {
         out["reset_applied"] = reset_done;
         send_json(res, 200, out);
     }));
+
+    // 12. MES Transactional Outbox, Lot Anti-Mix & Graded Offline Degradation (v4.6)
+    svr_.Get("/api/mes/status", wrap([this](const httplib::Request&, httplib::Response& res) {
+        send_json(res, 200, mes_worker_ ? mes_worker_->status_json() : json::object());
+    }));
+
+    svr_.Get("/api/mes/outbox", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const int limit = get_int_query(req, "limit", 50);
+        const std::string status_filter = req.has_param("status") ? req.get_param_value("status") : "";
+        send_json(res, 200, json{
+            {"items", db_.mes_list_outbox(limit, status_filter)},
+            {"counts", db_.mes_outbox_counts()},
+            {"status", mes_worker_ ? mes_worker_->status_json() : json::object()}
+        });
+    }));
+
+    svr_.Post("/api/mes/config", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        (void)auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        const json body = parse_json_body_or_throw(req);
+        if (!mes_worker_) throw DatabaseHttpError(503, "MES_WORKER_UNAVAILABLE");
+        send_json(res, 200, mes_worker_->reconfigure_from_json(body, true));
+    }));
+
+    svr_.Post("/api/mes/lot/bind", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const std::string actor = auth_.require_station_or_admin_token(
+            get_opt_header(req, "X-Station-Token"),
+            get_opt_header(req, "X-Admin-Token")
+        );
+        const json body = parse_json_body_or_throw(req);
+        if (!mes_worker_) throw DatabaseHttpError(503, "MES_WORKER_UNAVAILABLE");
+        send_json(res, 200, mes_worker_->bind_work_order_online(body, actor));
+    }));
+
+    svr_.Post("/api/mes/whitelist", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const std::string actor = auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        const json body = parse_json_body_or_throw(req);
+        if (!mes_worker_) throw DatabaseHttpError(503, "MES_WORKER_UNAVAILABLE");
+        send_json(res, 200, mes_worker_->set_whitelist_policy(body, actor));
+    }));
+
+    svr_.Post("/api/mes/recall/unlock", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        const std::string actor = auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        const json body = parse_json_body_or_throw(req);
+        if (!mes_worker_) throw DatabaseHttpError(503, "MES_WORKER_UNAVAILABLE");
+        send_json(res, 200, mes_worker_->unlock_recall_lock(body, actor));
+    }));
+
+    svr_.Post("/api/mes/outbox/flush", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        (void)auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        if (!mes_worker_) throw DatabaseHttpError(503, "MES_WORKER_UNAVAILABLE");
+        send_json(res, 200, mes_worker_->tick_once(true));
+    }));
+
+    svr_.Post("/api/mes/outbox/:id/requeue", wrap([this](const httplib::Request& req, httplib::Response& res) {
+        (void)auth_.require_admin_token(get_opt_header(req, "X-Admin-Token"));
+        int64_t row_id = 0;
+        try {
+            const std::string raw_id = req.path_params.at("id");
+            std::size_t pos = 0;
+            row_id = std::stoll(raw_id, &pos);
+            if (pos != raw_id.size() || row_id <= 0) {
+                throw DatabaseHttpError(422, "INVALID_OUTBOX_ID");
+            }
+        } catch (const DatabaseHttpError&) {
+            throw;
+        } catch (...) {
+            throw DatabaseHttpError(422, "INVALID_OUTBOX_ID");
+        }
+        const json item = db_.mes_requeue_dead_letter(row_id, mes_default_wall_clock_ms());
+        if (mes_worker_) {
+            mes_worker_->notify_outbox_enqueued();
+        }
+        send_json(res, 200, json{
+            {"ok", true},
+            {"item", item},
+            {"counts", db_.mes_outbox_counts()}
+        });
+    }));
 }
 
 void StationHttpServer::register_static_and_spa_routes() {
@@ -2965,6 +3172,9 @@ void StationHttpServer::stop_maintenance_thread() {
 void StationHttpServer::stop() {
     stopping_.store(true);
     maintenance_cv_.notify_all();
+    if (mes_worker_) {
+        mes_worker_->stop();
+    }
     if (interlock_) {
         interlock_->stop();
     }

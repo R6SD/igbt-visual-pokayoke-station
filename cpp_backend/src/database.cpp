@@ -760,6 +760,59 @@ void StationDatabase::open_and_initialize() {
         );
         CREATE INDEX IF NOT EXISTS idx_rr_sessions_time ON red_rabbit_sessions(started_at_ms DESC);
         CREATE INDEX IF NOT EXISTS idx_lock_audit_time ON station_lock_audit(created_at_ms DESC);
+        CREATE TABLE IF NOT EXISTS mes_outbox_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            cycle_id TEXT NOT NULL,
+            work_order_id TEXT NOT NULL,
+            lot_id TEXT NOT NULL,
+            tube_seq INTEGER NOT NULL,
+            endpoint_path TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('PENDING','IN_FLIGHT','ACKED','DEAD_LETTER')),
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            next_retry_at_ms INTEGER NOT NULL,
+            last_http_code INTEGER,
+            last_error TEXT,
+            response_body TEXT,
+            created_at_ms INTEGER NOT NULL,
+            acked_at_ms INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_mes_outbox_sched ON mes_outbox_queue(status, next_retry_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_mes_outbox_lot ON mes_outbox_queue(lot_id, id DESC);
+        CREATE TABLE IF NOT EXISTS mes_active_lot (
+            singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+            work_order_id TEXT NOT NULL,
+            lot_id TEXT NOT NULL,
+            part_number TEXT NOT NULL,
+            expected_pipe_color TEXT NOT NULL,
+            lot_status TEXT NOT NULL CHECK (lot_status IN ('ACTIVE','HOLD','SCRAP')),
+            signature_sha256 TEXT NOT NULL,
+            validated_at_ms INTEGER NOT NULL,
+            expires_at_ms INTEGER NOT NULL,
+            tube_seq INTEGER NOT NULL DEFAULT 0,
+            offline_used_count INTEGER NOT NULL DEFAULT 0,
+            offline_started_at_ms INTEGER,
+            updated_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS mes_runtime_policy (
+            singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+            whitelist_approved INTEGER NOT NULL DEFAULT 0,
+            whitelist_actor_id TEXT NOT NULL DEFAULT '',
+            whitelist_actor_role TEXT NOT NULL DEFAULT '',
+            whitelist_reason TEXT NOT NULL DEFAULT '',
+            whitelist_max_tubes INTEGER NOT NULL DEFAULT 50,
+            whitelist_max_duration_ms INTEGER NOT NULL DEFAULT 1800000,
+            whitelist_approved_at_ms INTEGER NOT NULL DEFAULT 0,
+            recall_locked INTEGER NOT NULL DEFAULT 0,
+            recall_status TEXT NOT NULL DEFAULT '',
+            recall_lot_id TEXT NOT NULL DEFAULT '',
+            recall_work_order_id TEXT NOT NULL DEFAULT '',
+            recall_reason TEXT NOT NULL DEFAULT '',
+            recall_affected_keys TEXT NOT NULL DEFAULT '[]',
+            recall_triggered_at_ms INTEGER NOT NULL DEFAULT 0,
+            updated_at_ms INTEGER NOT NULL DEFAULT 0
+        );
     )SQL");
 
     if (!column_exists_unlocked("cycles", "source")) {
@@ -1698,7 +1751,8 @@ json StationDatabase::purge_cycles(const std::string& scope) {
 bool StationDatabase::record_live_transition(
     const json& state_data,
     const std::optional<std::string>& state_before,
-    const std::vector<uint8_t>& evidence_jpeg
+    const std::vector<uint8_t>& evidence_jpeg,
+    const std::optional<MesOutboxEnqueueRequest>& mes_outbox
 ) {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1843,6 +1897,10 @@ bool StationDatabase::record_live_transition(
                     }
                 }
             }
+        }
+
+        if (mes_outbox.has_value()) {
+            mes_insert_outbox_unlocked(*mes_outbox);
         }
 
         tx.commit();

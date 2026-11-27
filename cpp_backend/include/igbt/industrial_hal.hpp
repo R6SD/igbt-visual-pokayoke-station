@@ -1,5 +1,7 @@
 #pragma once
 
+#include "igbt/common.hpp"
+
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -96,6 +98,10 @@ struct MesWorkOrder {
     std::string part_number;
     std::string expected_lot_id;
     std::string expected_pipe_color;
+    std::string lot_status{"ACTIVE"};
+    std::string server_signature;
+    int64_t validated_at_ms{0};
+    int64_t expires_at_ms{0};
 };
 
 /**
@@ -113,6 +119,11 @@ public:
     ) = 0;
     virtual bool is_connected() const = 0;
     virtual std::string backend_name() const = 0;
+
+    virtual json status_json() const {
+        return json{{"backend", backend_name()}, {"connected", is_connected()}};
+    }
+    virtual void stop() {}
 };
 
 /**
